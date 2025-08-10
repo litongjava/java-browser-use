@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.jfinal.kit.Kv;
+import com.litongjava.ai.browser.consts.BrowserUserAgent;
 import com.litongjava.model.body.RespBodyVo;
 import com.litongjava.tio.utils.collect.Lists;
 import com.litongjava.tio.utils.snowflake.SnowflakeIdUtils;
@@ -55,27 +56,28 @@ public class PlaywrightService {
         //
         "--disable-blink-features=AutomationControlled"));
 
-    //下载与录制
+    // 下载与录制
     opts.setAcceptDownloads(true);
 
     opts.setDownloadsPath(downloadDir);
-    //opts.setRecordHarPath(Paths.get("trace.har"));
-    //opts.setRecordHarMode(HarMode.FULL);
-    //opts.setRecordHarContent(HarContentPolicy.EMBED);
+    // opts.setRecordHarPath(Paths.get("trace.har"));
+    // opts.setRecordHarMode(HarMode.FULL);
+    // opts.setRecordHarContent(HarContentPolicy.EMBED);
 
     opts.setRecordVideoDir(videosDir);
     opts.setRecordVideoSize(new RecordVideoSize(screenWidth, screenHeight));
 
-    //视窗 & 设备仿真
+    // 视窗 & 设备仿真
     opts.setViewportSize(screenWidth, screenHeight);
     opts.setDeviceScaleFactor(1.0);
     opts.setIsMobile(false);
     opts.setHasTouch(false);
 
-    //权限 & HTTP 头
+    // 权限 & HTTP 头
     opts.setPermissions(Arrays.asList("clipboard-read", "clipboard-write", "notifications"));
-    opts.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
-    //opts.setGeolocation(new Geolocation(21.3, -157.8));
+
+    opts.setUserAgent(BrowserUserAgent.CHROME_127_WIN_10);
+    // opts.setGeolocation(new Geolocation(21.3, -157.8));
     opts.setServiceWorkers(ServiceWorkerPolicy.ALLOW);
 
     BrowserType chromium = pw.chromium();
@@ -282,9 +284,12 @@ public class PlaywrightService {
       instance.page.close();
       instance.context.close();
     } catch (Exception e) {
+      log.error(e.getMessage());
     }
     try {
-      BrowserContext context = instance.playwright.chromium().launchPersistentContext(instance.profileDir, instance.opts);
+      BrowserContext context = instance.playwright.chromium().launchPersistentContext(instance.profileDir,
+          instance.opts);
+      log.info("new context:{}", context);
       Page firstPage = context.pages().get(0);
       instance.context = context;
       instance.page = firstPage;
