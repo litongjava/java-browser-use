@@ -26,7 +26,7 @@ public class PlayWrightKeheLogin {
     String password = EnvUtils.getStr("kehe.password");
 
     PlaywrightService playwrightService = Aop.get(PlaywrightService.class);
-    long id = playwrightService.start(null, false);
+    long id = playwrightService.start(null, false, false);
     BrowserInstance instance = playwrightService.getInstance(id);
     Page page = instance.page;
     page.navigate("https://connect-identity-server.kehe.com/Account/Login");
@@ -69,7 +69,6 @@ public class PlayWrightKeheLogin {
       // 等待跳转或者检查登录是否成功
       page.waitForLoadState(LoadState.NETWORKIDLE);
     }
-    
 
     try (Page newPage = instance.context.newPage()) {
       String url = "https://connectretailer.kehe.com/every-day/products/027271103063";
@@ -85,7 +84,7 @@ public class PlayWrightKeheLogin {
         e.printStackTrace();
       }
     }
-    
+
     try (Page newPage = instance.context.newPage()) {
       String url = "https://connectretailer.kehe.com/every-day/products/027271103063";
       newPage.navigate(url);
@@ -100,7 +99,6 @@ public class PlayWrightKeheLogin {
       }
     }
 
-    
     String out = DomService.getSimpleText(page);
     System.out.println("[Start of page]");
     System.out.println(out);

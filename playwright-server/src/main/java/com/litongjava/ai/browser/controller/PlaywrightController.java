@@ -13,10 +13,10 @@ public class PlaywrightController {
 
   private final PlaywrightService svc = Aop.get(PlaywrightService.class);
   private final ActionService actionService = Aop.get(ActionService.class);
-  
+
   @RequestPath("/start")
   public RespBodyVo start(Long id, boolean headless) {
-    long newId = svc.start(id, headless);
+    long newId = svc.start(id, headless, false);
     return RespBodyVo.ok(Kv.by("id", newId));
   }
 
@@ -102,12 +102,9 @@ public class PlaywrightController {
   }
 
   /**
-   * POST /api/v1/playwright/commands
-   * body: [
-   *   { "go_to_url": { "url":"https://www.taobao.com" } },
-   *   { "click_element_by_index": { "index": 2 } },
-   *   …
-   * ]
+   * POST /api/v1/playwright/commands body: [ { "go_to_url": {
+   * "url":"https://www.taobao.com" } }, { "click_element_by_index": { "index": 2
+   * } }, … ]
    */
   @RequestPath("/commands")
   public RespBodyVo batchExecute(Long id, String bodyJson) {

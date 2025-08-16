@@ -14,14 +14,14 @@ public class PlayWrightAmazonSearch {
     EnvUtils.load();
 
     PlaywrightService playwrightService = Aop.get(PlaywrightService.class);
-    long id = playwrightService.start(null, false);
+    long id = playwrightService.start(null, false, false);
     Page page = playwrightService.currentPage(id);
     page.navigate("https://www.amazon.com");
     page.waitForLoadState();
 
     page.fill("input[name='field-keywords']", "Mac Mini M4");
     page.click("#nav-search-submit-button");
-    
+
     page.waitForLoadState();
 
     String content = page.content();

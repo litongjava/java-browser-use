@@ -32,7 +32,7 @@ public class PlaywrightService {
 
   private static final ConcurrentHashMap<Long, BrowserInstance> INSTANCES = new ConcurrentHashMap<>();
 
-  public long start(Long id, boolean headless) {
+  public long start(Long id, boolean headless, boolean record) {
     Playwright pw = Playwright.create();
     Path profileDir = Paths.get(System.getProperty("user.home"), ".config", "browseruse", "profiles", "default");
     Path downloadDir = Paths.get(System.getProperty("user.home"), "Downloads", "broswer");
@@ -56,7 +56,7 @@ public class PlaywrightService {
         //
         "--disable-blink-features=AutomationControlled"));
 
-    // 下载与录制
+    // 下载
     opts.setAcceptDownloads(true);
 
     opts.setDownloadsPath(downloadDir);
@@ -64,8 +64,11 @@ public class PlaywrightService {
     // opts.setRecordHarMode(HarMode.FULL);
     // opts.setRecordHarContent(HarContentPolicy.EMBED);
 
-    opts.setRecordVideoDir(videosDir);
-    opts.setRecordVideoSize(new RecordVideoSize(screenWidth, screenHeight));
+    // 录制
+    if (record) {
+      opts.setRecordVideoDir(videosDir);
+      opts.setRecordVideoSize(new RecordVideoSize(screenWidth, screenHeight));
+    }
 
     // 视窗 & 设备仿真
     opts.setViewportSize(screenWidth, screenHeight);
