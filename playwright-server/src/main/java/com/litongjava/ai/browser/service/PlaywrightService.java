@@ -10,9 +10,6 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import com.jfinal.kit.Kv;
 import com.litongjava.ai.browser.consts.BrowserUserAgent;
-import com.litongjava.model.body.RespBodyVo;
-import com.litongjava.tio.utils.collect.Lists;
-import com.litongjava.tio.utils.snowflake.SnowflakeIdUtils;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.BrowserType.LaunchPersistentContextOptions;
@@ -26,6 +23,9 @@ import com.microsoft.playwright.options.SelectOption;
 import com.microsoft.playwright.options.ServiceWorkerPolicy;
 
 import lombok.extern.slf4j.Slf4j;
+import nexus.io.model.body.RespBodyVo;
+import nexus.io.tio.utils.collect.Lists;
+import nexus.io.tio.utils.snowflake.SnowflakeIdUtils;
 
 @Slf4j
 public class PlaywrightService {

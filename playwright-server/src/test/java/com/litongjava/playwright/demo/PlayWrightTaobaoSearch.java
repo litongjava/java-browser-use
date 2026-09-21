@@ -4,10 +4,11 @@ import org.junit.Test;
 
 import com.litongjava.ai.browser.dom.service.DomService;
 import com.litongjava.ai.browser.service.PlaywrightService;
-import com.litongjava.jfinal.aop.Aop;
-import com.litongjava.tio.utils.environment.EnvUtils;
 import com.microsoft.playwright.ElementHandle;
 import com.microsoft.playwright.Page;
+
+import nexus.io.jfinal.aop.Aop;
+import nexus.io.tio.utils.environment.EnvUtils;
 
 public class PlayWrightTaobaoSearch {
 

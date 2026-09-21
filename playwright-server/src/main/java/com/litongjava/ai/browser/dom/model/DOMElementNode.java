@@ -6,8 +6,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
-import com.litongjava.tio.utils.collect.Lists;
-import com.litongjava.tio.utils.hutool.StrUtil;
+import nexus.io.tio.utils.collect.Lists;
+import nexus.io.tio.utils.hutool.StrUtil;
 
 public class DOMElementNode extends DOMBaseNode {
   private final String tagName;

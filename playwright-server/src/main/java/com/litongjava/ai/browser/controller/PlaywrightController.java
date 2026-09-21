@@ -3,10 +3,11 @@ package com.litongjava.ai.browser.controller;
 import com.jfinal.kit.Kv;
 import com.litongjava.ai.browser.service.ActionService;
 import com.litongjava.ai.browser.service.PlaywrightService;
-import com.litongjava.annotation.RequestPath;
-import com.litongjava.jfinal.aop.Aop;
-import com.litongjava.model.body.RespBodyVo;
 import com.microsoft.playwright.Response;
+
+import nexus.io.annotation.RequestPath;
+import nexus.io.jfinal.aop.Aop;
+import nexus.io.model.body.RespBodyVo;
 
 @RequestPath("/api/v1/playwright")
 public class PlaywrightController {
@@ -102,7 +103,8 @@ public class PlaywrightController {
   }
 
   /**
-   * POST /api/v1/playwright/commands body: [ { "go_to_url": {
+   * POST /api/v1/playwright/commands 
+   * body: [ { "go_to_url": {
    * "url":"https://www.taobao.com" } }, { "click_element_by_index": { "index": 2
    * } }, … ]
    */

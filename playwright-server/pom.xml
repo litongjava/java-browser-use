@@ -7,9 +7,9 @@
   </parent>
   <artifactId>playwright-server</artifactId>
   <properties>
-    <tio-boot.version>2.0.1</tio-boot.version>
     <lombok-version>1.18.30</lombok-version>
     <fastjson2.version>2.0.52</fastjson2.version>
+    <tio-boot-admin.version>2.1.5</tio-boot-admin.version>
     <main.class>com.litongjava.ai.browser.PlaywrightApp</main.class>
   </properties>
   <dependencies>
@@ -25,9 +25,9 @@
 
     <!-- Tio Boot 框架 -->
     <dependency>
-      <groupId>com.litongjava</groupId>
-      <artifactId>tio-boot-admin</artifactId>
-      <version>1.0.5</version>
+      <groupId>nexus.io</groupId>
+      <artifactId>tio-boot-admin-web</artifactId>
+      <version>${tio-boot-admin.version}</version>
     </dependency>
 
 

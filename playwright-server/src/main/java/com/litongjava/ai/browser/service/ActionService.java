@@ -21,7 +21,8 @@ import com.litongjava.ai.browser.actions.model.UploadFileParams;
 import com.litongjava.ai.browser.actions.model.WaitParams;
 import com.litongjava.ai.browser.actions.registry.CommandHandler;
 import com.litongjava.ai.browser.actions.registry.HandlerRegistry;
-import com.litongjava.model.body.RespBodyVo;
+
+import nexus.io.model.body.RespBodyVo;
 
 public class ActionService {
 

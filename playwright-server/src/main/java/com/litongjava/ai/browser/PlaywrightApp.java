@@ -1,7 +1,8 @@
 package com.litongjava.ai.browser;
 
 import com.litongjava.ai.browser.config.PlaywrightAppConfig;
-import com.litongjava.tio.boot.TioApplication;
+
+import nexus.io.tio.boot.TioApplication;
 
 public class PlaywrightApp {
   

@@ -3,9 +3,9 @@ package com.litongjava.ai.browser.config;
 import java.util.ArrayList;
 import java.util.List;
 
-import com.litongjava.context.BootConfiguration;
-import com.litongjava.tio.boot.http.handler.controller.TioBootHttpControllerRouter;
-import com.litongjava.tio.boot.server.TioBootServer;
+import nexus.io.context.BootConfiguration;
+import nexus.io.tio.boot.http.handler.controller.TioBootHttpControllerRouter;
+import nexus.io.tio.boot.server.TioBootServer;
 
 public class PlaywrightAppConfig implements BootConfiguration {
 

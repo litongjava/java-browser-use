@@ -5,14 +5,14 @@ import org.junit.Test;
 import com.litongjava.ai.browser.dom.service.DomService;
 import com.litongjava.ai.browser.service.BrowserInstance;
 import com.litongjava.ai.browser.service.PlaywrightService;
-import com.litongjava.jfinal.aop.Aop;
-import com.litongjava.tio.utils.environment.EnvUtils;
 import com.microsoft.playwright.ElementHandle;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Page;
 import com.microsoft.playwright.options.LoadState;
 
 import lombok.extern.slf4j.Slf4j;
+import nexus.io.jfinal.aop.Aop;
+import nexus.io.tio.utils.environment.EnvUtils;
 
 @Slf4j
 
