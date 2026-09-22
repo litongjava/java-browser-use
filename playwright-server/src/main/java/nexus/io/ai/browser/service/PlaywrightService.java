@@ -59,6 +59,27 @@ public class PlaywrightService {
 
   private static final ConcurrentHashMap<Long, BrowserInstance> INSTANCES = new ConcurrentHashMap<>();
 
+  /**
+   * 全进程共享的 Playwright(driver)
+   *
+   * <p>只在 {@link #playwright()} 与 {@link #discardPlaywright()} 里读写,都用类锁保护。
+   */
+  private static volatile Playwright sharedPlaywright;
+
+  static {
+    // driver 是一个 node 子进程,服务被 Ctrl+C / kill 时要把一起收掉,别留下孤儿进程
+    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+      Playwright current = sharedPlaywright;
+      if (current != null) {
+        try {
+          current.close();
+        } catch (RuntimeException ignored) {
+          // 正在退出,关不掉也无所谓
+        }
+      }
+    }, "playwright-driver-shutdown"));
+  }
+
   /** 以函数形式提交的脚本:function、async function、箭头函数 */
   private static final Pattern FUNCTION_LIKE = Pattern.compile("^(async\\s+)?(function\\b|\\(|[A-Za-z_$][\\w$]*\\s*=>)");
 
@@ -101,9 +122,11 @@ public class PlaywrightService {
   /**
    * 启动一个任务的浏览器实例
    *
-   * <p>一个任务一个实例:每次调用都会新建独立的 Playwright 与独立的持久化 profile,互不干扰。
-   * profile 目录按任务 ID 分开({@code ~/.config/browseruse/profiles/<id>}),所以同一个 id
-   * 重新 start 时登录态还在,不同任务之间则是隔离的。
+   * <p>一个任务一个实例,但**不是**一个任务一个 driver:全进程共用一个 Playwright(见
+   * {@link #playwright()}),这里直接从 {@code launchPersistentContext()} 开始。隔离靠的是
+   * 每个任务自己的 BrowserContext 与持久化 profile 目录
+   * ({@code ~/.config/browseruse/profiles/<id>}),所以同一个 id 重新 start 时登录态还在,
+   * 不同任务之间互不干扰。
    *
    * @param id       任务 ID,传 null 时自动生成雪花 ID
    * @param headless 是否无头
@@ -115,7 +138,6 @@ public class PlaywrightService {
       throw new IllegalStateException("该 id 已经有正在运行的浏览器实例：" + taskId + "，请先调用 close，或换一个 id");
     }
 
-    Playwright pw = Playwright.create();
     Path profileDir = profileDir(taskId);
     Path downloadDir = Paths.get(userHome(), "Downloads", "broswer");
     log.info("task {} user dir:{}", taskId, profileDir);
@@ -157,18 +179,79 @@ public class PlaywrightService {
     opts.setUserAgent(BrowserUserAgent.CHROME_127_WIN_10);
     opts.setServiceWorkers(ServiceWorkerPolicy.ALLOW);
 
-    BrowserType chromium = pw.chromium();
-    BrowserContext ctx = chromium.launchPersistentContext(profileDir, opts);
+    long startedAt = System.currentTimeMillis();
+    BrowserContext ctx = launchContext(profileDir, opts);
     Page firstPage = ctx.pages().get(0);
 
     // 屏蔽 navigator.webdriver
     firstPage.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => false});");
 
-    BrowserInstance instance = new BrowserInstance(taskId, pw, ctx, firstPage, profileDir, opts);
+    BrowserInstance instance = new BrowserInstance(taskId, ctx, firstPage, profileDir, opts);
     attachListeners(instance, firstPage);
     attachRequestRecorder(instance);
     INSTANCES.put(taskId, instance);
+    log.info("task {} 浏览器就绪,耗时 {}ms", taskId, System.currentTimeMillis() - startedAt);
     return taskId;
+  }
+
+  /**
+   * 进程内共享的 Playwright(driver)
+   *
+   * <p>{@code Playwright.create()} 会拉起一个 node driver 进程并完成握手,每次大约几百毫秒,
+   * 而且每个实例都常驻一个 node 进程。但「一个任务一个实例」并不需要各自一个 driver ——
+   * 隔离的单位是 BrowserContext:每个任务有自己的 {@code launchPersistentContext}(独立
+   * profile、独立浏览器进程)。所以全进程共用一个 driver,{@code start} 直接从
+   * {@code launchPersistentContext()} 开始。
+   */
+  private static Playwright playwright() {
+    Playwright current = sharedPlaywright;
+    if (current != null) {
+      return current;
+    }
+    synchronized (PlaywrightService.class) {
+      if (sharedPlaywright == null) {
+        long startedAt = System.currentTimeMillis();
+        sharedPlaywright = Playwright.create();
+        log.info("创建共享 Playwright(driver),耗时 {}ms", System.currentTimeMillis() - startedAt);
+      }
+      return sharedPlaywright;
+    }
+  }
+
+  /**
+   * 把共享的 Playwright 判死并关掉,下次 {@link #playwright()} 会重新创建
+   *
+   * <p>只在 driver 已经不可用时调用。传进来的实例可能已经半死,close() 本身也可能抛异常,
+   * 所以这里的失败只记 debug 日志。
+   */
+  private static void discardPlaywright() {
+    synchronized (PlaywrightService.class) {
+      Playwright dead = sharedPlaywright;
+      sharedPlaywright = null;
+      if (dead != null) {
+        try {
+          dead.close();
+        } catch (RuntimeException e) {
+          log.debug("关闭失效的 Playwright 失败:{}", e.getMessage());
+        }
+      }
+    }
+  }
+
+  /**
+   * 用共享的 Playwright 起一个持久化上下文
+   *
+   * <p>第一次失败时把共享实例判死、重建一个再试一次:driver 进程可能已经被上一次任务带崩了,
+   * 重建比让用户去重启整个服务划算。第二次还失败就把异常抛出去。
+   */
+  private static BrowserContext launchContext(Path profileDir, LaunchPersistentContextOptions opts) {
+    try {
+      return playwright().chromium().launchPersistentContext(profileDir, opts);
+    } catch (RuntimeException first) {
+      log.warn("启动浏览器失败,重建共享 Playwright 后重试一次:{}", first.getMessage());
+      discardPlaywright();
+      return playwright().chromium().launchPersistentContext(profileDir, opts);
+    }
   }
 
   /**
@@ -246,22 +329,31 @@ public class PlaywrightService {
   /** 记录网络请求,onResponse 时回填状态码;带请求体的记下 postData,便于排查提交了什么 */
   private void attachRequestRecorder(BrowserInstance inst) {
     inst.context.onRequest(request -> {
-      Kv entry = Kv.by("method", request.method()).set("url", request.url())
-          .set("resourceType", request.resourceType()).set("status", null);
-      String postData = safePostData(request);
-      if (postData != null) {
-        entry.set("postData", truncate(postData, MAX_RECORDED_BODY_CHARS));
-      }
+      Kv entry = requestInfo(request);
       addBoundedRequest(inst.requests, entry);
       inst.requestIndex.put(request, entry);
     });
     inst.context.onResponse(response -> {
       Kv entry = inst.requestIndex.remove(response.request());
       if (entry != null) {
-        entry.set("status", response.status());
+        entry.set("status", response.status()).set("respondedAt", System.currentTimeMillis());
       }
-      rememberResponse(inst, response);
+      rememberResponse(inst, response, entry == null ? requestInfo(response.request()) : entry);
     });
+    inst.context.onRequestFailed(request -> {
+      Kv entry = inst.requestIndex.remove(request);
+      if (entry != null) entry.set("failure", request.failure()).set("finishedAt", System.currentTimeMillis());
+    });
+  }
+
+  private static Kv requestInfo(Request request) {
+    Kv entry = Kv.by("requestId", String.valueOf(SnowflakeIdUtils.id()))
+        .set("requestedAt", System.currentTimeMillis()).set("method", request.method())
+        .set("url", request.url()).set("resourceType", request.resourceType()).set("status", null);
+    String body = safePostData(request);
+    if (body != null) entry.set("postData", truncate(body, MAX_RECORDED_BODY_CHARS))
+        .set("postDataLength", body.length()).set("postDataTruncated", body.length() > MAX_RECORDED_BODY_CHARS);
+    return entry;
   }
 
   /** 请求体只在少数请求上有,取不到时不要影响记录本身 */
@@ -274,9 +366,9 @@ public class PlaywrightService {
   }
 
   /** 保留最近 100 个响应(带时间戳),get_response_body / wait_for_response 靠它回捞响应体 */
-  private static void rememberResponse(BrowserInstance inst, Response response) {
+  private static void rememberResponse(BrowserInstance inst, Response response, Kv request) {
     synchronized (inst.recentResponses) {
-      inst.recentResponses.addLast(new BrowserInstance.RecordedResponse(response, System.currentTimeMillis()));
+      inst.recentResponses.addLast(new BrowserInstance.RecordedResponse(response, System.currentTimeMillis(), request));
       while (inst.recentResponses.size() > 100) {
         inst.recentResponses.removeFirst();
       }
@@ -574,13 +666,9 @@ public class PlaywrightService {
     return resolveIndex(inst, index, null);
   }
 
-  /** 元素操作失败时的提示:超时基本都是快照过期 */
+  /** 元素操作失败时的提示:超时只表示未满足可操作条件，完整调用日志用于区分具体原因 */
   private static String actionFailure(String action, PlaywrightException e) {
-    String message = briefMessage(e.getMessage());
-    if (message.startsWith("Timeout")) {
-      return action + " 失败：元素不存在或页面已变化,请重新调用 get_browser_state 获取元素索引";
-    }
-    return action + " 失败：" + message;
+    return ActionError.describe(action, e.getMessage());
   }
 
   /** 等待类接口失败时的提示:等待超时和元素失效不是一回事 */
@@ -599,11 +687,7 @@ public class PlaywrightService {
    * (实测百度首页的搜索框 #kw 被隐藏,fill 会等满 5 秒后失败)。
    */
   private static String locateFailure(String action, String target, PlaywrightException e) {
-    String message = briefMessage(e.getMessage());
-    if (message.startsWith("Timeout")) {
-      return action + " 失败：没匹配到可操作的元素(不存在或不可见): " + target;
-    }
-    return action + " 失败：" + message;
+    return ActionError.describe(action, e.getMessage()) + ": " + target;
   }
 
   /** 按索引做一次点击类操作(dblclick/hover/focus/check/uncheck 共用),带索引失效重试 */
@@ -670,21 +754,68 @@ public class PlaywrightService {
     return RespBodyVo.ok();
   }
 
+  private static void requireEditable(Locator locator) {
+    // Return the actual reason before spending the timeout waiting on a read-only date picker.
+    if (locator.count() > 0) {
+      if (!locator.isEnabled()) throw new PlaywrightException("ELEMENT_DISABLED");
+      if ("true".equals(locator.getAttribute("aria-readonly")) ||
+          locator.getAttribute("readonly") != null) throw new PlaywrightException("ELEMENT_READ_ONLY");
+    }
+  }
+
+  private static void fillEditable(Locator locator, String value) {
+    requireEditable(locator);
+    locator.fill(value, new Locator.FillOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+  }
+
   private static Locator.ClickOptions clickOptions() {
     return new Locator.ClickOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS);
   }
 
   // ==================== 点击回执与索引失效重试 ====================
 
-  /** 动作前后探针:url、页签数、正文长度,足够判断"这一下到底有没有生效" */
+  /** 动作前后探针:url、页签数、正文长度,用于观察变化，不能证明业务成功或失败 */
   private static Kv stateProbe(BrowserInstance inst) {
     Kv probe = Kv.by("url", inst.page.url()).set("tabCount", inst.context.pages().size());
     try {
-      probe.set("textLength", asInt(inst.page.evaluate("() => document.body ? document.body.innerText.length : 0")));
+      Object fingerprint = inst.page.evaluate("""
+          () => {
+            const text = document.body ? document.body.innerText : '';
+            const controls = Array.from(document.querySelectorAll('input,textarea,select')).map(e =>
+              [e.type === 'password' ? '[redacted]' : e.value, e.checked, e.disabled, e.readOnly]);
+            const structure = Array.from(document.querySelectorAll('body *'))
+              .filter(e => !e.closest('#playwright-highlight-container'))
+              .map(e => [e.tagName,e.className?.baseVal ?? e.className,e.getAttribute('style'),
+                e.getAttribute('aria-expanded'),e.getAttribute('aria-selected'),e.hidden]);
+            const source = JSON.stringify([text, controls, structure]);
+            let hash = 2166136261;
+            for (let i=0;i<source.length;i++) hash = Math.imul(hash ^ source.charCodeAt(i), 16777619);
+            return {textLength:text.length, fingerprint:String(hash >>> 0)};
+          }
+          """);
+      if (fingerprint instanceof Map) probe.putAll((Map) fingerprint);
     } catch (PlaywrightException e) {
-      probe.set("textLength", 0);
+      probe.set("probeError", briefMessage(e.getMessage()));
     }
     return probe;
+  }
+
+  private static boolean probeChanged(Kv before, Kv after) {
+    return !java.util.Objects.equals(before.get("url"), after.get("url"))
+        || !java.util.Objects.equals(before.get("tabCount"), after.get("tabCount"))
+        || (before.containsKey("fingerprint") && after.containsKey("fingerprint")
+            && !java.util.Objects.equals(before.get("fingerprint"), after.get("fingerprint")));
+  }
+
+  private static Kv observeAfter(Kv before, BrowserInstance inst) {
+    Kv after = stateProbe(inst);
+    long deadline = System.nanoTime() + 500_000_000L;
+    while (!probeChanged(before, after) && !after.containsKey("probeError") && System.nanoTime() < deadline) {
+      // Pump Playwright events while waiting, allowing delayed popups and framework updates to arrive.
+      inst.page.waitForTimeout(50);
+      after = stateProbe(inst);
+    }
+    return after;
   }
 
   private static int asInt(Object value) {
@@ -695,27 +826,30 @@ public class PlaywrightService {
    * 动作回执
    *
    * <p>「点一下到底生效没有」光看 ok=true 判断不出来:实测点悬浮菜单项时命中的是纯文本节点,
-   * 接口返回成功但页面毫无变化。这里把前后状态一起返回,changed 为 false 就说明大概率没点中。
+   * 接口返回成功但页面毫无变化。这里把前后状态一起返回,changed 为 false 只说明观察窗口内尚未发现变化。
    */
   private static Kv receipt(Kv before, BrowserInstance inst) {
-    Kv after = stateProbe(inst);
+    Kv after = observeAfter(before, inst);
     String urlBefore = String.valueOf(before.get("url"));
     String urlAfter = String.valueOf(after.get("url"));
     int tabBefore = asInt(before.get("tabCount"));
     int tabAfter = asInt(after.get("tabCount"));
     int lenBefore = asInt(before.get("textLength"));
     int lenAfter = asInt(after.get("textLength"));
-    boolean changed = !urlBefore.equals(urlAfter) || tabBefore != tabAfter || lenBefore != lenAfter;
+    boolean changed = probeChanged(before, after);
     return Kv.by("urlBefore", urlBefore).set("urlAfter", urlAfter)
         .set("tabCountBefore", tabBefore).set("tabCountAfter", tabAfter)
-        .set("textLengthBefore", lenBefore).set("textLengthAfter", lenAfter).set("changed", changed);
+        .set("textLengthBefore", lenBefore).set("textLengthAfter", lenAfter).set("changed", changed)
+        .set("changeStatus", changed ? "observed" : "not_observed")
+        .set("observationComplete", !before.containsKey("probeError") && !after.containsKey("probeError"))
+        .set("observationWindowMs", 500);
   }
 
   /** 动作成功但页面毫无变化时,把 changed=false 和提示一起返回 */
   private static RespBodyVo okWithReceipt(Kv before, BrowserInstance inst, String action) {
     Kv report = receipt(before, inst);
     if (!Boolean.TRUE.equals(report.getBoolean("changed"))) {
-      report.set("hint", action + " 已执行,但 url、页签数、正文长度都没有变化,请确认是否点中了目标元素");
+      report.set("hint", action + " 已执行，但观察窗口内尚未发现变化；不代表点击失败，请等待目标条件或读取新状态");
     }
     return RespBodyVo.ok(report);
   }
@@ -950,7 +1084,7 @@ public class PlaywrightService {
       return RespBodyVo.fail("input_text 索引越界: " + index + indexHint(inst));
     }
     try {
-      locator.fill(value, new Locator.FillOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+      fillEditable(locator, value);
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(actionFailure("input_text", e));
     }
@@ -1381,6 +1515,7 @@ public class PlaywrightService {
       return RespBodyVo.fail("type_text 索引越界: " + index + indexHint(inst));
     }
     try {
+      requireEditable(locator);
       locator.pressSequentially(text, new Locator.PressSequentiallyOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(actionFailure("type_text", e));
@@ -1527,7 +1662,7 @@ public class PlaywrightService {
 
   public RespBodyVo inputTextBySelector(Long browserId, String selector, String value) {
     return actBySelector(browserId, "input_text_by_selector", selector,
-        (locator) -> locator.fill(value, new Locator.FillOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)));
+        (locator) -> fillEditable(locator, value));
   }
 
   /**
@@ -1642,7 +1777,7 @@ public class PlaywrightService {
     Kv report = receipt(before, inst);
     report.set(hit);
     if (!Boolean.TRUE.equals(report.getBoolean("changed"))) {
-      report.set("hint", action + " 已执行,但 url、页签数、正文长度都没有变化,请确认点中的是不是目标元素");
+      report.set("hint", action + " 已执行，但观察窗口内尚未发现变化；不代表点击失败，请等待目标条件或读取新状态");
     }
     return RespBodyVo.ok(report);
   }
@@ -1667,7 +1802,7 @@ public class PlaywrightService {
   public RespBodyVo inputTextByLabel(Long browserId, String label, String value) {
     return actByLocator(browserId, "input_text_by_label", "标签 " + label,
         (inst) -> inst.page.getByLabel(label).first(),
-        (locator) -> locator.fill(value, new Locator.FillOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)));
+        (locator) -> fillEditable(locator, value));
   }
 
   /**
@@ -1735,7 +1870,7 @@ public class PlaywrightService {
     }
     Kv data = Kv.by("value", null);
     try {
-      locator.fill("", new Locator.FillOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+      fillEditable(locator, "");
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(locateFailure("clear_text", target, e));
     }
@@ -2291,13 +2426,18 @@ public class PlaywrightService {
    * (例如中间发生过跳转)时,data.bodyError 里会说明原因。
    */
   public RespBodyVo getResponseBody(Long browserId, String filter, Integer index, Integer maxChars) {
+    return getResponseBody(browserId, filter, index, maxChars, null);
+  }
+
+  public RespBodyVo getResponseBody(Long browserId, String filter, Integer index, Integer maxChars, String requestId) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     List<BrowserInstance.RecordedResponse> matched = new ArrayList<>();
     for (BrowserInstance.RecordedResponse recorded : snapshotResponses(inst)) {
-      if (filter == null || filter.isEmpty() || recorded.response.url().contains(filter)) {
+      if ((filter == null || filter.isEmpty() || recorded.response.url().contains(filter))
+          && (requestId == null || requestId.equals(recorded.request.getStr("requestId")))) {
         matched.add(recorded);
       }
     }
@@ -2346,7 +2486,7 @@ public class PlaywrightService {
         }
       }
       if (hit != null) {
-        Kv kv = responseInfo(hit.response, maxChars);
+        Kv kv = responseInfo(hit, maxChars);
         kv.set("ageMs", System.currentTimeMillis() - hit.at).set("fromLookBack", true);
         return RespBodyVo.ok(kv);
       }
@@ -2360,7 +2500,10 @@ public class PlaywrightService {
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(waitFailure("wait_for_response", e));
     }
-    Kv kv = responseInfo(response, maxChars);
+    BrowserInstance.RecordedResponse recorded = snapshotResponses(inst).stream()
+        .filter(item -> item.response == response).findFirst()
+        .orElseGet(() -> new BrowserInstance.RecordedResponse(response, System.currentTimeMillis(), requestInfo(response.request())));
+    Kv kv = responseInfo(recorded, maxChars);
     kv.set("ageMs", 0).set("fromLookBack", false);
     return RespBodyVo.ok(kv);
   }
@@ -2412,7 +2555,11 @@ public class PlaywrightService {
   }
 
   private static Kv responseInfo(BrowserInstance.RecordedResponse recorded, Integer maxChars) {
-    return responseInfo(recorded.response, maxChars);
+    Kv kv = responseInfo(recorded.response, maxChars);
+    kv.set("requestId", recorded.request.get("requestId"))
+        .set("request", recorded.request).set("respondedAt", recorded.at)
+        .set("ageMs", Math.max(0, System.currentTimeMillis() - recorded.at));
+    return kv;
   }
 
   private static Kv responseInfo(Response response, Integer maxChars) {
@@ -2422,11 +2569,11 @@ public class PlaywrightService {
     try {
       body = response.text();
     } catch (PlaywrightException e) {
-      kv.set("bodyError", briefMessage(e.getMessage()));
+      kv.set("bodyError", briefMessage(e.getMessage())).set("bodyAvailable", false);
     }
     if (body != null) {
       kv.set("body", truncate(body, limit));
-      kv.set("bodyLength", body.length());
+      kv.set("bodyLength", body.length()).set("truncated", body.length() > limit).set("bodyAvailable", true);
     }
     return kv;
   }
@@ -2697,15 +2844,28 @@ public class PlaywrightService {
 
   public RespBodyVo close(Long browserId) {
     BrowserInstance inst = INSTANCES.remove(browserId);
-    if (inst != null && inst.context != null) {
-      inst.context.close();
-      inst.playwright.close();
-      return RespBodyVo.ok();
-    } else {
+    if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
     }
+    if (inst.context != null) {
+      try {
+        inst.context.close();
+      } catch (RuntimeException e) {
+        // 上下文可能已经因为浏览器崩溃而失效,这里不该让 close 变成失败
+        log.warn("关闭任务 {} 的浏览器上下文失败:{}", browserId, e.getMessage());
+      }
+    }
+    // 注意:这里**不关** Playwright。它是全进程共享的 driver,关掉会把其它任务的浏览器一起搞死;
+    // 它由 JVM 退出时的 shutdown hook 负责收尾。
+    return RespBodyVo.ok();
   }
 
+  /**
+   * 重建任务自己的浏览器上下文
+   *
+   * <p>用在 {@code set_credentials} 这类需要换掉整个上下文(代理、认证)的接口上。只换
+   * BrowserContext,共享的 Playwright 不动。
+   */
   public BrowserInstance restartContext(BrowserInstance instance) {
     try {
       instance.page.close();
@@ -2714,8 +2874,7 @@ public class PlaywrightService {
       log.error(e.getMessage());
     }
     try {
-      BrowserContext context = instance.playwright.chromium().launchPersistentContext(instance.profileDir,
-          instance.opts);
+      BrowserContext context = launchContext(instance.profileDir, instance.opts);
       log.info("new context:{}", context);
       Page firstPage = context.pages().get(0);
       instance.context = context;
@@ -2726,7 +2885,6 @@ public class PlaywrightService {
       log.error(e.getMessage(), e);
     }
     return instance;
-
   }
 
 }

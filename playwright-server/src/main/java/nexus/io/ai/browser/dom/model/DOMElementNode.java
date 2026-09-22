@@ -7,7 +7,6 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 import nexus.io.tio.utils.collect.Lists;
-import nexus.io.tio.utils.hutool.StrUtil;
 
 public class DOMElementNode extends DOMBaseNode {
   private final String tagName;
@@ -25,7 +24,8 @@ public class DOMElementNode extends DOMBaseNode {
   // （viewportInfo / pageCoordinates 按需补）
   public static final List<String> DEFAULT_INCLUDE_ATTRIBUTES = Lists.of("title", "type", "checked", "name", "role", "value",
       //
-      "placeholder", "data-date-format", "alt", "aria-label", "aria-expanded", "data-state", "aria-checked");
+      "placeholder", "data-date-format", "alt", "aria-label", "aria-expanded", "data-state", "aria-checked",
+      "readonly", "disabled", "editable", "selected", "selected-text");
 
   public DOMElementNode(String tagName, String xpath, Map<String, String> attributes, boolean isVisible, boolean
   //
@@ -132,17 +132,21 @@ public class DOMElementNode extends DOMBaseNode {
   private void processNode(DOMBaseNode node, String indent, List<String> includeAttributes, List<String> out) {
     if (node instanceof DOMElementNode) {
       DOMElementNode el = (DOMElementNode) node;
-      if (el.getHighlightIndex() != null) {
+      if (el.getHighlightIndex() != null || (el.isVisible() && el.isTopElement &&
+          List.of("input", "textarea", "select", "option", "button").contains(el.tagName))) {
         String text = el.getAllTextTillNextClickableElement(-1);
         String attrStr = buildAttributesHtml(el.attributes, includeAttributes, text);
-        String indicator = Boolean.TRUE.equals(el.isNew()) ? "*[" + el.getHighlightIndex() + "]" : "[" + el.getHighlightIndex() + "]";
+        String indicator = el.highlightIndex == null ? "" : Boolean.TRUE.equals(el.isNew()) ? "*[" + el.getHighlightIndex() + "]" : "[" + el.getHighlightIndex() + "]";
         String line = indent + indicator + "<" + el.tagName + (attrStr.isEmpty() ? "" : " " + attrStr)
             + (text.isEmpty() ? (attrStr.isEmpty() ? " " : "") + "/>" : (attrStr.isEmpty() ? " " : "") + ">" + text + "/>");
         out.add(line);
       }
       // 继续递归
+      boolean meaningful = el.highlightIndex != null || List.of("form", "fieldset", "table", "thead", "tbody",
+          "tr", "td", "th", "ul", "ol", "li", "nav", "section", "dialog").contains(el.tagName);
+      String childIndent = meaningful && indent.length() < 6 ? indent + "\t" : indent;
       for (DOMBaseNode c : el.getChildren()) {
-        processNode(c, indent + "\t", includeAttributes, out);
+        processNode(c, childIndent, includeAttributes, out);
       }
     } else if (node instanceof DOMTextNode) {
       DOMTextNode txt = (DOMTextNode) node;
@@ -158,12 +162,25 @@ public class DOMElementNode extends DOMBaseNode {
   private String buildAttributesHtml(Map<String, String> attrs, List<String> includeAttributes, String text) {
     Map<String, String> keep = new LinkedHashMap<>();
     for (String k : includeAttributes) {
-      if (attrs.containsKey(k) && StrUtil.isNotBlank(attrs.get(k))) {
-        keep.put(k, cap(attrs.get(k), 15));
+      if (attrs.containsKey(k) && attrs.get(k) != null) {
+        String value = attrs.get(k);
+        if ("value".equals(k) && "password".equalsIgnoreCase(attrs.get("type"))) {
+          value = "[redacted]";
+        }
+        if (List.of("title", "placeholder", "alt", "aria-label", "selected-text").contains(k)) {
+          value = cap(value, 160);
+        }
+        keep.put(k, value);
       }
     }
     // “去重”“剔除与文本相同的属性” 等…可按需补
-    return keep.entrySet().stream().map(e -> e.getKey() + "='" + e.getValue() + "'").collect(Collectors.joining(" "));
+    return keep.entrySet().stream().map(e -> e.getKey() + "='" + escapeAttribute(e.getValue()) + "'")
+        .collect(Collectors.joining(" "));
+  }
+
+  private static String escapeAttribute(String value) {
+    return value.replace("&", "&amp;").replace("'", "&#39;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t");
   }
 
   private static String cap(String s, int max) {

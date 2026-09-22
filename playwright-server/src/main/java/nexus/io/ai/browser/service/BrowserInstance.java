@@ -17,7 +17,6 @@ import com.jfinal.kit.Kv;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType.LaunchPersistentContextOptions;
 import com.microsoft.playwright.Page;
-import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.Request;
 import com.microsoft.playwright.Response;
 
@@ -26,7 +25,6 @@ import nexus.io.ai.browser.dom.model.DOMState;
 public class BrowserInstance {
   /** 任务 ID:一个任务一个实例,截图与结构化文本都落在 data/&lt;id&gt;/ 下 */
   public final long id;
-  public final Playwright playwright;
   public BrowserContext context;
   public Page page;
   public Path profileDir;
@@ -67,10 +65,16 @@ public class BrowserInstance {
   public static class RecordedResponse {
     public final Response response;
     public final long at;
+    public final Kv request;
 
     public RecordedResponse(Response response, long at) {
+      this(response, at, new Kv());
+    }
+
+    public RecordedResponse(Response response, long at, Kv request) {
       this.response = response;
       this.at = at;
+      this.request = Kv.by("requestId", request.get("requestId")).set(request);
     }
   }
 
@@ -83,14 +87,15 @@ public class BrowserInstance {
   public final Map<String, Kv> routes = new ConcurrentHashMap<>();
   public final Set<String> routedPatterns = ConcurrentHashMap.newKeySet();
 
-  public BrowserInstance(Playwright playwright, BrowserContext ctx, Page pg) {
-    this(0L, playwright, ctx, pg, null, null);
-  }
-
-  public BrowserInstance(long id, Playwright playwright, BrowserContext ctx, Page pg, Path profileDir,
+  /**
+   * 一个任务的运行时状态
+   *
+   * <p>注意这里**不持有** Playwright:它是整个进程共用的 driver(见
+   * {@link PlaywrightService#playwright()}),任务的隔离单位是 BrowserContext 与 profile 目录。
+   */
+  public BrowserInstance(long id, BrowserContext ctx, Page pg, Path profileDir,
       LaunchPersistentContextOptions opts) {
     this.id = id;
-    this.playwright = playwright;
     this.context = ctx;
     this.page = pg;
     this.profileDir = profileDir;

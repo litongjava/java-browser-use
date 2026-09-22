@@ -1291,6 +1291,25 @@
       }
     }
 
+    // HTML attributes are defaults; properties contain the current form state.
+    if (['input', 'textarea', 'select', 'option'].includes(nodeData.tagName)) {
+      const attrs = nodeData.attributes;
+      attrs.value = node.type === 'password' ? '[redacted]' : String(node.value ?? '');
+      attrs.disabled = String(node.matches(':disabled') || node.getAttribute('aria-disabled') === 'true');
+      attrs.readonly = String(!!node.readOnly || node.getAttribute('aria-readonly') === 'true');
+      attrs.editable = String(attrs.readonly !== 'true' && attrs.disabled !== 'true' &&
+        (nodeData.tagName === 'textarea' || (nodeData.tagName === 'input' &&
+        !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'hidden'].includes(node.type))));
+      if (['checkbox', 'radio'].includes(node.type)) attrs.checked = String(node.checked);
+      if (nodeData.tagName === 'option') attrs.selected = String(node.selected);
+      if (nodeData.tagName === 'select') {
+        attrs['selected-text'] = Array.from(node.selectedOptions).map(o => o.text).join(', ');
+        if (node.multiple) attrs.value = JSON.stringify(Array.from(node.selectedOptions).map(o => o.value));
+      }
+    } else if (node.isContentEditable) {
+      nodeData.attributes.editable = 'true';
+    }
+
     let nodeWasHighlighted = false;
     // Perform visibility, interactivity, and highlighting checks
     if (node.nodeType === Node.ELEMENT_NODE) {

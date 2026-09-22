@@ -172,3 +172,4 @@ secrets.txt
 # 上面的 app.properties 规则是为了挡掉本地私有的配置覆盖,
 # 但服务自己的默认配置(端口)必须进版本库,否则 clone 下来起不了服务。
 !playwright-server/src/main/resources/app.properties
+taobao.json

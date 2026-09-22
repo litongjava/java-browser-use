@@ -2,6 +2,7 @@ package nexus.io.ai.browser.service;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
@@ -31,10 +32,44 @@ import nexus.io.model.body.RespBodyVo;
  */
 public class ActionService {
 
+  public static final Set<String> PAGE_CHANGING = Set.of(
+      // 导航
+      "navigate", "go_to_url", "go_back", "go_forward", "reload",
+      // 点击与交互
+      "click_element_by_index", "double_click_element_by_index", "click_element_by_selector",
+      "click_element_by_text", "click_element_by_role", "hover_and_click", "hover_element_by_index",
+      "focus_element_by_index", "check_element_by_index", "uncheck_element_by_index",
+      "input_text", "input_text_by_selector", "input_text_by_label", "type_text", "clear_text",
+      "send_keys", "key_down", "key_up", "select_dropdown_option", "upload_file", "drag_element_by_index",
+      // 滚动与鼠标
+      "scroll", "scroll_to_text", "mouse_move", "mouse_down", "mouse_up", "mouse_wheel",
+      // 页签
+      "new_tab", "switch_tab", "switch_tab_by_url", "close_tab", "close_other_tabs", "bring_to_front",
+      // 等待(等到了页面往往就变了)
+      "wait", "wait_for_element", "wait_for_text", "wait_for_url", "wait_for_load", "wait_for_function",
+      // 脚本与设置
+      "execute_js", "set_viewport", "set_media", "set_credentials");
+
   /** 命令数组里最多允许多少条,挡住一次请求塞进上万个动作 */
   private static final int MAX_COMMANDS = 200;
 
-  private final PlaywrightService svc = Aop.get(PlaywrightService.class);
+  private final PlaywrightService svc;
+
+  public ActionService() { this(Aop.get(PlaywrightService.class)); }
+
+  public ActionService(PlaywrightService svc) { this.svc = svc; }
+
+  private void attachCapture(RespBodyVo result, Long id, String method) {
+    if (id == null || !result.isOk() || !PAGE_CHANGING.contains(method)) return;
+    BrowserInstance inst = svc.getInstance(id);
+    if (inst == null) return;
+    Kv capture = svc.capture(inst);
+    Object data = result.getData();
+    Kv merged = data instanceof Kv ? (Kv) data : Kv.by("result", data);
+    merged.set(capture);
+    result.setData(merged);
+  }
+
 
   /**
    * 执行一条命令
@@ -55,7 +90,15 @@ public class ActionService {
       return RespBodyVo.fail("不支持的方法：" + method);
     }
     try {
-      return executor.run(svc, id, params == null ? new JSONObject() : params);
+      RespBodyVo result = executor.run(svc, id, params == null ? new JSONObject() : params);
+      if (!result.isOk() && result.getMsg() != null) {
+        java.util.regex.Matcher match = java.util.regex.Pattern.compile("\\[([A-Z_]+)\\]").matcher(result.getMsg());
+        String errorCode = match.find() ? match.group(1) : ActionError.code(result.getMsg());
+        Kv detail = result.getData() instanceof Kv ? (Kv) result.getData() : new Kv();
+        result.setData(detail.set("errorCode", errorCode));
+      }
+      attachCapture(result, id, method);
+      return result;
     } catch (Exception e) {
       return RespBodyVo.fail(method + " 失败：" + PlaywrightService.briefMessage(e.getMessage()));
     }

@@ -164,7 +164,7 @@ public class CommandTable {
     put("wait_for_response", (svc, id, a) -> svc.waitForResponse(id, reqStr(a, "urlPattern"),
         a.getDouble("timeoutSeconds"), a.getInteger("maxChars"), a.getInteger("lookBackSeconds")));
     put("get_response_body", (svc, id, a) -> svc.getResponseBody(id, optStr(a, "filter"), a.getInteger("index"),
-        a.getInteger("maxChars")));
+        a.getInteger("maxChars"), optStr(a, "requestId")));
 
     // ---------- 页面状态汇总与快照差异 ----------
     put("get_page_snapshot", (svc, id, a) -> svc.getPageSnapshot(id, a.getBoolean("includeConsole"),

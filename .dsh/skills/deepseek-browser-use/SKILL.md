@@ -1,7 +1,7 @@
 ---
 name: deepseek-browser-use
-description: 通过 HTTP 接口驱动真实浏览器完成网页任务：一个任务一个独立浏览器实例，用 get_browser_state 取回可交互结构化页面文本与元素索引，按索引点击/输入/勾选/悬停/拖拽/双击，下拉框、上传文件、多标签页、等待、鼠标、截图与 PDF、Cookie 与本地存储、浏览器设置、弹窗与控制台、网络拦截、执行任意 JavaScript、批量指令；每次页面变化自动截图、每次取状态自动落盘截图与结构化文本。当任务需要真实浏览器（JS 渲染、登录态、点击交互）而不是纯 HTTP 抓取时使用。
-whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点击、勾选、滚动、截图、执行 JS 或提取页面内容时；服务默认地址 http://localhost:10049。
+description: 通过 HTTP 接口驱动真实浏览器完成网页任务：一个任务一个独立浏览器实例，用 get_browser_state 取回可交互结构化页面文本与元素索引，按索引点击/输入/勾选/悬停/拖拽/双击，下拉框、上传文件、多标签页、等待、鼠标、截图与 PDF、Cookie 与本地存储、浏览器设置、弹窗与控制台、网络拦截、执行任意 JavaScript、批量指令；每次页面变化自动截图、每次取状态自动落盘截图与结构化文本（截图只留档，非必要不要读图，读文本即可，以节省 token）。当任务需要真实浏览器（JS 渲染、登录态、点击交互）而不是纯 HTTP 抓取时使用。
+whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点击、勾选、滚动、截图、执行 JS 或提取页面内容时；服务默认地址 http://localhost:10049。读页面只用 get_browser_state 的文本字段，非必要不要读它返回的图片。
 ---
 
 # DeepSeek Browser Use（HTTP 浏览器自动化）
@@ -13,6 +13,16 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 - **只有一个业务端点**：`POST http://localhost:10049/playwright/command`
 - 另有 `GET /playwright/health`（健康检查）与 `GET /data/**`（读取截图与结构化文本）
 - 共 93 个方法，`get_browser_state` 是阅读页面的入口，其余方法负责操作与观测
+
+> ## 省 token 铁律：非必要不要读图
+>
+> `get_browser_state` 以及每个「会改变页面」的方法都会带回 `data.screenshot`（URL）、`data.screenshot_path`（服务器本地路径），`get_browser_state` 还带回 `data.state_file`。**这些字段只是地址，不要顺手把它们读进上下文**：
+>
+> - **不要**为了「看看页面长什么样」去下载/打开这些图片，也不要交给视觉模型、不要用 图片读取工具读它。图片的 token 消耗比同一次返回的 `data.text` 高几个数量级。
+> - 定位与操作所需的全部信息都在文本里：`data.browser_state`（页签）+ `data.text`（每行的 `[index]` 就是元素索引）。**读图不会多给一个索引，只会多烧 token。**
+> - 判断「点击到底生效没有」不要靠看图：用点击回执里的 `data.changed`，或用 `diff_dom_text` 比文本差异，都比读图省得多。
+> - **只有文本根本表达不了的时候才看图**：验证码 / 二维码 / 扫码登录、图表与曲线、纯图片按钮或图标、以及文本与操作结果明显矛盾、必须肉眼确认的场合。这时优先用 `get_element_screenshot` **只截那一个元素**，而不是把整页大图读进来。
+> - 确实需要整页图时再用 `screenshot`（不传 `path` 会返回 `base64`），并且一次任务里尽量只读一张。
 
 ## 一、请求与响应
 
@@ -73,9 +83,43 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
 - **任何参数问题都返回 JSON 错误，不再有 HTTP 500**：缺必填参数得到 `click_element_by_index 失败：缺少参数 index`，方法名不存在得到 `不支持的方法：xxx`，请求体不是合法 JSON 得到 `请求体不是合法 JSON：...`。
 - 实例不存在时统一返回 `没有找到对应的浏览器实例：<id>`。
 
+### 响应精简模式（兼容原协议）
+
+请求信封可选 `responseMode: "compact"`，默认保持完整响应。`ok`、`code`、`error`、`msg` 一律保留，包括成功时的 null；精简仅发生在 `data` 内。
+
+```json
+{"id":"1001","method":"get_browser_state","responseMode":"compact","params":{"highlight":false}}
+```
+
+- 页面状态保留 `tabs`（index 为 0 基、current 标明当前页），省略重复的 `browser_state` 和顶层 URL/标题。
+- 保留截图 URL 与文本文件链接，省略本机截图绝对路径。不会省略截图错误。
+- 点击回执省略前后 URL、页签数、正文长度及 outerHtml 等诊断字段；请求信封加 `diagnostics: true` 可保留这些字段。
+- 批量结果逐条采用相同规则；网站返回的 body、脚本 result 及请求参数不会被递归删字段。
+- `count` 为已执行条数；批量中每个成功的页面动作恰好归档一次，末尾取状态仍独立归档。单条与批量经过同一执行收尾。
+
+### 表单状态和动作结果
+
+页面文本中的 value、checked、selected 来自实时 DOM 属性，不只是初始 HTML。只读、禁用状态及 editable 也会输出；select 提供 selected-text。密码值在快照和文本留档中为 `[redacted]`。可见的禁用表单控件可能没有操作索引，但仍输出状态。
+
+属性中的 name、value、状态值不再按 15 字符截断；title、placeholder、alt、aria-label、selected-text 的展示上限为 160 字符。普通布局容器不增加缩进，表单、菜单、表格等语义结构保留缩进，最多 6 层。
+
+动作错误的 `data.errorCode` 区分 ELEMENT_READ_ONLY、ELEMENT_DISABLED、ELEMENT_HIDDEN、ELEMENT_OBSCURED、ELEMENT_NOT_EDITABLE、STALE_ELEMENT、ACTION_TIMEOUT 和 ACTION_FAILED。错误原因来自完整调用日志；没有充分证据的超时只报 ACTION_TIMEOUT。
+
+点击回执会短暂等待异步变化（观察循环上限约 500ms，具体浏览器调用耗时另计）。`data.changeStatus` 为 observed 或 not_observed，`data.observationComplete` 指示探针是否成功，`data.observationWindowMs` 为观察窗口配置。`changed=false` 不表示点击失败，`changed=true` 也不表示查询、缴款等业务成功；应使用目标元素、文本或网络响应确认，禁止仅据此重复提交。
+
+### 网络证据关联
+
+`get_requests` 中每次请求有独立 requestId（雪花 ID 字符串）、requestedAt、method、url、resourceType；有请求体时附 postData、postDataLength、postDataTruncated。响应到达后回填 status 和 respondedAt，网络失败则记录 failure 和 finishedAt。
+
+`get_response_body` 和 `wait_for_response` 返回相同 requestId、对应 request 元数据、respondedAt 和 ageMs。bodyLength 是完整响应字符数，truncated 明示是否截断，bodyAvailable 指示响应体是否可用。重复 URL 应优先通过 requestId 回查，避免把上次查询结果当成本次结果。
+
+接口只报告网站返回的记录和查询条件：空列表或 Total=0 表示该条件下没有记录，不能自动解释为税额、余额等业务金额为零。
+
 ## 二、任务与浏览器实例
 
-**一个任务一个实例。** 每次 `start` 都会新建一套独立的 Playwright + Chromium + 持久化 profile，任务之间完全隔离。
+**一个任务一个实例。** 每次 `start` 都会新建一套独立的 Chromium + 持久化 profile，任务之间完全隔离。
+
+> 隔离的单位是**浏览器上下文**（独立 profile、独立浏览器进程），Playwright 的 driver 则是整个服务共用的一个。这对调用方完全透明：一个任务崩了不影响别的任务，`close` 也只关掉自己那套。
 
 - `id` 就是任务标识。`start` 时自己指定（例如用业务里的任务号），不传则自动生成雪花 ID。
 - 每个任务的 profile 目录是 `~/.config/browseruse/profiles/<id>`：**同一个 id 重新 start 时登录态还在**（cookie、localStorage 都留着），不同任务之间互不干扰。
@@ -105,7 +149,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
 | `data.tabs` | 页签数组：`index`（**0 基**）、`url`、`title`、`current` |
 | `data.pixels_above` / `data.pixels_below` | 视口上方/下方还有多少像素没进快照 |
 | `data.viewport_height` / `data.page_height` | 视口高度与整页高度 |
-| `data.seq` / `data.screenshot` / `data.screenshot_path` / `data.state_file` | 本次落盘的截图与结构化文本，见第四节 |
+| `data.seq` / `data.screenshot` / `data.screenshot_path` / `data.state_file` | 本次落盘的截图与结构化文本，见第四节。**前三个只是截图地址：非必要不要读图**，见开头的省 token 铁律；真正要读的是 `data.text` |
 
 ### 页签信息文本块
 
@@ -149,13 +193,13 @@ current tab is: 1
 | 现象 | 含义 |
 | --- | --- |
 | `[Start of page]` / `[End of page]` | 只是首尾标记，不是页面元素。**接口本身不输出这两行**（`data.text` 的第一行就是第一个元素），样例里出现它们是因为样例来自 demo/测试代码自己 `println` 的边界标记 |
-| 行首缩进（制表符） | DOM 嵌套层级：`[20]` 缩进在 `[19]<li />` 里，说明这条新闻链接属于那个 `li`；`[17]<div>` 缩进在 `[16]<a>` 里 |
+| 行首缩进（制表符） | 语义层级，普通布局容器折叠，最多 6 层；不是原始 DOM 深度：`[20]` 缩进在 `[19]<li />` 里，说明这条新闻链接属于那个 `li`；`[17]<div>` 缩进在 `[16]<a>` 里 |
 | `[index]` | 元素索引，所有按索引操作的方法都用它。**编号不连续**（`[12]` 后面直接是 `[14]`），因为只有 buildDomTree 判定为可交互的节点才有索引，不要把它当行号或「第 n 个元素」 |
 | 行尾 `/>` | 只是格式化后缀，**不代表自闭合**：`[0]<a >新闻/>` 里的 `新闻` 就是链接文字 |
 | `<a />`、`<span />`、`<div />`（没有文字） | 没有可见文字的节点：图标、装饰、空容器。它**有索引**就说明可以点 |
 | `[17]<div > />`（尖括号里只有一个空格） | 该节点没有任何被保留的语义属性，文本也只有一个空格 |
-| 属性集合 | 只保留语义信息：实测有 `type`、`placeholder`、`aria-label`、`title`、`name`、`value`（按钮类）。**没有 `id`、`class`、`href`、`style`**，所以从快照里看不出链接地址、也认不出 CSS 类名 |
-| `value='百度一下'` | 按钮类 input 上的按钮文字；输入框上出现的 `value` 是**当前值**（实测必应搜索框输入后快照里出现 `value='Mac Mini M4'`），但要确定地读值还是用 `get_element_value` |
+| 属性集合 | 只保留语义信息，并补充表单实时属性：有 `type`、`placeholder`、`aria-label`、`title`、`name`、`value`（按钮类）。**没有 `id`、`class`、`href`、`style`**，所以从快照里看不出链接地址、也认不出 CSS 类名 |
+| `value='百度一下'` | 按钮类 input 上的按钮文字；输入框上出现的 `value` 是**当前值**（实测必应搜索框输入后快照里出现 `value='Mac Mini M4'`），包含脚本修改后的实时属性；密码统一显示 `[redacted]`。也可用 `get_element_value` 单独读取 |
 | 文本顺序 | DOM 顺序；`[21]<li >新/>` 里的 `新` 是角标文字，真正的链接文字在它内部的 `[22]` 里 |
 | 元素在快照里找不到 | **不可见的元素不进快照**。实测百度首页的真实搜索框是 `INPUT#kw name=wd`，但它 `offsetParent === null`（被新的 AI 输入框取代而隐藏），快照里就没有它，只剩 `[16]<button >百度一下/>`。这种元素用选择器类方法也会失败（隐藏元素不满足可操作性），只能用 `execute_js` 设值，见第十节第 16 条 |
 
@@ -165,9 +209,9 @@ current tab is: 1
 - 要按 `id`/`class`/`href` 定位，用 `click_element_by_selector`、`input_text_by_selector`，或用 `execute_js` 取（例如 `document.querySelectorAll('a')[0].href`）。**只想看这些属性就先用 `get_interactive_map`**：它按当前快照的 xpath 一次回查全部元素，直接给出 `index → tag/id/className/href/name/text` 的映射，省掉一堆 `execute_js`。
 - `index` 直接用于：`click_element_by_index`、`input_text`、`upload_file`、`get_dropdown_options`、`select_dropdown_option`、`double_click_element_by_index`、`hover_element_by_index`、`focus_element_by_index`、`check_element_by_index`、`uncheck_element_by_index`、`type_text`、`drag_element_by_index`、`get_element_text`、`get_element_html`、`get_element_value`、`get_element_attribute`、`get_element_box`、`is_visible`、`is_enabled`、`is_checked`、`clear_text`、`hover_and_click`、`get_element_screenshot`、`screenshot`。
 - **没有快照时的差别**：`click_element_by_index`、`input_text`、`upload_file`、`get_dropdown_options`、`select_dropdown_option` 会退化成 CSS 选择器顺序索引；读取/状态类方法则直接报错 `索引越界: N,当前没有页面快照,请先调用 get_browser_state 获取元素索引`。
-- 索引越界返回 `xxx 索引越界: N`；元素已失效（快照过期）时按索引操作的等待上限是 **5 秒**，超时返回 `xxx 失败：元素不存在或页面已变化,请重新调用 get_browser_state 获取元素索引`。
-- **索引失效会自动补救两级**：先等 300 毫秒用同一个 xpath 重试（挡住动画/异步渲染的抖动），再重取一次临时快照，按「同 tag + 同文本且全页唯一」把元素找回来。都失败才报上面那句错误，**不会乱点别的元素**。补救用的临时快照不会覆盖当前快照，所以索引不会悄悄漂移。
-- 快照是**快照**：点击、跳转、异步渲染之后索引会重算，必须重新调用 `get_browser_state`；沿用旧索引只会得到越界或 5 秒超时。
+- 索引越界返回 `xxx 索引越界: N`；每次元素操作等待上限为 **5 秒**，部分按索引点击有恢复重试，总耗时可能更长。只读输入立即报错；超时本身不证明快照过期，需看 `data.errorCode`。
+- **索引失效会自动补救两级**：先等 300 毫秒用同一个 xpath 重试（挡住动画/异步渲染的抖动），再重取一次临时快照，按「同 tag + 同文本且全页唯一」把元素找回来。都失败才返回对应错误，**不会乱点别的元素**。补救用的临时快照不会覆盖当前快照，所以索引不会悄悄漂移。
+- 快照是**快照**：点击、跳转、异步渲染之后索引会重算，必须重新调用 `get_browser_state`；沿用旧索引可能得到越界或操作超时。
 
 ## 四、截图与可交互结构化文本（data/<id>/）
 
@@ -179,7 +223,7 @@ current tab is: 1
 | 每次 `get_browser_state` | `data/<id>/<seq>.png` 截图 **+** `data/<id>/<seq>.txt` 同名的可交互结构化文本 |
 
 - `seq` 是**每个任务独立的自增序号，从 1 开始**：1.png、2.png、3.png、4.png…… 一对 `.png` / `.txt` 的序号相同，表示是同一时刻的页面。
-- 这两个文件都可以直接 GET：`GET http://localhost:10049/data/<id>/<seq>.png`、`GET .../<seq>.txt`。视觉模型可以直接按 URL 取图。
+- 这两个文件都可以直接 GET：`GET http://localhost:10049/data/<id>/<seq>.png`、`GET .../<seq>.txt`。视觉模型可以按 URL 取图，**但非必要不要取**（见开头的省 token 铁律）：截图只是留档，智能体读页面请读 `data.text` 或同序号的 `.txt`。
 - 响应里的字段：`data.seq`、`data.screenshot`（URL，如 `/data/1001/3.png`）、`data.screenshot_path`（服务器本地绝对路径）、`data.state_file`（URL，只有 `get_browser_state` 有）。截图失败不会让方法失败，原因在 `data.screenshot_error`。
 - `<seq>.txt` 的内容是「页签文本块 + 空行 + 可交互结构化文本」，也就是 `data.browser_state` 加 `data.text`，方便事后离线复看某一步的页面。
 - 哪些方法算「会改变页面」：导航类（`navigate`、`go_to_url`、`go_back`、`go_forward`、`reload`）、点击与交互类、滚动与鼠标类、页签类、等待类、`execute_js` 与部分设置类。纯读取类（`get_url`、`get_cookies`、`is_visible`……）不截图，否则每读一个值就多一张一模一样的图。
@@ -195,7 +239,7 @@ current tab is: 1
 4. 用索引方法执行动作：`click_element_by_index`、`input_text`、`check_element_by_index`、`select_dropdown_option`……
 5. **页面只要发生变化（点击、跳转、异步渲染、弹窗）就回到第 3 步重新取一次**；没变化才可以继续用上一轮索引。判断「刚才那一下到底有没有变化」用 `diff_dom_text`，比重新读整页省 token。
 6. 需要判断「有没有加载出来」时用 `wait_for_element` / `wait_for_text` / `wait_for_url` / `wait_for_load`，不要用固定 `wait`。
-7. 需要看页面长什么样时，**先看 `data.screenshot`**（每步自动截图，直接给视觉模型）；要按需重截用 `screenshot`（不传 `path` 会返回 `base64`）；只看某个元素（验证码、二维码、图表）用 `get_element_screenshot`。
+7. **默认不看图**：`data.screenshot` 只是截图地址，非必要不要读进上下文（见开头的省 token 铁律）。判断页面变化用 `data.changed` 或 `diff_dom_text`；只有验证码、二维码、图表、纯图片元素这类「文本表达不了」的场景才按需取图，优先 `get_element_screenshot`（只截那一个元素），要整页图才用 `screenshot`（不传 `path` 会返回 `base64`）。
 8. 需要读接口返回的 JSON 时用 `wait_for_response`（等新响应）或 `get_response_body`（回看最近的响应），不要只靠 `get_requests` 的状态码猜。
 9. 想一次拿到页面当前状态（url/标题/页签/弹窗/是否还在加载）用 `get_page_snapshot`，不要连发五六次调用。
 10. 遇到验证码、短信码、人工登录这类智能体做不了的环节，用 `request_human_input` 把图和人话一起交出去，见第九节。
@@ -211,7 +255,7 @@ current tab is: 1
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
 | `start` | `id`(可选), `headless`(bool，默认 `true`) | 新建一个独立实例；返回 `data.id`。传 `id` 就把它当任务 ID |
-| `close` | `id` | 关闭上下文与 Playwright，释放实例（profile 保留） |
+| `close` | `id` | 关闭这个任务的浏览器上下文（profile 保留，下次同 id `start` 登录态还在） |
 
 ### 导航与页面信息
 
@@ -259,12 +303,12 @@ current tab is: 1
 | `data.urlBefore` / `data.urlAfter` | 点击前后的 URL |
 | `data.tabCountBefore` / `data.tabCountAfter` | 点击前后的页签数（变多说明弹出了新页签） |
 | `data.textLengthBefore` / `data.textLengthAfter` | 点击前后 `document.body.innerText` 的长度（粗略反映内容变化） |
-| `data.changed` | 上面三项有任意一项变化就是 `true` |
-| `data.hint` | `changed=false` 时出现：`xxx 已执行,但 url、页签数、正文长度都没有变化,请确认是否点中了目标元素` |
+| `data.changed` | URL、页签数或页面指纹发生变化则为 `true`；指纹涵盖正文、表单实时值和 DOM 结构状态 |
+| `data.hint` | `changed=false` 时出现：动作已执行，但观察窗口内尚未发现变化；不代表点击失败 |
 | `data.tag` / `data.text` / `data.outerHtml` | **只有** `click_element_by_text`、`click_element_by_role`、`hover_and_click` 返回：真正命中的元素是什么 |
 | `data.seq` / `data.screenshot` / `data.screenshot_path` | 这一步的自动截图，见第四节 |
 
-`ok=true` 只代表动作没抛异常，**不代表点中了东西**：实测点悬浮菜单时文本命中的是纯文本容器，方法返回成功但页面毫无变化。判断是否生效要看 `data.changed`。
+`ok=true` 只代表动作没抛异常，**不代表点中了东西**：实测点悬浮菜单时文本命中的是纯文本容器，方法返回成功但页面毫无变化。`data.changed` 仅表示观察到变化，不证明业务操作成功；为 false 时应等待目标条件。
 
 ### 读取元素信息与状态（按索引）
 
@@ -337,7 +381,7 @@ current tab is: 1
 | `get_element_screenshot` | `id`, `index`(可选), `selector`(可选), `path`(可选) | 只截一个元素，返回 `data.path`+`data.size` 或 `data.base64`、`data.target`。`index` 与 `selector` 传一个即可 |
 | `pdf` | `id`, `path`(可选) | 存 PDF，返回 `data.path`；不传 `path` 落到 `~/Downloads/broswer/` |
 
-> 日常「看页面长什么样」不用调 `screenshot`：第四节里每个改变页面的方法都自动截了图，`data.screenshot` 直接就能给视觉模型。`get_element_screenshot` 是验证码、二维码、图表这类「必须看图」的元素的标准做法：走 Playwright 自己的元素截图，**不受 canvas 跨域污染限制**（用 `execute_js` + canvas 手抠图，跨域图片会直接失败）。
+> 日常「看页面长什么样」**先别看图**：`data.screenshot` 是每个改变页面的方法自动留下的截图地址，但把图读进上下文很贵，非必要不要读（见开头的省 token 铁律），读 `data.text` 就够了。`get_element_screenshot` 是验证码、二维码、图表这类「必须看图」的元素的标准做法：走 Playwright 自己的元素截图，**不受 canvas 跨域污染限制**（用 `execute_js` + canvas 手抠图，跨域图片会直接失败），而且只截一个元素、比整页图省得多。
 
 ### Cookie 与本地存储
 
@@ -381,7 +425,7 @@ current tab is: 1
 | `unroute` | `id`, `urlPattern`(可选) | 不传则移除全部路由 |
 | `get_requests` | `id`, `filter`(可选) | 返回 `data.requests`（`method/url/resourceType/status`，**带请求体的请求另有 `postData`，最多 4000 字符**），最多 200 条，`filter` 按 URL 子串过滤。**只有元数据，没有响应体** |
 | `wait_for_response` | `id`, `urlPattern`, `timeoutSeconds`(可选), `maxChars`(可选), `lookBackSeconds`(可选) | 等 `urlPattern` 匹配的响应并返回它的响应体：`data.url`、`data.status`、`data.body`（默认最多 20000 字符）、`data.bodyLength`、`data.ageMs`、`data.fromLookBack`。匹配规则见下面的「URL 匹配」 |
-| `get_response_body` | `id`, `filter`(可选), `index`(可选), `maxChars`(可选) | 回看**已经发生过**的响应体（保留最近 100 个响应）。`filter` 按 URL 子串过滤，不传取最近一个；`index` 在多个匹配里选第几个（默认最后一个）。响应体已被释放时返回 `data.bodyError` |
+| `get_response_body` | `id`, `filter`(可选), `index`(可选), `maxChars`(可选), `requestId`(可选) | 回看**已经发生过**的响应体（保留最近 100 个响应）。`filter` 按 URL 子串过滤，不传取最近一个；`index` 在多个匹配里选第几个（默认最后一个）。可用 `requestId` 精确关联重复 URL 的某次请求。响应体已被释放时返回 `data.bodyError`，且 `data.bodyAvailable=false` |
 
 **URL 匹配**（`wait_for_response` 的 `urlPattern`、`switch_tab_by_url` 的 `url`）：先按**子串**匹配，再按**通配**匹配，通配里的 `*` 和 `**` 都表示任意字符、**可以跨 `/`**。模式没写尾部通配时，URL 后面还可以再跟内容（`#fragment`、`?query` 都算），所以：
 
@@ -593,7 +637,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 
 **悬浮菜单**：`hover_and_click` 一步完成悬停 + 点击（分两步菜单会收起来）。菜单项如果只有文本没有索引，用 `hover_and_click` 加 `selector`，注意选择器里的引号在 JSON 里要转义。
 
-**判断点击到底生效没有**：看点击回执里的 `data.changed`。`false` 说明 url、页签数、正文长度都没变，多半没点中；配合 `diff_dom_text` 能确认页面快照有没有变，`data.screenshot` 还能直接看图。
+**判断点击到底生效没有**：看点击回执里的 `data.changed`。`false` 只表示最多约 500ms 的观察窗口内尚未发现变化，不能据此重复提交；配合 `diff_dom_text` 能确认页面快照有没有变。**不要为了这个去读 `data.screenshot`**，图很贵（见开头的省 token 铁律）。
 
 **读某个接口返回的 JSON**：`wait_for_response` 加 `urlPattern` 与 `timeoutSeconds` 直接拿 `data.body`（默认先回看最近 10 秒）；已经发生过的用 `get_response_body`。
 
@@ -616,7 +660,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 13. 一个实例只对应一个当前 Page，**不要并发对同一个 `id` 发请求**；并发任务请各自 `start` 一个实例。
 14. `set_credentials` 会重建上下文，当前页面会丢；`headless=false` 会弹出真实窗口，只适合本机调试。
 15. 服务无鉴权且 `execute_js` 能执行任意脚本，对外部署前必须加访问控制。
-16. **不可见元素既不进快照，也不能用选择器操作**：实测百度首页的真实搜索框 `INPUT#kw`（`offsetParent === null`，被新的 AI 输入框取代而隐藏）不在 `data.text` 里，只剩提交按钮；`input_text_by_selector` 作用在它上面会等满 5 秒后返回 `input_text_by_selector 失败：没匹配到可操作的元素(不存在或不可见): 选择器 #kw`。这种元素只能用 `execute_js` 直接设值并派发事件：
+16. **不可见元素既不进快照，也不能用选择器操作**：实测百度首页的真实搜索框 `INPUT#kw`（`offsetParent === null`，被新的 AI 输入框取代而隐藏）不在 `data.text` 里，只剩提交按钮；`input_text_by_selector` 作用在它上面会等满 5 秒后返回 `input_text_by_selector 失败：[ELEMENT_HIDDEN] 元素当前不可见: 选择器 #kw`。这种元素只能用 `execute_js` 直接设值并派发事件：
 
     ```js
     (function(){var e=document.querySelector("#kw");e.focus();e.value="Mac Mini M4";
@@ -628,10 +672,11 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 18. **验证 `route` mock 时别等页面自己的回调**：实测页面加载时自己发起的 `fetch` 被 mock 后，渲染进程里的 `.then` 可能迟迟不执行（没有真实网络 IO 去唤醒它），而用 `execute_js` 主动发一次同样的请求就能立刻拿到 mock 数据。要验证拦截效果就用 `execute_js` 主动发请求，或看 `get_requests` 里的状态码。
 19. **一个批次里前面的失败会影响后面**：批次是顺序执行的，索引类命令依赖同一次快照，前面的点击跳转会改变 DOM；PTC 的稳妥做法是「动作段 + 末尾 `get_browser_state`」，用下一次推理基于新快照决定后续，而不是在一个批次里塞几十步。
 20. **`get_dialog` 是「最近一次弹窗」，不会自动清除**：它可能来自很早以前的一次操作，别把内容当成当前这一步的结果。实测提交验证码失败过之后，后续查询明明成功了，`get_dialog` 仍返回上一轮的「验证码输入错误」，据此误判会白跑一轮。用 `data.dialog.seq`/`timestamp` 判断新旧，或在每次提交动作前先 `get_dialog` 加 `consume: true`。
-21. **`ok=true` 不代表点中了东西**：点击类方法只保证动作没抛异常。实测点悬浮菜单时文本命中的是纯文本容器，方法返回成功但页面毫无变化。判断是否生效看回执里的 `data.changed`；`click_element_by_text` / `click_element_by_role` / `hover_and_click` 还会返回真正命中的 `data.tag`/`data.outerHtml`。
+21. **`ok=true` 不代表点中了东西**：点击类方法只保证动作没抛异常。实测点悬浮菜单时文本命中的是纯文本容器，方法返回成功但页面毫无变化。是否观察到变化看回执里的 `data.changed`；`click_element_by_text` / `click_element_by_role` / `hover_and_click` 还会返回真正命中的 `data.tag`/`data.outerHtml`。
 22. **`input_text` 清空不了**：`text` 是必填参数。要清空用 `clear_text`。
 23. **`get_requests` 只有元数据**：`method/url/resourceType/status`，加带请求体请求的 `postData`（最多 4000 字符），**没有响应体**。要读接口返回的内容用 `wait_for_response`（先回看最近 10 秒，再等新响应）或 `get_response_body`（回看最近 100 个响应）。另外 `wait_for_response` 遇到页面**自己**发起的 fetch 时，回调可能迟迟不执行（见第 18 条），这时用 `execute_js` 主动发一次同样的请求，或改用 `get_response_body` 回看。
 24. **页签索引不稳定**：实测点一次菜单会弹出两个同 URL 的重复页签，这时 `pageIndex` 很容易指错。按 URL 用 `switch_tab_by_url` 切换，用 `close_other_tabs` 清理，别一个个 `close_tab`（索引会整体前移）。
-25. **图片类元素只能靠截图接口拿**：`get_browser_state` 只有文本，`execute_js` + canvas 抠图遇到跨域图片会被污染直接失败。用 `get_element_screenshot`（走 Playwright 元素截图，不受同源限制）；智能体本身读不了图时，按第九节请人来看。
+25. **图片类元素只能靠截图接口拿**：`get_browser_state` 只有文本，`execute_js` + canvas 抠图遇到跨域图片会被污染直接失败。用 `get_element_screenshot`（走 Playwright 元素截图，不受同源限制）；智能体本身读不了图时，按第九节请人来看。**但只在确实必须看图时才调它**，非必要不要读图（见开头的省 token 铁律）。
 26. **截图序号是任务级的，不是调用级的**：`seq` 只增不减，`close` 再 `start` 同一个 id 也会接着往上加（文件不删就继续累加）。想要干净的一轮就从空的 `data/<id>/` 目录开始。
 27. **`data/<id>/` 里的文件不会自动清理**，长期跑要自己定期清理；服务只监听本机，`/data/**` 也没有鉴权，别把它暴露到公网。
+28. **非必要不要读 `get_browser_state`（以及任何自动截图）返回的图片**：`data.screenshot` / `data.screenshot_path` 只是地址，把图读进上下文非常贵，而定位和操作要的信息全在 `data.browser_state` + `data.text` 里。默认只读文本字段；确认页面变化用 `data.changed` / `diff_dom_text`；只有验证码、二维码、图表、纯图片元素这类文本表达不了的场景才取图，并且优先 `get_element_screenshot` 只截那一个元素。详见开头的省 token 铁律。

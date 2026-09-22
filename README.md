@@ -121,15 +121,34 @@ Content-Type: application/json
 
 ---
 
+### 可选精简响应
+
+请求信封增加 `"responseMode":"compact"` 可减少 `data` 内的重复页签描述、本机截图路径和点击诊断字段；`"diagnostics":true` 保留点击诊断信息。默认完整格式不变，`ok/code/error/msg` 在所有模式下均保留，包括 null。
+
+表单快照显示实时值、只读和禁用状态，密码值脱敏；普通布局缩进折叠。点击回执会短暂观察异步变化，`changed=false` 仅代表尚未观察到变化。单条和批量动作均自动归档截图。
+
+网络请求及响应通过 requestId 关联，支持按 ID 回查特定响应，并明确报告请求体、响应体的截断状态。业务查询返回空记录时，调用方需核实查询条件，不能直接推断金额为零。
+
 ## 四、核心概念
 
 ### 一个任务一个实例
 
-每次 `start` 都新建一套独立的 Playwright + Chromium + 持久化 profile，任务之间完全隔离：
+每次 `start` 都新建一套独立的 Chromium + 持久化 profile，任务之间完全隔离：
 
 - profile 在 `~/.config/browseruse/profiles/<id>`，**同一个 id 重新 `start` 时登录态还在**；
 - 同一个 id 不能重复 `start`（会明确报错，提示先 `close` 或换 id）；
 - 不同任务用不同 id，可以并发跑，互不干扰。
+
+**隔离的单位是浏览器上下文，不是 Playwright 的 driver。** `Playwright.create()` 会拉起一个 node 子进程并握手，每次约 350～400ms，还常驻一份内存；但「一个任务一个实例」并不需要各自一个 driver —— 真正需要隔离的是 `BrowserContext`（独立 profile、独立浏览器进程）。所以服务全进程共用一个 driver，`start` 直接从 `launchPersistentContext()` 开始：
+
+| | 每个任务一个 driver | 共享一个 driver（现在） |
+| --- | --- | --- |
+| 第 2 个任务起的 `start` 耗时 | ~850ms | ~480ms |
+| 空闲时的 node 进程 | 每个任务一个 | 1 个 |
+
+代价是 driver 成了单点：它一旦崩，所有任务一起断。所以 `start` 里带了自愈 —— 第一次失败就把共享实例判死、重建一个再试一次（实测 driver 被杀后，下一次 `start` 会在 ~340ms 内重建并成功）。
+
+`close` 只关掉该任务自己的浏览器上下文，**不会**动共享的 driver，因此关一个任务不会连累别的任务。driver 本身由 JVM 退出时的 shutdown hook 收尾；即使进程被硬杀（`taskkill /F`），driver 也会因为管道关闭自己退出，不会留下孤儿进程。
 
 ### get_browser_state：智能体的「眼睛」
 
@@ -196,15 +215,36 @@ mvn test
 ### 打发行版
 
 ```shell
-# 当前平台
+# 当前构建机对应的平台
 node scripts/package/build-release.mjs
 
-# 指定平台
+# 单个平台
 node scripts/package/build-release.mjs --platform=linux-x64
+
+# 家族别名:macos / linux 会展开成两个架构
+node scripts/package/build-release.mjs --platform=macos
+node scripts/package/build-release.mjs --platform=linux
 
 # 五个平台全打
 node scripts/package/build-release.mjs --platform=all
+
+# 看帮助
+node scripts/package/build-release.mjs --help
 ```
+
+平台名与别名：
+
+| 平台名 | 说明 |
+| --- | --- |
+| `windows-x64` | Windows 64 位 |
+| `linux-x64` / `linux-arm64` | Linux x86_64 / arm64 |
+| `macos-x64` / `macos-arm64` | macOS Intel / Apple 芯片 |
+| `all` | 上面五个 |
+| `macos`、`mac`、`darwin` | 等价于 `macos-x64` + `macos-arm64` |
+| `linux` | 等价于 `linux-x64` + `linux-arm64` |
+| `windows`、`win` | 等价于 `windows-x64` |
+
+**打包不受构建机限制**：在 Windows 上一样能打出 Linux 与 macOS 的包（macOS 的符号链接问题已在打包流程里处理，见下）。构建机需要 JDK 21+、Maven、Node.js 18+，以及能访问 Playwright 的 CDN。
 
 脚本会：
 
