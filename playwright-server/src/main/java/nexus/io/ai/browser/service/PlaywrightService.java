@@ -62,7 +62,8 @@ public class PlaywrightService {
   /**
    * 全进程共享的 Playwright(driver)
    *
-   * <p>只在 {@link #playwright()} 与 {@link #discardPlaywright()} 里读写,都用类锁保护。
+   * <p>
+   * 只在 {@link #playwright()} 与 {@link #discardPlaywright()} 里读写,都用类锁保护。
    */
   private static volatile Playwright sharedPlaywright;
 
@@ -81,7 +82,8 @@ public class PlaywrightService {
   }
 
   /** 以函数形式提交的脚本:function、async function、箭头函数 */
-  private static final Pattern FUNCTION_LIKE = Pattern.compile("^(async\\s+)?(function\\b|\\(|[A-Za-z_$][\\w$]*\\s*=>)");
+  private static final Pattern FUNCTION_LIKE = Pattern
+      .compile("^(async\\s+)?(function\\b|\\(|[A-Za-z_$][\\w$]*\\s*=>)");
 
   /** 语句中的 return,用于识别需要包装成函数体的脚本片段 */
   private static final Pattern RETURN_STATEMENT = Pattern.compile("(^|[;{}\\n])\\s*return[\\s;(]");
@@ -122,7 +124,8 @@ public class PlaywrightService {
   /**
    * 启动一个任务的浏览器实例
    *
-   * <p>一个任务一个实例,但**不是**一个任务一个 driver:全进程共用一个 Playwright(见
+   * <p>
+   * 一个任务一个实例,但**不是**一个任务一个 driver:全进程共用一个 Playwright(见
    * {@link #playwright()}),这里直接从 {@code launchPersistentContext()} 开始。隔离靠的是
    * 每个任务自己的 BrowserContext 与持久化 profile 目录
    * ({@code ~/.config/browseruse/profiles/<id>}),所以同一个 id 重新 start 时登录态还在,
@@ -197,11 +200,11 @@ public class PlaywrightService {
   /**
    * 进程内共享的 Playwright(driver)
    *
-   * <p>{@code Playwright.create()} 会拉起一个 node driver 进程并完成握手,每次大约几百毫秒,
-   * 而且每个实例都常驻一个 node 进程。但「一个任务一个实例」并不需要各自一个 driver ——
-   * 隔离的单位是 BrowserContext:每个任务有自己的 {@code launchPersistentContext}(独立
-   * profile、独立浏览器进程)。所以全进程共用一个 driver,{@code start} 直接从
-   * {@code launchPersistentContext()} 开始。
+   * <p>
+   * {@code Playwright.create()} 会拉起一个 node driver 进程并完成握手,每次大约几百毫秒, 而且每个实例都常驻一个
+   * node 进程。但「一个任务一个实例」并不需要各自一个 driver —— 隔离的单位是 BrowserContext:每个任务有自己的
+   * {@code launchPersistentContext}(独立 profile、独立浏览器进程)。所以全进程共用一个
+   * driver,{@code start} 直接从 {@code launchPersistentContext()} 开始。
    */
   private static Playwright playwright() {
     Playwright current = sharedPlaywright;
@@ -221,8 +224,8 @@ public class PlaywrightService {
   /**
    * 把共享的 Playwright 判死并关掉,下次 {@link #playwright()} 会重新创建
    *
-   * <p>只在 driver 已经不可用时调用。传进来的实例可能已经半死,close() 本身也可能抛异常,
-   * 所以这里的失败只记 debug 日志。
+   * <p>
+   * 只在 driver 已经不可用时调用。传进来的实例可能已经半死,close() 本身也可能抛异常, 所以这里的失败只记 debug 日志。
    */
   private static void discardPlaywright() {
     synchronized (PlaywrightService.class) {
@@ -241,8 +244,8 @@ public class PlaywrightService {
   /**
    * 用共享的 Playwright 起一个持久化上下文
    *
-   * <p>第一次失败时把共享实例判死、重建一个再试一次:driver 进程可能已经被上一次任务带崩了,
-   * 重建比让用户去重启整个服务划算。第二次还失败就把异常抛出去。
+   * <p>
+   * 第一次失败时把共享实例判死、重建一个再试一次:driver 进程可能已经被上一次任务带崩了, 重建比让用户去重启整个服务划算。第二次还失败就把异常抛出去。
    */
   private static BrowserContext launchContext(Path profileDir, LaunchPersistentContextOptions opts) {
     try {
@@ -257,19 +260,21 @@ public class PlaywrightService {
   /**
    * Chromium 启动参数
    *
-   * <p>这里**不传** {@code --no-sandbox} 与 {@code --disable-web-security}:Chrome 把这两个
+   * <p>
+   * 这里**不传** {@code --no-sandbox} 与 {@code --disable-web-security}:Chrome 把这两个
    * 标志当成「不受支持的命令行标志」,启动时会打印
    * {@code You are using an unsupported command-line flag: --no-sandbox. Stability and security will suffer.}
    * 并在窗口上挂一条提示。
    *
-   * <p>关键点是 {@code --no-sandbox} 根本不用我们加:Playwright 的 {@code chromiumSandbox}
-   * 默认就是 {@code false},它自己会往命令行里塞 {@code --no-sandbox}(见驱动的
+   * <p>
+   * 关键点是 {@code --no-sandbox} 根本不用我们加:Playwright 的 {@code chromiumSandbox} 默认就是
+   * {@code false},它自己会往命令行里塞 {@code --no-sandbox}(见驱动的
    * {@code _innerDefaultArgs}:{@code if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")})。
    * 所以真正要去掉这个警告,必须把 {@code chromiumSandbox} 打开,见 {@link #chromiumSandbox()}。
    */
   static List<String> chromiumArgs() {
     List<String> args = new ArrayList<>();
-    args.add("--disable-blink-features=AutomationControlled");
+    // 不禁用 AutomationControlled：该启动参数会触发 Chromium 的不受支持标志提示。
     if (isLinux()) {
       // 容器里 /dev/shm 往往只有 64MB,不加这个 Chrome 会随机崩
       args.add("--disable-dev-shm-usage");
@@ -280,10 +285,12 @@ public class PlaywrightService {
   /**
    * 是否开启 Chromium 沙箱
    *
-   * <p>Windows/macOS 上开启:这样 Playwright 不会再传 {@code --no-sandbox},既消掉了那条
+   * <p>
+   * Windows/macOS 上开启:这样 Playwright 不会再传 {@code --no-sandbox},既消掉了那条
    * 「不受支持的命令行标志」警告,又拿回了 Chrome 自己的进程沙箱(更安全)。
    *
-   * <p>Linux 上关闭:容器里通常以 root 运行,而 root 不带 {@code --no-sandbox} 时 Chrome
+   * <p>
+   * Linux 上关闭:容器里通常以 root 运行,而 root 不带 {@code --no-sandbox} 时 Chrome
    * 直接拒绝启动({@code Running as root without --no-sandbox is not supported})。这条路上
    * Chrome 仍会打印那条警告,这是容器里跑浏览器的固有代价。
    */
@@ -306,14 +313,11 @@ public class PlaywrightService {
     return Paths.get(userHome(), ".config", "browseruse", "profiles", String.valueOf(taskId));
   }
 
-
   /** 弹窗、控制台日志、页面错误:每个新页面都要挂一次 */
   private void attachListeners(BrowserInstance inst, Page page) {
     page.onDialog(dialog -> {
-      Kv info = Kv.by("type", dialog.type()).set("message", dialog.message())
-          .set("defaultValue", dialog.defaultValue())
-          .set("seq", inst.dialogSeq.incrementAndGet())
-          .set("timestamp", System.currentTimeMillis());
+      Kv info = Kv.by("type", dialog.type()).set("message", dialog.message()).set("defaultValue", dialog.defaultValue())
+          .set("seq", inst.dialogSeq.incrementAndGet()).set("timestamp", System.currentTimeMillis());
       inst.lastDialog = info;
       log.info("弹窗:{} {}", info.getStr("type"), info.getStr("message"));
       if (inst.dismissDialogs) {
@@ -342,17 +346,19 @@ public class PlaywrightService {
     });
     inst.context.onRequestFailed(request -> {
       Kv entry = inst.requestIndex.remove(request);
-      if (entry != null) entry.set("failure", request.failure()).set("finishedAt", System.currentTimeMillis());
+      if (entry != null)
+        entry.set("failure", request.failure()).set("finishedAt", System.currentTimeMillis());
     });
   }
 
   private static Kv requestInfo(Request request) {
-    Kv entry = Kv.by("requestId", String.valueOf(SnowflakeIdUtils.id()))
-        .set("requestedAt", System.currentTimeMillis()).set("method", request.method())
-        .set("url", request.url()).set("resourceType", request.resourceType()).set("status", null);
+    Kv entry = Kv.by("requestId", String.valueOf(SnowflakeIdUtils.id())).set("requestedAt", System.currentTimeMillis())
+        .set("method", request.method()).set("url", request.url()).set("resourceType", request.resourceType())
+        .set("status", null);
     String body = safePostData(request);
-    if (body != null) entry.set("postData", truncate(body, MAX_RECORDED_BODY_CHARS))
-        .set("postDataLength", body.length()).set("postDataTruncated", body.length() > MAX_RECORDED_BODY_CHARS);
+    if (body != null)
+      entry.set("postData", truncate(body, MAX_RECORDED_BODY_CHARS)).set("postDataLength", body.length())
+          .set("postDataTruncated", body.length() > MAX_RECORDED_BODY_CHARS);
     return entry;
   }
 
@@ -413,12 +419,14 @@ public class PlaywrightService {
   /**
    * 取浏览器当前状态:页签信息 + 页面结构化文本(可交互元素索引)
    *
-   * <p>执行 buildDomTree 把当前页面转成 AI 可读的结构化文本,并缓存本次快照。返回的 text 每行
-   * 形如 {@code [index]<tag attr='value'>文本/>},其中 index 就是 click_element_by_index、
+   * <p>
+   * 执行 buildDomTree 把当前页面转成 AI 可读的结构化文本,并缓存本次快照。返回的 text 每行 形如
+   * {@code [index]<tag attr='value'>文本/>},其中 index 就是 click_element_by_index、
    * input_text、upload_file、get_dropdown_options、select_dropdown_option 要用的元素索引。
    * 页面变化后需要重新调用。
    *
-   * <p>同时会做两件落盘动作(都放在 {@code data/&lt;id&gt;/} 下,由 /data/** 静态路由对外提供):
+   * <p>
+   * 同时会做两件落盘动作(都放在 {@code data/&lt;id&gt;/} 下,由 /data/** 静态路由对外提供):
    * <ol>
    * <li>截一张图,文件名是自增序号 {@code &lt;seq&gt;.png}</li>
    * <li>把页签文本 + 可交互结构化文本写成同名 {@code &lt;seq&gt;.txt}</li>
@@ -473,8 +481,8 @@ public class PlaywrightService {
   /**
    * 只重取一次快照,不落盘
    *
-   * <p>diff_dom_text 用:它每次都要重新 buildDomTree,但不需要产生一对新的截图/文本文件,
-   * 否则对比一次页面就多两张垃圾文件。
+   * <p>
+   * diff_dom_text 用:它每次都要重新 buildDomTree,但不需要产生一对新的截图/文本文件, 否则对比一次页面就多两张垃圾文件。
    */
   private RespBodyVo buildState(BrowserInstance inst, Boolean highlight, Integer viewportExpansion) {
     boolean doHighlight = highlight == null || highlight;
@@ -495,7 +503,8 @@ public class PlaywrightService {
   /**
    * 页签信息文本块,给模型直接读
    *
-   * <p>格式固定为(编号从 1 开始):
+   * <p>
+   * 格式固定为(编号从 1 开始):
    *
    * <pre>
    * Browser tab: 1, Title: "哔哩哔哩 (゜-゜)つロ 干杯~-bilibili", URL: "https://www.bilibili.com/".
@@ -503,8 +512,9 @@ public class PlaywrightService {
    * current tab is: 1
    * </pre>
    *
-   * <p>标题和 URL 都取不到的页签(新建但还没加载完的空白页)只输出 {@code Browser tab: N, }。
-   * 注意这里的编号是 1 基,而 data.tabs 里的 index 与 switch_tab 的 pageIndex 仍然是 0 基。
+   * <p>
+   * 标题和 URL 都取不到的页签(新建但还没加载完的空白页)只输出 {@code Browser tab: N, }。 注意这里的编号是 1 基,而
+   * data.tabs 里的 index 与 switch_tab 的 pageIndex 仍然是 0 基。
    */
   public static String browserStateText(BrowserInstance inst) {
     List<Page> pages = inst.context.pages();
@@ -550,7 +560,8 @@ public class PlaywrightService {
   /**
    * 给当前页面截图,序号自增
    *
-   * <p>文件落在 {@code data/&lt;id&gt;/&lt;seq&gt;.png},返回值里的 screenshot 是可以直接 GET 的
+   * <p>
+   * 文件落在 {@code data/&lt;id&gt;/&lt;seq&gt;.png},返回值里的 screenshot 是可以直接 GET 的
    * URL({@code /data/&lt;id&gt;/&lt;seq&gt;.png})。截图前会尽力等页面进入 DOMCONTENTLOADED,
    * 等不到(超时)也照常截图,不会因为等待失败而丢掉这一张。
    *
@@ -600,7 +611,6 @@ public class PlaywrightService {
     }
   }
 
-
   /** 所有标签页,index 可直接用于 switch_tab 与 close_tab */
   private List<Kv> tabs(BrowserInstance inst) {
     List<Page> pages = inst.context.pages();
@@ -624,8 +634,9 @@ public class PlaywrightService {
   /**
    * 把元素索引解析成定位器
    *
-   * <p>优先使用最近一次 get_browser_state 的 DOM 树快照,索引即结构化文本里的 [index];
-   * 还没有快照时回退为 CSS 选择器顺序索引。
+   * <p>
+   * 优先使用最近一次 get_browser_state 的 DOM 树快照,索引即结构化文本里的 [index]; 还没有快照时回退为 CSS
+   * 选择器顺序索引。
    *
    * @return 索引越界或没有对应元素时返回 null
    */
@@ -683,8 +694,9 @@ public class PlaywrightService {
   /**
    * 选择器/文本/角色/标签定位失败时的提示
    *
-   * <p>这些接口和快照索引无关,所以不能说「请重新调用 get_browser_state」;超时基本都是元素不存在或不可见
-   * (实测百度首页的搜索框 #kw 被隐藏,fill 会等满 5 秒后失败)。
+   * <p>
+   * 这些接口和快照索引无关,所以不能说「请重新调用 get_browser_state」;超时基本都是元素不存在或不可见 (实测百度首页的搜索框 #kw
+   * 被隐藏,fill 会等满 5 秒后失败)。
    */
   private static String locateFailure(String action, String target, PlaywrightException e) {
     return ActionError.describe(action, e.getMessage()) + ": " + target;
@@ -755,11 +767,13 @@ public class PlaywrightService {
   }
 
   private static void requireEditable(Locator locator) {
-    // Return the actual reason before spending the timeout waiting on a read-only date picker.
+    // Return the actual reason before spending the timeout waiting on a read-only
+    // date picker.
     if (locator.count() > 0) {
-      if (!locator.isEnabled()) throw new PlaywrightException("ELEMENT_DISABLED");
-      if ("true".equals(locator.getAttribute("aria-readonly")) ||
-          locator.getAttribute("readonly") != null) throw new PlaywrightException("ELEMENT_READ_ONLY");
+      if (!locator.isEnabled())
+        throw new PlaywrightException("ELEMENT_DISABLED");
+      if ("true".equals(locator.getAttribute("aria-readonly")) || locator.getAttribute("readonly") != null)
+        throw new PlaywrightException("ELEMENT_READ_ONLY");
     }
   }
 
@@ -793,7 +807,8 @@ public class PlaywrightService {
             return {textLength:text.length, fingerprint:String(hash >>> 0)};
           }
           """);
-      if (fingerprint instanceof Map) probe.putAll((Map) fingerprint);
+      if (fingerprint instanceof Map)
+        probe.putAll((Map) fingerprint);
     } catch (PlaywrightException e) {
       probe.set("probeError", briefMessage(e.getMessage()));
     }
@@ -811,7 +826,8 @@ public class PlaywrightService {
     Kv after = stateProbe(inst);
     long deadline = System.nanoTime() + 500_000_000L;
     while (!probeChanged(before, after) && !after.containsKey("probeError") && System.nanoTime() < deadline) {
-      // Pump Playwright events while waiting, allowing delayed popups and framework updates to arrive.
+      // Pump Playwright events while waiting, allowing delayed popups and framework
+      // updates to arrive.
       inst.page.waitForTimeout(50);
       after = stateProbe(inst);
     }
@@ -825,7 +841,8 @@ public class PlaywrightService {
   /**
    * 动作回执
    *
-   * <p>「点一下到底生效没有」光看 ok=true 判断不出来:实测点悬浮菜单项时命中的是纯文本节点,
+   * <p>
+   * 「点一下到底生效没有」光看 ok=true 判断不出来:实测点悬浮菜单项时命中的是纯文本节点,
    * 接口返回成功但页面毫无变化。这里把前后状态一起返回,changed 为 false 只说明观察窗口内尚未发现变化。
    */
   private static Kv receipt(Kv before, BrowserInstance inst) {
@@ -837,10 +854,9 @@ public class PlaywrightService {
     int lenBefore = asInt(before.get("textLength"));
     int lenAfter = asInt(after.get("textLength"));
     boolean changed = probeChanged(before, after);
-    return Kv.by("urlBefore", urlBefore).set("urlAfter", urlAfter)
-        .set("tabCountBefore", tabBefore).set("tabCountAfter", tabAfter)
-        .set("textLengthBefore", lenBefore).set("textLengthAfter", lenAfter).set("changed", changed)
-        .set("changeStatus", changed ? "observed" : "not_observed")
+    return Kv.by("urlBefore", urlBefore).set("urlAfter", urlAfter).set("tabCountBefore", tabBefore)
+        .set("tabCountAfter", tabAfter).set("textLengthBefore", lenBefore).set("textLengthAfter", lenAfter)
+        .set("changed", changed).set("changeStatus", changed ? "observed" : "not_observed")
         .set("observationComplete", !before.containsKey("probeError") && !after.containsKey("probeError"))
         .set("observationWindowMs", 500);
   }
@@ -857,12 +873,13 @@ public class PlaywrightService {
   /**
    * 按索引动作,带索引失效重试
    *
-   * <p>索引来自最近一次 get_browser_state 的 xpath。Vue/React 一重渲染(悬浮菜单尤其明显),
-   * xpath 指向的节点就没了,原来只能报「元素不存在或页面已变化」。这里失败后做两级补救:
-   * 先等 300ms 用同一个 xpath 重试(动画或异步渲染的抖动),再重取一次临时快照,按
-   * 「同 tag + 同文本且全页唯一」把元素找回来。都失败就照旧报错,不会乱点别的元素。
+   * <p>
+   * 索引来自最近一次 get_browser_state 的 xpath。Vue/React 一重渲染(悬浮菜单尤其明显), xpath
+   * 指向的节点就没了,原来只能报「元素不存在或页面已变化」。这里失败后做两级补救: 先等 300ms 用同一个 xpath
+   * 重试(动画或异步渲染的抖动),再重取一次临时快照,按 「同 tag + 同文本且全页唯一」把元素找回来。都失败就照旧报错,不会乱点别的元素。
    *
-   * <p>补救用的临时快照不覆盖 inst.domState,避免索引悄悄漂移。
+   * <p>
+   * 补救用的临时快照不覆盖 inst.domState,避免索引悄悄漂移。
    */
   private RespBodyVo indexAction(BrowserInstance inst, int index, String action, String fallbackSelector,
       Consumer<Locator> consumer, boolean withReceipt) {
@@ -908,7 +925,8 @@ public class PlaywrightService {
   /**
    * 按「同 tag + 同文本」在重取的临时快照里找回元素
    *
-   * <p>只有全页唯一匹配才返回;匹配到多个或一个都没有时返回 null,宁可失败也不猜。
+   * <p>
+   * 只有全页唯一匹配才返回;匹配到多个或一个都没有时返回 null,宁可失败也不猜。
    */
   private Locator recoverByIdentity(BrowserInstance inst, int index) {
     DOMState snapshot = inst.domState;
@@ -998,8 +1016,9 @@ public class PlaywrightService {
   /**
    * 后退一页
    *
-   * <p>goBack() 返回 null 只表示目标页没有 HTTP 响应(例如 about:blank),并不代表后退失败,
-   * 因此这里用 URL 是否变化来判断。
+   * <p>
+   * goBack() 返回 null 只表示目标页没有 HTTP 响应(例如 about:blank),并不代表后退失败, 因此这里用 URL
+   * 是否变化来判断。
    */
   public RespBodyVo goBack(Long browserId) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -1023,7 +1042,8 @@ public class PlaywrightService {
   /**
    * 固定等待若干秒
    *
-   * <p>方法名不叫 wait:Object.wait 会抢走重载解析,调用处只能写成 this.wait 才不歧义。
+   * <p>
+   * 方法名不叫 wait:Object.wait 会抢走重载解析,调用处只能写成 this.wait 才不歧义。
    */
   public RespBodyVo waitSeconds(Long browserId, Integer seconds) {
     if (!INSTANCES.containsKey(browserId)) {
@@ -1053,7 +1073,8 @@ public class PlaywrightService {
   /**
    * 点击后如果有新页签弹出,把它切成当前页并带到最前
    *
-   * <p>最多等 1.5 秒;没有新页签就什么也不做。
+   * <p>
+   * 最多等 1.5 秒;没有新页签就什么也不做。
    */
   private void adoptNewTab(BrowserInstance inst, int tabCountBefore) {
     for (int i = 0; i < 15; i++) {
@@ -1145,7 +1166,8 @@ public class PlaywrightService {
   /**
    * 把页面带到最前(激活页签)。
    *
-   * <p>Playwright 的 switch_tab / new_tab 只改服务端记录的当前页,有头模式下浏览器窗口里
+   * <p>
+   * Playwright 的 switch_tab / new_tab 只改服务端记录的当前页,有头模式下浏览器窗口里
    * 显示的仍是原来那个页签,人工看不到智能体正在操作哪一页。这里统一调用 bringToFront
    * 让窗口跟着切换;无头模式调用无副作用,页面已关闭时忽略异常。
    */
@@ -1160,7 +1182,8 @@ public class PlaywrightService {
   /**
    * 把指定页签(默认当前页签)带到窗口最前,返回 data.pageIndex
    *
-   * <p>switch_tab / new_tab 已经会自动带前,这个接口是给"我只是想让人看一眼这一页"用的:
+   * <p>
+   * switch_tab / new_tab 已经会自动带前,这个接口是给"我只是想让人看一眼这一页"用的:
    * 不改当前操作页,只切窗口。有头模式下人工能立刻看到。
    */
   public RespBodyVo bringToFront(Long browserId, Integer pageIndex) {
@@ -1183,8 +1206,9 @@ public class PlaywrightService {
   /**
    * 按 URL 匹配切换当前页签,返回 data.pageIndex
    *
-   * <p>页签多了以后 index 不稳定(实测点一次菜单会弹出两个同 URL 的重复页签),按 URL 找更可靠。
-   * url 支持 Playwright 通配写法(`**` 匹配任意字符),也支持子串;匹配到多个时取第一个。
+   * <p>
+   * 页签多了以后 index 不稳定(实测点一次菜单会弹出两个同 URL 的重复页签),按 URL 找更可靠。 url 支持 Playwright
+   * 通配写法(`**` 匹配任意字符),也支持子串;匹配到多个时取第一个。
    */
   public RespBodyVo switchTabByUrl(Long browserId, String url) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -1206,8 +1230,8 @@ public class PlaywrightService {
   /**
    * 关掉除指定页签之外的全部页签,返回 data.closed 与 data.remaining
    *
-   * <p>pageIndex 不传时保留当前页签。关重复页签用这个最省事:一个个 close_tab 会因为
-   * 索引整体前移而关错。
+   * <p>
+   * pageIndex 不传时保留当前页签。关重复页签用这个最省事:一个个 close_tab 会因为 索引整体前移而关错。
    */
   public RespBodyVo closeOtherTabs(Long browserId, Integer pageIndex) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -1246,7 +1270,8 @@ public class PlaywrightService {
   /**
    * 提取页面可见文本,extractLinks 为 true 时同时返回页面链接
    *
-   * <p>文本取 document.body.innerText,最多 20000 字符。读取前会临时隐藏 get_browser_state 画的
+   * <p>
+   * 文本取 document.body.innerText,最多 20000 字符。读取前会临时隐藏 get_browser_state 画的
    * 高亮层,避免高亮序号混进正文。
    */
   public RespBodyVo extractStructuredData(Long browserId, String query, boolean extractLinks) {
@@ -1255,13 +1280,11 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     try {
-      Object text = inst.page.evaluate("() => {"
-          + " const c = document.getElementById('playwright-highlight-container');"
-          + " const prev = c ? c.style.display : null;"
-          + " if (c) c.style.display = 'none';"
-          + " const t = document.body ? document.body.innerText.slice(0, 20000) : '';"
-          + " if (c) c.style.display = prev || '';"
-          + " return t; }");
+      Object text = inst.page
+          .evaluate("() => {" + " const c = document.getElementById('playwright-highlight-container');"
+              + " const prev = c ? c.style.display : null;" + " if (c) c.style.display = 'none';"
+              + " const t = document.body ? document.body.innerText.slice(0, 20000) : '';"
+              + " if (c) c.style.display = prev || '';" + " return t; }");
       Kv kv = Kv.by("query", query).set("text", text);
       if (extractLinks) {
         Object links = inst.page.evaluate("() => Array.from(document.querySelectorAll('a[href]'))"
@@ -1357,14 +1380,15 @@ public class PlaywrightService {
   /**
    * 在浏览器当前页面执行 JavaScript
    *
-   * <p>body 支持三种写法:
+   * <p>
+   * body 支持三种写法:
    * <ul>
    * <li>表达式:document.title</li>
    * <li>函数:() =&gt; document.title 或 () =&gt; { ...; return value; }</li>
    * <li>语句片段:const el = document.querySelector('#kw'); return el.value;</li>
    * </ul>
-   * Playwright 会对脚本求值,结果为函数时自动调用,返回值必须是 JSON 可序列化的值,
-   * DOM 元素等对象不会报错但只会返回 ref: &lt;Node&gt; 这样的引用,请先转换为 outerHTML、textContent 等基本类型。
+   * Playwright 会对脚本求值,结果为函数时自动调用,返回值必须是 JSON 可序列化的值, DOM 元素等对象不会报错但只会返回 ref:
+   * &lt;Node&gt; 这样的引用,请先转换为 outerHTML、textContent 等基本类型。
    *
    * @param browserId 浏览器实例 ID
    * @param body      需要执行的 JavaScript
@@ -1639,9 +1663,11 @@ public class PlaywrightService {
   /**
    * 按选择器点击
    *
-   * <p>点完如果弹出了新页签就自动切过去(并带到最前),否则留在原页签。返回点击回执。
+   * <p>
+   * 点完如果弹出了新页签就自动切过去(并带到最前),否则留在原页签。返回点击回执。
    *
-   * <p>注意参数类型必须是 Long:控制器传的就是 Long,如果这里再放一个 long 重载,重载解析会
+   * <p>
+   * 注意参数类型必须是 Long:控制器传的就是 Long,如果这里再放一个 long 重载,重载解析会
    * 选中参数类型完全匹配的那个,另一个就成了永远不生效的死代码(改接口行为时尤其容易踩)。
    */
   public RespBodyVo clickElementBySelector(Long browserId, String selector) {
@@ -1661,15 +1687,15 @@ public class PlaywrightService {
   }
 
   public RespBodyVo inputTextBySelector(Long browserId, String selector, String value) {
-    return actBySelector(browserId, "input_text_by_selector", selector,
-        (locator) -> fillEditable(locator, value));
+    return actBySelector(browserId, "input_text_by_selector", selector, (locator) -> fillEditable(locator, value));
   }
 
   /**
    * 按可见文本点击
    *
-   * <p>直接点 `getByText` 命中的那个节点是靠不住的:实测政务站点的悬浮菜单里,文本命中的是
-   * `<div class="scrollList">` 这类纯文本容器,接口返回成功但什么也没发生。所以这里先向上找
+   * <p>
+   * 直接点 `getByText` 命中的那个节点是靠不住的:实测政务站点的悬浮菜单里,文本命中的是 `<div class="scrollList">`
+   * 这类纯文本容器,接口返回成功但什么也没发生。所以这里先向上找
    * **最近的可点击祖先**(`a`/`button`/`[role=button]`/`[onclick]`),找到就点它,找不到才退回
    * 点文本节点本身;返回的 data 里带上真正点中的 `tag` 与 `outerHtml`,假成功一眼可见。
    */
@@ -1722,8 +1748,9 @@ public class PlaywrightService {
   /**
    * 文本定位:优先返回"最近的可点击祖先"
    *
-   * <p>给命中的元素打一个临时属性,再用属性选择器取回,这样拿到的定位器只指向这一个元素,
-   * 不受祖先/兄弟节点同名文本的影响。属性由调用方在动作完成后清理(见 {@link TextHit#cleanup()})。
+   * <p>
+   * 给命中的元素打一个临时属性,再用属性选择器取回,这样拿到的定位器只指向这一个元素, 不受祖先/兄弟节点同名文本的影响。属性由调用方在动作完成后清理(见
+   * {@link TextHit#cleanup()})。
    */
   private TextHit resolveByText(BrowserInstance inst, String text) {
     Locator candidates = inst.page.getByText(text);
@@ -1800,17 +1827,17 @@ public class PlaywrightService {
   }
 
   public RespBodyVo inputTextByLabel(Long browserId, String label, String value) {
-    return actByLocator(browserId, "input_text_by_label", "标签 " + label,
-        (inst) -> inst.page.getByLabel(label).first(),
+    return actByLocator(browserId, "input_text_by_label", "标签 " + label, (inst) -> inst.page.getByLabel(label).first(),
         (locator) -> fillEditable(locator, value));
   }
 
   /**
    * 悬停后立刻点击同一个元素
    *
-   * <p>悬浮菜单必须 hover 才渲染,而 hover_element_by_index → click_element_by_index 两步走,
-   * 中间隔着一次推理往返,菜单早收起来了(实测政务站点的「我要查询」下拉菜单)。这里把两步合成
-   * 一次调用,中间只留一个可调的 hoverDelayMs(默认 300 毫秒)。
+   * <p>
+   * 悬浮菜单必须 hover 才渲染,而 hover_element_by_index → click_element_by_index 两步走,
+   * 中间隔着一次推理往返,菜单早收起来了(实测政务站点的「我要查询」下拉菜单)。这里把两步合成 一次调用,中间只留一个可调的 hoverDelayMs(默认
+   * 300 毫秒)。
    */
   public RespBodyVo hoverAndClick(Long browserId, Integer index, String selector, Integer hoverDelayMs) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -1846,7 +1873,8 @@ public class PlaywrightService {
   /**
    * 清空输入框,返回 data.value(清空后的值)
    *
-   * <p>`input_text` 的 text 是必填参数,传空串会被参数校验挡掉(HTTP 500「缺少参数 text」),
+   * <p>
+   * `input_text` 的 text 是必填参数,传空串会被参数校验挡掉(HTTP 500「缺少参数 text」),
    * 所以清空要单独走这个接口。index 与 selector 传一个即可。
    */
   public RespBodyVo clearText(Long browserId, Integer index, String selector) {
@@ -1917,7 +1945,8 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     try {
-      inst.page.locator(selector).first().waitFor(new Locator.WaitForOptions().setTimeout(timeoutMillis(timeoutSeconds)));
+      inst.page.locator(selector).first()
+          .waitFor(new Locator.WaitForOptions().setTimeout(timeoutMillis(timeoutSeconds)));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(waitFailure("wait_for_element", e));
     }
@@ -1958,7 +1987,8 @@ public class PlaywrightService {
     LoadState loadState = "networkidle".equalsIgnoreCase(state) ? LoadState.NETWORKIDLE
         : "domcontentloaded".equalsIgnoreCase(state) ? LoadState.DOMCONTENTLOADED : LoadState.LOAD;
     try {
-      inst.page.waitForLoadState(loadState, new Page.WaitForLoadStateOptions().setTimeout(timeoutMillis(timeoutSeconds)));
+      inst.page.waitForLoadState(loadState,
+          new Page.WaitForLoadStateOptions().setTimeout(timeoutMillis(timeoutSeconds)));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(waitFailure("wait_for_load", e));
     }
@@ -2022,7 +2052,8 @@ public class PlaywrightService {
   /**
    * 页面截图
    *
-   * <p>传了 index 或 selector 时只截该元素;否则截整页,可以用 clipX/clipY/clipWidth/clipHeight
+   * <p>
+   * 传了 index 或 selector 时只截该元素;否则截整页,可以用 clipX/clipY/clipWidth/clipHeight
    * 指定裁剪区域(四个都传才生效)。path 为空时返回 data.base64。
    */
   public RespBodyVo screenshot(Long browserId, String path, Boolean fullPage, Integer index, String selector,
@@ -2034,8 +2065,7 @@ public class PlaywrightService {
     if (index != null || (selector != null && !selector.isEmpty())) {
       return elementScreenshot(inst, index, selector, path);
     }
-    Page.ScreenshotOptions options = new Page.ScreenshotOptions()
-        .setFullPage(fullPage != null && fullPage);
+    Page.ScreenshotOptions options = new Page.ScreenshotOptions().setFullPage(fullPage != null && fullPage);
     if (clipX != null && clipY != null && clipWidth != null && clipHeight != null) {
       options.setClip(clipX, clipY, clipWidth, clipHeight);
     }
@@ -2057,7 +2087,8 @@ public class PlaywrightService {
   /**
    * 只截一个元素,返回 data.path+data.size 或 data.base64
    *
-   * <p>和用 execute_js + canvas 抠图相比,这里走 Playwright 自己的截图,不受 canvas 跨域污染限制,
+   * <p>
+   * 和用 execute_js + canvas 抠图相比,这里走 Playwright 自己的截图,不受 canvas 跨域污染限制,
    * 验证码、二维码、图表这类"必须看图"的元素都能拿到。
    */
   public RespBodyVo getElementScreenshot(Long browserId, Integer index, String selector, String path) {
@@ -2090,8 +2121,8 @@ public class PlaywrightService {
         Files.write(Paths.get(path), bytes);
         return RespBodyVo.ok(Kv.by("path", path).set("size", bytes.length).set("target", target));
       }
-      return RespBodyVo.ok(Kv.by("base64", Base64.getEncoder().encodeToString(bytes)).set("size", bytes.length)
-          .set("target", target));
+      return RespBodyVo.ok(
+          Kv.by("base64", Base64.getEncoder().encodeToString(bytes)).set("size", bytes.length).set("target", target));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(locateFailure("get_element_screenshot", target, e));
     } catch (IOException e) {
@@ -2164,8 +2195,8 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     try {
-      Object value = inst.page.evaluate(
-          "(key) => key ? localStorage.getItem(key) : JSON.stringify(localStorage)", key == null ? "" : key);
+      Object value = inst.page.evaluate("(key) => key ? localStorage.getItem(key) : JSON.stringify(localStorage)",
+          key == null ? "" : key);
       return RespBodyVo.ok(Kv.by("value", value));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail("get_local_storage 失败：" + briefMessage(e.getMessage()));
@@ -2288,9 +2319,10 @@ public class PlaywrightService {
   /**
    * 读最近一次弹窗
    *
-   * <p>弹窗记录不会自动清除,所以它可能来自很早以前的一次操作。data.dialog 里带 seq 与
-   * timestamp,客户端可以据此判断是不是新弹窗;consume 为 true 时读后即清,下一次读只会
-   * 返回这之后新产生的弹窗(推荐在每次提交动作前 consume 一次,避免把旧弹窗当成新结果)。
+   * <p>
+   * 弹窗记录不会自动清除,所以它可能来自很早以前的一次操作。data.dialog 里带 seq 与
+   * timestamp,客户端可以据此判断是不是新弹窗;consume 为 true 时读后即清,下一次读只会 返回这之后新产生的弹窗(推荐在每次提交动作前
+   * consume 一次,避免把旧弹窗当成新结果)。
    */
   public RespBodyVo getDialog(Long browserId, Boolean consume) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -2333,7 +2365,8 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    return RespBodyVo.ok(Kv.by("logs", new ArrayList<>(inst.consoleLogs)).set("errors", new ArrayList<>(inst.pageErrors)));
+    return RespBodyVo
+        .ok(Kv.by("logs", new ArrayList<>(inst.consoleLogs)).set("errors", new ArrayList<>(inst.pageErrors)));
   }
 
   public RespBodyVo clearConsoleLogs(Long browserId) {
@@ -2422,8 +2455,9 @@ public class PlaywrightService {
   /**
    * 回看最近一个匹配的响应体
    *
-   * <p>保留最近 100 个响应,filter 按 URL 子串过滤(不传取最近一个)。响应体已经被释放
-   * (例如中间发生过跳转)时,data.bodyError 里会说明原因。
+   * <p>
+   * 保留最近 100 个响应,filter 按 URL 子串过滤(不传取最近一个)。响应体已经被释放 (例如中间发生过跳转)时,data.bodyError
+   * 里会说明原因。
    */
   public RespBodyVo getResponseBody(Long browserId, String filter, Integer index, Integer maxChars) {
     return getResponseBody(browserId, filter, index, maxChars, null);
@@ -2460,15 +2494,18 @@ public class PlaywrightService {
   /**
    * 等一个网络响应并返回它的响应体
    *
-   * <p>SPA 页面的数据都在 XHR 里,而 get_requests 只有 url 和状态码,看不到返回内容。这个接口
-   * 等 urlPattern(Playwright 通配,如 `**&#47;api&#47;nsrxx&#47;query`)匹配的响应出现,然后直接把
+   * <p>
+   * SPA 页面的数据都在 XHR 里,而 get_requests 只有 url 和状态码,看不到返回内容。这个接口 等
+   * urlPattern(Playwright 通配,如 `**&#47;api&#47;nsrxx&#47;query`)匹配的响应出现,然后直接把
    * 响应体给出来 —— 「点一下 → 等接口 → 读 JSON」一次调用完成。
    *
-   * <p>**先回看再等**:`lookBackSeconds`(默认 10 秒)内已经收到过的匹配响应会直接返回,并把
-   * `data.ageMs` 设成它距今的毫秒数。这样在批量里「点击 → wait_for_response」的顺序写法也能
+   * <p>
+   * **先回看再等**:`lookBackSeconds`(默认 10 秒)内已经收到过的匹配响应会直接返回,并把 `data.ageMs`
+   * 设成它距今的毫秒数。这样在批量里「点击 → wait_for_response」的顺序写法也能
    * 命中(响应往往在点击返回前就到了),不必并发对同一个实例发请求。
    *
-   * <p>`lookBackSeconds=0` 表示只等新响应。要看已经发生过的响应,用 get_response_body。
+   * <p>
+   * `lookBackSeconds=0` 表示只等新响应。要看已经发生过的响应,用 get_response_body。
    */
   public RespBodyVo waitForResponse(Long browserId, String urlPattern, Double timeoutSeconds, Integer maxChars,
       Integer lookBackSeconds) {
@@ -2502,7 +2539,8 @@ public class PlaywrightService {
     }
     BrowserInstance.RecordedResponse recorded = snapshotResponses(inst).stream()
         .filter(item -> item.response == response).findFirst()
-        .orElseGet(() -> new BrowserInstance.RecordedResponse(response, System.currentTimeMillis(), requestInfo(response.request())));
+        .orElseGet(() -> new BrowserInstance.RecordedResponse(response, System.currentTimeMillis(),
+            requestInfo(response.request())));
     Kv kv = responseInfo(recorded, maxChars);
     kv.set("ageMs", 0).set("fromLookBack", false);
     return RespBodyVo.ok(kv);
@@ -2511,9 +2549,10 @@ public class PlaywrightService {
   /**
    * url 是否匹配 pattern:先按子串,再按通配
    *
-   * <p>通配里的 `*` 可以跨 `/`(即 `**&#47;example.com*` 能匹配 `https://example.com/`)。
-   * 这一点比 Playwright 原生的通配宽松:原生把 `*` 当成"不含 / 的一串",`https://example.com/`
-   * 末尾那个 `/` 会让 `**&#47;example.com*` 匹配不上。回看和等待用同一套匹配,行为一致。
+   * <p>
+   * 通配里的 `*` 可以跨 `/`(即 `**&#47;example.com*` 能匹配 `https://example.com/`)。 这一点比
+   * Playwright 原生的通配宽松:原生把 `*` 当成"不含 / 的一串",`https://example.com/` 末尾那个 `/` 会让
+   * `**&#47;example.com*` 匹配不上。回看和等待用同一套匹配,行为一致。
    */
   private static boolean urlMatches(String url, String pattern) {
     if (pattern == null || pattern.isEmpty()) {
@@ -2556,9 +2595,8 @@ public class PlaywrightService {
 
   private static Kv responseInfo(BrowserInstance.RecordedResponse recorded, Integer maxChars) {
     Kv kv = responseInfo(recorded.response, maxChars);
-    kv.set("requestId", recorded.request.get("requestId"))
-        .set("request", recorded.request).set("respondedAt", recorded.at)
-        .set("ageMs", Math.max(0, System.currentTimeMillis() - recorded.at));
+    kv.set("requestId", recorded.request.get("requestId")).set("request", recorded.request)
+        .set("respondedAt", recorded.at).set("ageMs", Math.max(0, System.currentTimeMillis() - recorded.at));
     return kv;
   }
 
@@ -2583,11 +2621,14 @@ public class PlaywrightService {
   /**
    * 一次拿到「页面现在是什么状态」需要的全部信息
    *
-   * <p>替代 get_url + get_title + get_tabs + get_dialog + get_console_logs + get_requests 六次调用。
-   * 不返回 DOM 快照文本(那是 get_browser_state 的活),只做状态汇总。
+   * <p>
+   * 替代 get_url + get_title + get_tabs + get_dialog + get_console_logs +
+   * get_requests 六次调用。 不返回 DOM 快照文本(那是 get_browser_state 的活),只做状态汇总。
    *
-   * <p>返回 data.url、data.title、data.tabs、data.dialog(带 seq/timestamp)、data.loading、
-   * data.logs / data.errors(includeConsole=true)、data.requests(includeRequests=true)。
+   * <p>
+   * 返回 data.url、data.title、data.tabs、data.dialog(带 seq/timestamp)、data.loading、
+   * data.logs /
+   * data.errors(includeConsole=true)、data.requests(includeRequests=true)。
    */
   public RespBodyVo getPageSnapshot(Long browserId, Boolean includeConsole, Boolean includeRequests,
       String requestFilter) {
@@ -2622,11 +2663,12 @@ public class PlaywrightService {
   /**
    * 与上一次快照比较,返回新增/消失的行
    *
-   * <p>会重新执行一次 buildDomTree(和 get_browser_state 一样),再和上一次的文本按行做多重集差集。
-   * 判断「刚才那一下到底有没有让页面变化」比重新读整页省 token:data.changed=false 就说明
-   * 快照内容一模一样。
+   * <p>
+   * 会重新执行一次 buildDomTree(和 get_browser_state 一样),再和上一次的文本按行做多重集差集。
+   * 判断「刚才那一下到底有没有让页面变化」比重新读整页省 token:data.changed=false 就说明 快照内容一模一样。
    *
-   * <p>返回 data.changed、data.first(第一次快照没有可比对象)、data.added、data.removed、
+   * <p>
+   * 返回 data.changed、data.first(第一次快照没有可比对象)、data.added、data.removed、
    * data.url、data.title、data.tabs;added/removed 各最多 200 行。
    */
   public RespBodyVo diffDomText(Long browserId, Boolean highlight, Integer viewportExpansion) {
@@ -2695,10 +2737,12 @@ public class PlaywrightService {
   /**
    * 返回「索引 → 元素定位信息」的映射
    *
-   * <p>快照文本里只有语义属性,没有 id/class/href,想拿这些以前只能上 execute_js。这个接口按
-   * 当前快照的 xpath 一次回查所有元素,给出 index、tag、xpath、id、className、href、name、text。
+   * <p>
+   * 快照文本里只有语义属性,没有 id/class/href,想拿这些以前只能上 execute_js。这个接口按 当前快照的 xpath
+   * 一次回查所有元素,给出 index、tag、xpath、id、className、href、name、text。
    *
-   * <p>索引仍然来自最近一次 get_browser_state;没有快照时直接报错。
+   * <p>
+   * 索引仍然来自最近一次 get_browser_state;没有快照时直接报错。
    */
   public RespBodyVo getInteractiveMap(Long browserId) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -2721,8 +2765,7 @@ public class PlaywrightService {
     try {
       raw = inst.page.evaluate("(list) => list.map(xpath => {"
           + " const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
-          + " const e = r.singleNodeValue; if (!e) return null;"
-          + " return { tag: e.tagName, id: e.id || null,"
+          + " const e = r.singleNodeValue; if (!e) return null;" + " return { tag: e.tagName, id: e.id || null,"
           + " className: typeof e.className === 'string' ? e.className : null,"
           + " href: e.getAttribute ? e.getAttribute('href') : null,"
           + " name: e.getAttribute ? e.getAttribute('name') : null,"
@@ -2751,8 +2794,8 @@ public class PlaywrightService {
   /**
    * 发起一个人工介入请求
    *
-   * <p>验证码、短信码、人工登录这类环节,智能体既读不了图也拿不到凭证,只能请人来做。这个接口
-   * 把「请人」这件事固定下来:
+   * <p>
+   * 验证码、短信码、人工登录这类环节,智能体既读不了图也拿不到凭证,只能请人来做。这个接口 把「请人」这件事固定下来:
    *
    * <ol>
    * <li>request_human_input 建一个待办,可选把某个元素(验证码图)截成 base64 一起返回,并把当前页签带到最前</li>
@@ -2760,7 +2803,8 @@ public class PlaywrightService {
    * <li>智能体用 get_human_input 取答案;带 timeoutSeconds 时可以当长轮询用</li>
    * </ol>
    *
-   * <p>返回 data.requestId、data.prompt、data.expiresAt、data.url,以及传了 index/selector 时的
+   * <p>
+   * 返回 data.requestId、data.prompt、data.expiresAt、data.url,以及传了 index/selector 时的
    * data.imageBase64 与 data.imageSize。
    */
   public RespBodyVo requestHumanInput(Long browserId, String prompt, Integer index, String selector,
@@ -2777,8 +2821,8 @@ public class PlaywrightService {
     inst.humanRequests.put(requestId, request);
     // 需要人工介入时把页面带到最前,人才能直接看到验证码/表单
     activate(inst.page);
-    Kv data = Kv.by("requestId", requestId).set("prompt", prompt).set("expiresAt", expiresAt)
-        .set("url", inst.page.url());
+    Kv data = Kv.by("requestId", requestId).set("prompt", prompt).set("expiresAt", expiresAt).set("url",
+        inst.page.url());
     if (index != null || (selector != null && !selector.isEmpty())) {
       RespBodyVo shot = elementScreenshot(inst, index, selector, null);
       if (shot.isOk() && shot.getData() instanceof Kv) {
@@ -2809,9 +2853,9 @@ public class PlaywrightService {
   /**
    * 取人工答复
    *
-   * <p>data.status 为 pending / answered / expired。传 timeoutSeconds 时长轮询等待答复,到时间
-   * 还没答复就返回当前状态(不算失败)。人在浏览器里自己把事情做完了、始终没提交答复时,这里
-   * 会一直是 pending 直到过期,智能体可以直接继续后续步骤。
+   * <p>
+   * data.status 为 pending / answered / expired。传 timeoutSeconds 时长轮询等待答复,到时间
+   * 还没答复就返回当前状态(不算失败)。人在浏览器里自己把事情做完了、始终没提交答复时,这里 会一直是 pending 直到过期,智能体可以直接继续后续步骤。
    */
   public RespBodyVo getHumanInput(Long browserId, String requestId, Integer timeoutSeconds) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -2863,8 +2907,9 @@ public class PlaywrightService {
   /**
    * 重建任务自己的浏览器上下文
    *
-   * <p>用在 {@code set_credentials} 这类需要换掉整个上下文(代理、认证)的接口上。只换
-   * BrowserContext,共享的 Playwright 不动。
+   * <p>
+   * 用在 {@code set_credentials} 这类需要换掉整个上下文(代理、认证)的接口上。只换 BrowserContext,共享的
+   * Playwright 不动。
    */
   public BrowserInstance restartContext(BrowserInstance instance) {
     try {

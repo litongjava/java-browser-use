@@ -17,9 +17,10 @@ import nexus.io.model.body.RespBodyVo;
 /**
  * 方法分发与批量指令执行器
  *
- * <p>对外只有一个端点 {@code POST /playwright/command},请求体是
- * {@code {"id":123,"method":"get_browser_state","params":{}}}。{@link #execute} 负责把
- * {@code method} 分发到 {@link CommandTable},批量调用走 {@code method=commands}:
+ * <p>
+ * 对外只有一个端点 {@code POST /playwright/command},请求体是
+ * {@code {"id":123,"method":"get_browser_state","params":{}}}。{@link #execute}
+ * 负责把 {@code method} 分发到 {@link CommandTable},批量调用走 {@code method=commands}:
  *
  * <pre>
  * {"id":123,"method":"commands","params":{
@@ -27,8 +28,9 @@ import nexus.io.model.body.RespBodyVo;
  *    "commands":[{"click_element_by_index":{"index":12}},{"get_browser_state":{}}]}}
  * </pre>
  *
- * <p>批量里每一步的结果都在 data.results 里,所以一个批次可以同时做动作和读取(点击 →
- * get_browser_state → 再点击),模型一次推理就能拿到全部观察结果。
+ * <p>
+ * 批量里每一步的结果都在 data.results 里,所以一个批次可以同时做动作和读取(点击 → get_browser_state →
+ * 再点击),模型一次推理就能拿到全部观察结果。
  */
 public class ActionService {
 
@@ -36,11 +38,11 @@ public class ActionService {
       // 导航
       "navigate", "go_to_url", "go_back", "go_forward", "reload",
       // 点击与交互
-      "click_element_by_index", "double_click_element_by_index", "click_element_by_selector",
-      "click_element_by_text", "click_element_by_role", "hover_and_click", "hover_element_by_index",
-      "focus_element_by_index", "check_element_by_index", "uncheck_element_by_index",
-      "input_text", "input_text_by_selector", "input_text_by_label", "type_text", "clear_text",
-      "send_keys", "key_down", "key_up", "select_dropdown_option", "upload_file", "drag_element_by_index",
+      "click_element_by_index", "double_click_element_by_index", "click_element_by_selector", "click_element_by_text",
+      "click_element_by_role", "hover_and_click", "hover_element_by_index", "focus_element_by_index",
+      "check_element_by_index", "uncheck_element_by_index", "input_text", "input_text_by_selector",
+      "input_text_by_label", "type_text", "clear_text", "send_keys", "key_down", "key_up", "select_dropdown_option",
+      "upload_file", "drag_element_by_index",
       // 滚动与鼠标
       "scroll", "scroll_to_text", "mouse_move", "mouse_down", "mouse_up", "mouse_wheel",
       // 页签
@@ -55,21 +57,26 @@ public class ActionService {
 
   private final PlaywrightService svc;
 
-  public ActionService() { this(Aop.get(PlaywrightService.class)); }
+  public ActionService() {
+    this(Aop.get(PlaywrightService.class));
+  }
 
-  public ActionService(PlaywrightService svc) { this.svc = svc; }
+  public ActionService(PlaywrightService svc) {
+    this.svc = svc;
+  }
 
   private void attachCapture(RespBodyVo result, Long id, String method) {
-    if (id == null || !result.isOk() || !PAGE_CHANGING.contains(method)) return;
+    if (id == null || !result.isOk() || !PAGE_CHANGING.contains(method))
+      return;
     BrowserInstance inst = svc.getInstance(id);
-    if (inst == null) return;
+    if (inst == null)
+      return;
     Kv capture = svc.capture(inst);
     Object data = result.getData();
     Kv merged = data instanceof Kv ? (Kv) data : Kv.by("result", data);
     merged.set(capture);
     result.setData(merged);
   }
-
 
   /**
    * 执行一条命令
@@ -107,7 +114,8 @@ public class ActionService {
   /**
    * 批量指令:params 里是 {@code stopOnError} 与 {@code commands}
    *
-   * <p>{@code commands} 每项只能有一个键,键是命令名、值是参数对象:
+   * <p>
+   * {@code commands} 每项只能有一个键,键是命令名、值是参数对象:
    * {@code [{"click_element_by_index":{"index":12}},{"get_browser_state":{}}]}。
    */
   public RespBodyVo batchExecute(Long id, JSONObject params) {
@@ -163,8 +171,8 @@ public class ActionService {
         result = RespBodyVo.fail(PlaywrightService.briefMessage(e.getMessage()));
       }
 
-      results.add(Kv.by("index", i).set("command", cmdName).set("ok", result.isOk())
-          .set("data", result.getData()).set("msg", result.getMsg()));
+      results.add(Kv.by("index", i).set("command", cmdName).set("ok", result.isOk()).set("data", result.getData())
+          .set("msg", result.getMsg()));
 
       if (result.isOk()) {
         succeeded++;

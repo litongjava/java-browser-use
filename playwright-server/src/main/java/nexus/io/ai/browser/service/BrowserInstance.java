@@ -35,7 +35,8 @@ public class BrowserInstance {
   /**
    * 截图序号:每次「可能改变页面」的指令执行后自增一次
    *
-   * <p>落盘文件名就是 {@code data/&lt;id&gt;/&lt;seq&gt;.png},同一个序号的 .txt 是同一时刻的
+   * <p>
+   * 落盘文件名就是 {@code data/&lt;id&gt;/&lt;seq&gt;.png},同一个序号的 .txt 是同一时刻的
    * 可交互结构化文本,两者一一对应。
    */
   public final AtomicInteger captureSeq = new AtomicInteger();
@@ -90,11 +91,11 @@ public class BrowserInstance {
   /**
    * 一个任务的运行时状态
    *
-   * <p>注意这里**不持有** Playwright:它是整个进程共用的 driver(见
+   * <p>
+   * 注意这里**不持有** Playwright:它是整个进程共用的 driver(见
    * {@link PlaywrightService#playwright()}),任务的隔离单位是 BrowserContext 与 profile 目录。
    */
-  public BrowserInstance(long id, BrowserContext ctx, Page pg, Path profileDir,
-      LaunchPersistentContextOptions opts) {
+  public BrowserInstance(long id, BrowserContext ctx, Page pg, Path profileDir, LaunchPersistentContextOptions opts) {
     this.id = id;
     this.context = ctx;
     this.page = pg;

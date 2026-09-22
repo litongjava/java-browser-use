@@ -20,14 +20,16 @@ import nexus.io.tio.utils.environment.EnvUtils;
 /**
  * 发行包里内嵌的 Chromium
  *
- * <p>单文件发行版把目标平台的 Chromium 整个塞进 jar 的 {@code browsers/} 目录,首次运行时解压到
- * 用户缓存目录,之后直接用 {@code executablePath} 启动它。这样用户拿到 jar 就能跑,Playwright
- * 不会再去下载任何浏览器。
+ * <p>
+ * 单文件发行版把目标平台的 Chromium 整个塞进 jar 的 {@code browsers/} 目录,首次运行时解压到 用户缓存目录,之后直接用
+ * {@code executablePath} 启动它。这样用户拿到 jar 就能跑,Playwright 不会再去下载任何浏览器。
  *
- * <p>开发态(从 target/classes 运行、jar 里没有 browsers/index.txt)下 {@link #executablePath()}
- * 返回 null,服务会退回 Playwright 自己管理的浏览器,本地开发不受影响。
+ * <p>
+ * 开发态(从 target/classes 运行、jar 里没有 browsers/index.txt)下
+ * {@link #executablePath()} 返回 null,服务会退回 Playwright 自己管理的浏览器,本地开发不受影响。
  *
- * <p>打包时由 {@code scripts/package} 下的脚本生成:
+ * <p>
+ * 打包时由 {@code scripts/package} 下的脚本生成:
  * <ul>
  * <li>{@code browsers/index.txt}:内嵌文件清单,一行一个相对路径</li>
  * <li>{@code browsers/meta.properties}:{@code build}(构建标识,决定解压目录)与
@@ -36,9 +38,10 @@ import nexus.io.tio.utils.environment.EnvUtils;
  * {@code 相对路径<TAB>链接目标}</li>
  * </ul>
  *
- * <p>为什么符号链接要单独一个清单:macOS 的 {@code Chromium.app} 是标准的 framework 结构,
- * 靠 {@code Versions/Current -> 138.0.7204.23} 这类符号链接才能启动。而打包机不一定是 macOS
- * (Windows 上创建符号链接需要管理员特权),所以打包时把链接记下来,由这里在目标机器上重建。
+ * <p>
+ * 为什么符号链接要单独一个清单:macOS 的 {@code Chromium.app} 是标准的 framework 结构, 靠
+ * {@code Versions/Current -> 138.0.7204.23} 这类符号链接才能启动。而打包机不一定是 macOS (Windows
+ * 上创建符号链接需要管理员特权),所以打包时把链接记下来,由这里在目标机器上重建。
  */
 @Slf4j
 public final class BundledBrowser {
@@ -199,11 +202,13 @@ public final class BundledBrowser {
   /**
    * 重建符号链接
    *
-   * <p>macOS 的 {@code Chromium.app} 靠 framework 里的符号链接启动,而打包机不一定能创建它们,
-   * 所以打包时把链接清单写进 {@code browsers/symlinks.txt},这里在目标机器上重建。
+   * <p>
+   * macOS 的 {@code Chromium.app} 靠 framework 里的符号链接启动,而打包机不一定能创建它们, 所以打包时把链接清单写进
+   * {@code browsers/symlinks.txt},这里在目标机器上重建。
    *
-   * <p>已经有同名实体文件时先删掉;创建失败只记日志,不让整个解压失败 —— 万一某个平台不允许
-   * 建链接,至少浏览器主体是完整的,后面找不到可执行文件时还会退回 Playwright 自带的浏览器。
+   * <p>
+   * 已经有同名实体文件时先删掉;创建失败只记日志,不让整个解压失败 —— 万一某个平台不允许 建链接,至少浏览器主体是完整的,后面找不到可执行文件时还会退回
+   * Playwright 自带的浏览器。
    */
   private static void createSymlinks(Path root) {
     List<String> lines;
@@ -249,15 +254,15 @@ public final class BundledBrowser {
 
   /** Linux/macOS 下把解压出来的文件标成可执行:Chromium 的二进制与辅助进程都要求 +x */
   private static void makeExecutable(Path path) {
-    setPermissions(path, EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE,
-        PosixFilePermission.OWNER_EXECUTE, PosixFilePermission.GROUP_READ, PosixFilePermission.GROUP_EXECUTE,
-        PosixFilePermission.OTHERS_READ, PosixFilePermission.OTHERS_EXECUTE));
+    setPermissions(path,
+        EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE,
+            PosixFilePermission.GROUP_READ, PosixFilePermission.GROUP_EXECUTE, PosixFilePermission.OTHERS_READ,
+            PosixFilePermission.OTHERS_EXECUTE));
   }
 
   /** 清单里没写可执行文件时,按平台惯例在解压结果里找 */
   private static Path findExecutable(Path root) throws IOException {
-    List<String> candidates = isWindows()
-        ? List.of("chrome-win/chrome.exe", "chrome-win64/chrome.exe")
+    List<String> candidates = isWindows() ? List.of("chrome-win/chrome.exe", "chrome-win64/chrome.exe")
         : isMac()
             ? List.of("chrome-mac/Chromium.app/Contents/MacOS/Chromium",
                 "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium")

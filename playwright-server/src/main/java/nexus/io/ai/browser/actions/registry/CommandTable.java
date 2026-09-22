@@ -14,12 +14,13 @@ import nexus.io.model.body.RespBodyVo;
 /**
  * 命令表:唯一的方法分发处
  *
- * <p>对外只有一个 HTTP 端点 {@code POST /playwright/command},请求体形如
+ * <p>
+ * 对外只有一个 HTTP 端点 {@code POST /playwright/command},请求体形如
  * {@code {"id":123,"method":"go_to_url","params":{"url":"https://example.com"}}}。
  * {@code method} 就是这张表的键,{@code params} 里的参数名与下面 Executor 里读的键完全一致。
  *
- * <p>批量调用 {@code commands} 里的命令名用的是同一套名字,所以模型在「单独调用」和「批量调用」
- * 之间不需要切换心智模型。
+ * <p>
+ * 批量调用 {@code commands} 里的命令名用的是同一套名字,所以模型在「单独调用」和「批量调用」 之间不需要切换心智模型。
  */
 public class CommandTable {
 
@@ -47,8 +48,8 @@ public class CommandTable {
     put("reload", (svc, id, a) -> svc.reload(id));
     put("get_url", (svc, id, a) -> svc.getUrl(id));
     put("get_title", (svc, id, a) -> svc.getTitle(id));
-    put("get_browser_state", (svc, id, a) -> svc.getBrowserState(id, a.getBoolean("highlight"),
-        a.getInteger("viewportExpansion")));
+    put("get_browser_state",
+        (svc, id, a) -> svc.getBrowserState(id, a.getBoolean("highlight"), a.getInteger("viewportExpansion")));
     put("wait", (svc, id, a) -> svc.waitSeconds(id, reqInt(a, "seconds")));
 
     // ---------- 元素交互(按索引) ----------
@@ -67,18 +68,15 @@ public class CommandTable {
     put("key_down", (svc, id, a) -> svc.keyDown(id, reqStr(a, "keys")));
     put("key_up", (svc, id, a) -> svc.keyUp(id, reqStr(a, "keys")));
     put("get_dropdown_options", (svc, id, a) -> svc.getDropdownOptions(id, reqInt(a, "index")));
-    put("select_dropdown_option",
-        (svc, id, a) -> svc.selectDropdownOption(id, reqInt(a, "index"), reqStr(a, "text")));
-    put("scroll", (svc, id, a) -> svc.scroll(id, optBool(a, "down"), reqInt(a, "numPages"),
-        a.getInteger("index")));
+    put("select_dropdown_option", (svc, id, a) -> svc.selectDropdownOption(id, reqInt(a, "index"), reqStr(a, "text")));
+    put("scroll", (svc, id, a) -> svc.scroll(id, optBool(a, "down"), reqInt(a, "numPages"), a.getInteger("index")));
     put("scroll_to_text", (svc, id, a) -> svc.scrollToText(id, reqStr(a, "text")));
 
     // ---------- 读取元素信息与状态 ----------
     put("get_element_text", (svc, id, a) -> svc.getElementText(id, reqInt(a, "index")));
     put("get_element_html", (svc, id, a) -> svc.getElementHtml(id, reqInt(a, "index")));
     put("get_element_value", (svc, id, a) -> svc.getElementValue(id, reqInt(a, "index")));
-    put("get_element_attribute",
-        (svc, id, a) -> svc.getElementAttribute(id, reqInt(a, "index"), reqStr(a, "name")));
+    put("get_element_attribute", (svc, id, a) -> svc.getElementAttribute(id, reqInt(a, "index"), reqStr(a, "name")));
     put("get_element_count", (svc, id, a) -> svc.getElementCount(id, reqStr(a, "selector")));
     put("get_element_box", (svc, id, a) -> svc.getElementBox(id, reqInt(a, "index")));
     put("is_visible", (svc, id, a) -> svc.isVisible(id, reqInt(a, "index")));
@@ -90,8 +88,7 @@ public class CommandTable {
     put("input_text_by_selector",
         (svc, id, a) -> svc.inputTextBySelector(id, reqStr(a, "selector"), reqStr(a, "text")));
     put("click_element_by_text", (svc, id, a) -> svc.clickElementByText(id, reqStr(a, "text")));
-    put("click_element_by_role",
-        (svc, id, a) -> svc.clickElementByRole(id, reqStr(a, "role"), optStr(a, "name")));
+    put("click_element_by_role", (svc, id, a) -> svc.clickElementByRole(id, reqStr(a, "role"), optStr(a, "name")));
     put("input_text_by_label", (svc, id, a) -> svc.inputTextByLabel(id, reqStr(a, "label"), reqStr(a, "text")));
     put("clear_text", (svc, id, a) -> svc.clearText(id, a.getInteger("index"), optStr(a, "selector")));
     put("hover_and_click", (svc, id, a) -> svc.hoverAndClick(id, a.getInteger("index"), optStr(a, "selector"),
@@ -122,31 +119,28 @@ public class CommandTable {
     put("mouse_wheel", (svc, id, a) -> svc.mouseWheel(id, reqDouble(a, "deltaY")));
 
     // ---------- 截图与 PDF ----------
-    put("screenshot", (svc, id, a) -> svc.screenshot(id, optStr(a, "path"), a.getBoolean("fullPage"),
-        a.getInteger("index"), optStr(a, "selector"), a.getDouble("clipX"), a.getDouble("clipY"),
-        a.getDouble("clipWidth"), a.getDouble("clipHeight")));
-    put("get_element_screenshot", (svc, id, a) -> svc.getElementScreenshot(id, a.getInteger("index"),
-        optStr(a, "selector"), optStr(a, "path")));
+    put("screenshot",
+        (svc, id, a) -> svc.screenshot(id, optStr(a, "path"), a.getBoolean("fullPage"), a.getInteger("index"),
+            optStr(a, "selector"), a.getDouble("clipX"), a.getDouble("clipY"), a.getDouble("clipWidth"),
+            a.getDouble("clipHeight")));
+    put("get_element_screenshot",
+        (svc, id, a) -> svc.getElementScreenshot(id, a.getInteger("index"), optStr(a, "selector"), optStr(a, "path")));
     put("pdf", (svc, id, a) -> svc.pdf(id, optStr(a, "path")));
 
     // ---------- Cookie 与本地存储 ----------
     put("get_cookies", (svc, id, a) -> svc.getCookies(id, optStr(a, "url")));
-    put("set_cookie",
-        (svc, id, a) -> svc.setCookie(id, reqStr(a, "name"), reqStr(a, "value"), optStr(a, "url")));
+    put("set_cookie", (svc, id, a) -> svc.setCookie(id, reqStr(a, "name"), reqStr(a, "value"), optStr(a, "url")));
     put("clear_cookies", (svc, id, a) -> svc.clearCookies(id));
     put("get_local_storage", (svc, id, a) -> svc.getLocalStorage(id, optStr(a, "key")));
-    put("set_local_storage",
-        (svc, id, a) -> svc.setLocalStorage(id, reqStr(a, "key"), optStr(a, "value")));
+    put("set_local_storage", (svc, id, a) -> svc.setLocalStorage(id, reqStr(a, "key"), optStr(a, "value")));
     put("clear_local_storage", (svc, id, a) -> svc.clearLocalStorage(id));
 
     // ---------- 浏览器设置 ----------
     put("set_viewport", (svc, id, a) -> svc.setViewport(id, reqInt(a, "width"), reqInt(a, "height")));
-    put("set_geolocation",
-        (svc, id, a) -> svc.setGeolocation(id, reqDouble(a, "latitude"), reqDouble(a, "longitude")));
+    put("set_geolocation", (svc, id, a) -> svc.setGeolocation(id, reqDouble(a, "latitude"), reqDouble(a, "longitude")));
     put("set_offline", (svc, id, a) -> svc.setOffline(id, optBool(a, "offline")));
     put("set_headers", (svc, id, a) -> svc.setHeaders(id, reqStr(a, "headersJson")));
-    put("set_credentials",
-        (svc, id, a) -> svc.setCredentials(id, reqStr(a, "username"), reqStr(a, "password")));
+    put("set_credentials", (svc, id, a) -> svc.setCredentials(id, reqStr(a, "username"), reqStr(a, "password")));
     put("set_media", (svc, id, a) -> svc.setMedia(id, reqStr(a, "colorScheme")));
 
     // ---------- 弹窗与控制台 ----------
@@ -182,8 +176,8 @@ public class CommandTable {
     put("request_human_input", (svc, id, a) -> svc.requestHumanInput(id, reqStr(a, "prompt"), a.getInteger("index"),
         optStr(a, "selector"), a.getInteger("timeoutSeconds")));
     put("submit_human_input", (svc, id, a) -> svc.submitHumanInput(id, reqStr(a, "requestId"), optStr(a, "answer")));
-    put("get_human_input", (svc, id, a) -> svc.getHumanInput(id, reqStr(a, "requestId"),
-        a.getInteger("timeoutSeconds")));
+    put("get_human_input",
+        (svc, id, a) -> svc.getHumanInput(id, reqStr(a, "requestId"), a.getInteger("timeoutSeconds")));
   }
 
   private CommandTable() {

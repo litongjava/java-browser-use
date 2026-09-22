@@ -67,7 +67,8 @@ public class PlaywrightServiceTest {
     assertFalse("不能传 --no-sandbox,Chrome 会打印不受支持的命令行标志警告", args.contains("--no-sandbox"));
     assertFalse("不能传 --disable-web-security,同样会触发那条警告", args.contains("--disable-web-security"));
     assertFalse("不能传 --disable-infobars", args.contains("--disable-infobars"));
-    assertTrue("应当保留反自动化检测的启动参数", args.contains("--disable-blink-features=AutomationControlled"));
+    assertFalse("不能传 AutomationControlled 禁用参数,会触发不受支持的命令行标志提示",
+        args.contains("--disable-blink-features=AutomationControlled"));
   }
 
   /**

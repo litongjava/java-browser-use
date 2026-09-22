@@ -317,6 +317,8 @@ Windows / macOS 上服务会显式**开启** Chromium 沙箱；Linux 上关闭�
 You are using an unsupported command-line flag: --no-sandbox. Stability and security will suffer.
 ```
 
-值得说清楚的是：**这个标志不是本服务加的**。Playwright 的 `chromiumSandbox` 默认就是 `false`，它自己会往命令行里塞 `--no-sandbox`（见驱动的 `_innerDefaultArgs`：`if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")`）。所以只把自己传的参数删掉是没用的，必须显式开启沙箱。服务传的启动参数里只有 `--disable-blink-features=AutomationControlled`（以及 Linux 上的 `--disable-dev-shm-usage`），这两个都不在 Chrome 的「不受支持标志」名单里。
+值得说清楚的是：**这个标志不是本服务加的**。Playwright 的 `chromiumSandbox` 默认就是 `false`，它自己会往命令行里塞 `--no-sandbox`（见驱动的 `_innerDefaultArgs`：`if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")`）。所以只把自己传的参数删掉是没用的，必须显式开启沙箱。服务仅在 Linux 上额外传入 `--disable-dev-shm-usage`。
+
+如果提示中出现 `--disable-blink-features=AutomationControlled`，说明正在运行的浏览器仍使用旧版启动参数。项目已移除该参数；更新后端并重新启动浏览器后生效。移除后不再通过此参数隐藏浏览器的自动化特征，部分网站的自动化检测表现可能变化。
 
 这条改动有对应的单元测试（`PlaywrightServiceTest`）盯着：只要有人把 `--no-sandbox`、`--disable-web-security` 之类加回启动参数，或者把非 Linux 上的沙箱关掉，构建就会失败。
