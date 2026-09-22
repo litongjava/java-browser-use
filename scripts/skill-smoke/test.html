@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Playwright 接口测试页</title>
+<style>body{font-family:sans-serif;padding:20px}div{margin:8px 0}button{margin:4px 0}</style>
+</head>
+<body>
+<h1>Playwright 接口测试页</h1>
+<div><button id="btn" onclick="window.__clicks=(window.__clicks||0)+1">点我</button></div>
+<div><input type="text" id="txt" aria-label="用户名" placeholder="请输入用户名"></div>
+<div><input type="checkbox" id="chk"> <label for="chk">同意协议</label></div>
+<div>
+  <select id="sel" aria-label="城市">
+    <option value="">请选择</option>
+    <option value="bj">北京</option>
+    <option value="sh">上海</option>
+  </select>
+</div>
+<div><button id="dbl" ondblclick="window.__dbl=(window.__dbl||0)+1">双击我</button></div>
+<div><button id="hov" onmouseover="window.__hover=(window.__hover||0)+1">悬停我</button></div>
+<div><button id="drag" draggable="true">拖我</button></div>
+<div><button id="drop" ondragover="event.preventDefault()" ondrop="window.__drop=(window.__drop||0)+1">放到这里</button></div>
+<div><button id="alertBtn" onclick="alert('这是一个弹窗')">弹窗</button></div>
+<div><button id="toggleBtn" onclick="document.getElementById('btn').style.display='none'">隐藏点我按钮</button></div>
+<div><button id="attrbox" data-role="demo" title="提示">属性测试</button></div>
+<div><button id="submitBtn" aria-label="提交表单">提交</button></div>
+<div><a href="/other.html" id="link">其它页面</a></div>
+<div><input type="file" id="file" aria-label="上传文件"></div>
+<script>
+console.log('测试页已加载');
+fetch('/api/ping').then(r => r.json()).then(d => console.log('ping ' + JSON.stringify(d)));
+</script>
+</body>
+</html>

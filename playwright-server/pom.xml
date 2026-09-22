@@ -10,7 +10,7 @@
     <lombok-version>1.18.30</lombok-version>
     <fastjson2.version>2.0.52</fastjson2.version>
     <tio-boot-admin.version>2.1.5</tio-boot-admin.version>
-    <main.class>com.litongjava.ai.browser.PlaywrightApp</main.class>
+    <main.class>nexus.io.ai.browser.PlaywrightApp</main.class>
   </properties>
   <dependencies>
     <!-- Lombok 用于简化代码 -->
