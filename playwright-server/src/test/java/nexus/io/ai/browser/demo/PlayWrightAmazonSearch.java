@@ -15,7 +15,7 @@ public class PlayWrightAmazonSearch {
     EnvUtils.load();
 
     PlaywrightService playwrightService = Aop.get(PlaywrightService.class);
-    long id = playwrightService.start(null, false, false);
+    long id = playwrightService.start(null, false);
     Page page = playwrightService.currentPage(id);
     page.navigate("https://www.amazon.com");
     page.waitForLoadState();

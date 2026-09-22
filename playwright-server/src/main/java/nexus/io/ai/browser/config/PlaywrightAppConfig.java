@@ -1,12 +1,9 @@
 package nexus.io.ai.browser.config;
 
-import java.util.ArrayList;
-import java.util.List;
-
+import nexus.io.ai.browser.handler.PlaywrightHandler;
 import nexus.io.ai.browser.handler.PlaywrightHealthHandler;
 import nexus.io.context.BootConfiguration;
 import nexus.io.tio.boot.http.handler.common.HttpFileDataHandler;
-import nexus.io.tio.boot.http.handler.controller.TioBootHttpControllerRouter;
 import nexus.io.tio.boot.server.TioBootServer;
 import nexus.io.tio.http.server.router.HttpRequestRouter;
 
@@ -17,15 +14,11 @@ public class PlaywrightAppConfig implements BootConfiguration {
     TioBootServer me = TioBootServer.me();
     HttpRequestRouter r = me.getRequestRouter();
     if (r != null) {
-      r.add("/data/**",  new HttpFileDataHandler(false));
+      // 截图与可交互结构化文本:data/<id>/<seq>.png|.txt
+      r.add("/data/**", new HttpFileDataHandler(false));
       r.add("/playwright/health", new PlaywrightHealthHandler()::ping);
-    }
-
-    TioBootHttpControllerRouter controllerRouter = me.getControllerRouter();
-    if (controllerRouter != null) {
-      List<Class<?>> scannedClasses = new ArrayList<>();
-      scannedClasses.add(nexus.io.ai.browser.controller.PlaywrightController.class);
-      controllerRouter.addControllers(scannedClasses);
+      // 唯一的浏览器控制端点:POST {id, method, params}
+      r.add("/playwright/command", new PlaywrightHandler());
     }
   }
 }

@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import com.jfinal.kit.Kv;
@@ -23,15 +24,25 @@ import com.microsoft.playwright.Response;
 import nexus.io.ai.browser.dom.model.DOMState;
 
 public class BrowserInstance {
+  /** 任务 ID:一个任务一个实例,截图与结构化文本都落在 data/&lt;id&gt;/ 下 */
+  public final long id;
   public final Playwright playwright;
   public BrowserContext context;
   public Page page;
   public Path profileDir;
   public LaunchPersistentContextOptions opts;
-  /** 最近一次 get_dom_text 的 DOM 树快照,按索引操作元素时使用 */
+  /** 最近一次 get_browser_state 的 DOM 树快照,按索引操作元素时使用 */
   public DOMState domState;
 
-  /** 最近一次 get_dom_text 的文本,供 diff_dom_text 比较(每次快照后覆盖) */
+  /**
+   * 截图序号:每次「可能改变页面」的指令执行后自增一次
+   *
+   * <p>落盘文件名就是 {@code data/&lt;id&gt;/&lt;seq&gt;.png},同一个序号的 .txt 是同一时刻的
+   * 可交互结构化文本,两者一一对应。
+   */
+  public final AtomicInteger captureSeq = new AtomicInteger();
+
+  /** 最近一次 get_browser_state 的文本,供 diff_dom_text 比较(每次快照后覆盖) */
   public volatile String lastDomText;
 
   /** 最近一次弹窗信息 */
@@ -73,12 +84,12 @@ public class BrowserInstance {
   public final Set<String> routedPatterns = ConcurrentHashMap.newKeySet();
 
   public BrowserInstance(Playwright playwright, BrowserContext ctx, Page pg) {
-    this.playwright = playwright;
-    this.context = ctx;
-    this.page = pg;
+    this(0L, playwright, ctx, pg, null, null);
   }
 
-  public BrowserInstance(Playwright playwright, BrowserContext ctx, Page pg, Path profileDir, LaunchPersistentContextOptions opts) {
+  public BrowserInstance(long id, Playwright playwright, BrowserContext ctx, Page pg, Path profileDir,
+      LaunchPersistentContextOptions opts) {
+    this.id = id;
     this.playwright = playwright;
     this.context = ctx;
     this.page = pg;

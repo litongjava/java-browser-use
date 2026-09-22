@@ -19,7 +19,7 @@ public class PlayWrightTaobaoSearch {
     String password = EnvUtils.getStr("taobao.password");
 
     PlaywrightService playwrightService = Aop.get(PlaywrightService.class);
-    long id = playwrightService.start(null, false, false);
+    long id = playwrightService.start(null, false);
     Page page = playwrightService.currentPage(id);
     page.navigate("https://www.taobao.com");
     page.waitForLoadState();

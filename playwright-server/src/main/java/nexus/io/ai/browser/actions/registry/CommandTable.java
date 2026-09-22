@@ -12,15 +12,14 @@ import nexus.io.ai.browser.service.PlaywrightService;
 import nexus.io.model.body.RespBodyVo;
 
 /**
- * 批量指令(/commands)的命令表
+ * 命令表:唯一的方法分发处
  *
- * <p>每个条目把「命令名 + JSON 参数」映射到一个 PlaywrightService 调用,参数名与单独调用时的
- * query/form 参数名完全一致,这样模型在两种调用方式之间不需要切换心智模型。
+ * <p>对外只有一个 HTTP 端点 {@code POST /playwright/command},请求体形如
+ * {@code {"id":123,"method":"go_to_url","params":{"url":"https://example.com"}}}。
+ * {@code method} 就是这张表的键,{@code params} 里的参数名与下面 Executor 里读的键完全一致。
  *
- * <p>设计目标是 PTC(Programmatic Tool Calling):一次请求里下发一整个计划,把动作和读取混在
- * 一起(例如 点击 → get_dom_text → 再点击),只花一次模型推理就能拿到全部结果。
- *
- * <p>老的 17 个命令仍由 {@link HandlerRegistry} 处理,batchExecute 会优先查它。
+ * <p>批量调用 {@code commands} 里的命令名用的是同一套名字,所以模型在「单独调用」和「批量调用」
+ * 之间不需要切换心智模型。
  */
 public class CommandTable {
 
@@ -31,31 +30,48 @@ public class CommandTable {
   private static final Map<String, Executor> TABLE = new LinkedHashMap<>();
 
   static {
-    // ---------- 导航与页面信息 ----------
+    // ---------- 实例生命周期 ----------
     put("start", (svc, id, a) -> {
-      // 批量里不传 headless 时按无头处理,避免误弹出窗口
+      // 不传 headless 时按无头处理,避免在服务器上误弹出窗口
       Boolean headless = a.getBoolean("headless");
-      long newId = svc.start(id, headless == null || headless, false);
+      long newId = svc.start(id, headless == null || headless);
       return RespBodyVo.ok(Kv.by("id", newId));
     });
-    put("get_dom_text",
-        (svc, id, a) -> svc.getDomText(id, a.getBoolean("highlight"), a.getInteger("viewportExpansion")));
+    put("close", (svc, id, a) -> svc.close(id));
+
+    // ---------- 导航与页面信息 ----------
+    put("navigate", (svc, id, a) -> svc.navigate(id, reqStr(a, "url")));
+    put("go_to_url", (svc, id, a) -> svc.goToUrl(id, reqStr(a, "url")));
+    put("go_back", (svc, id, a) -> svc.goBack(id));
     put("go_forward", (svc, id, a) -> svc.goForward(id));
     put("reload", (svc, id, a) -> svc.reload(id));
     put("get_url", (svc, id, a) -> svc.getUrl(id));
     put("get_title", (svc, id, a) -> svc.getTitle(id));
+    put("get_browser_state", (svc, id, a) -> svc.getBrowserState(id, a.getBoolean("highlight"),
+        a.getInteger("viewportExpansion")));
+    put("wait", (svc, id, a) -> svc.waitSeconds(id, reqInt(a, "seconds")));
 
-    // ---------- 元素交互 ----------
+    // ---------- 元素交互(按索引) ----------
+    put("click_element_by_index", (svc, id, a) -> svc.clickElementByIndex(id, reqInt(a, "index")));
     put("double_click_element_by_index", (svc, id, a) -> svc.doubleClickElementByIndex(id, reqInt(a, "index")));
     put("hover_element_by_index", (svc, id, a) -> svc.hoverElementByIndex(id, reqInt(a, "index")));
     put("focus_element_by_index", (svc, id, a) -> svc.focusElementByIndex(id, reqInt(a, "index")));
     put("check_element_by_index", (svc, id, a) -> svc.checkElementByIndex(id, reqInt(a, "index")));
     put("uncheck_element_by_index", (svc, id, a) -> svc.uncheckElementByIndex(id, reqInt(a, "index")));
+    put("input_text", (svc, id, a) -> svc.inputTextByIndex(id, reqInt(a, "index"), reqStr(a, "text")));
     put("type_text", (svc, id, a) -> svc.typeText(id, reqInt(a, "index"), reqStr(a, "text")));
+    put("upload_file", (svc, id, a) -> svc.uploadFile(id, reqInt(a, "index"), reqStr(a, "path")));
     put("drag_element_by_index",
         (svc, id, a) -> svc.dragElementByIndex(id, reqInt(a, "index"), reqInt(a, "targetIndex")));
+    put("send_keys", (svc, id, a) -> svc.sendKeys(id, reqStr(a, "keys")));
     put("key_down", (svc, id, a) -> svc.keyDown(id, reqStr(a, "keys")));
     put("key_up", (svc, id, a) -> svc.keyUp(id, reqStr(a, "keys")));
+    put("get_dropdown_options", (svc, id, a) -> svc.getDropdownOptions(id, reqInt(a, "index")));
+    put("select_dropdown_option",
+        (svc, id, a) -> svc.selectDropdownOption(id, reqInt(a, "index"), reqStr(a, "text")));
+    put("scroll", (svc, id, a) -> svc.scroll(id, optBool(a, "down"), reqInt(a, "numPages"),
+        a.getInteger("index")));
+    put("scroll_to_text", (svc, id, a) -> svc.scrollToText(id, reqStr(a, "text")));
 
     // ---------- 读取元素信息与状态 ----------
     put("get_element_text", (svc, id, a) -> svc.getElementText(id, reqInt(a, "index")));
@@ -83,10 +99,12 @@ public class CommandTable {
 
     // ---------- 标签页 ----------
     put("get_tabs", (svc, id, a) -> svc.getTabs(id));
-    put("new_tab", (svc, id, a) -> svc.newTab(id, reqStr(a, "url")));
-    put("bring_to_front", (svc, id, a) -> svc.bringToFront(id, a.getInteger("pageIndex")));
+    put("new_tab", (svc, id, a) -> svc.newTab(id, optStr(a, "url")));
+    put("switch_tab", (svc, id, a) -> svc.switchTab(id, reqInt(a, "pageIndex")));
     put("switch_tab_by_url", (svc, id, a) -> svc.switchTabByUrl(id, reqStr(a, "url")));
+    put("close_tab", (svc, id, a) -> svc.closeTab(id, reqInt(a, "pageIndex")));
     put("close_other_tabs", (svc, id, a) -> svc.closeOtherTabs(id, a.getInteger("pageIndex")));
+    put("bring_to_front", (svc, id, a) -> svc.bringToFront(id, a.getInteger("pageIndex")));
 
     // ---------- 等待 ----------
     put("wait_for_element",
@@ -154,6 +172,11 @@ public class CommandTable {
     put("diff_dom_text",
         (svc, id, a) -> svc.diffDomText(id, a.getBoolean("highlight"), a.getInteger("viewportExpansion")));
     put("get_interactive_map", (svc, id, a) -> svc.getInteractiveMap(id));
+
+    // ---------- 其它 ----------
+    put("extract_structured_data",
+        (svc, id, a) -> svc.extractStructuredData(id, optStr(a, "query"), optBool(a, "extractLinks")));
+    put("execute_js", (svc, id, a) -> svc.executeJs(id, reqStr(a, "body")));
 
     // ---------- 人机协同 ----------
     put("request_human_input", (svc, id, a) -> svc.requestHumanInput(id, reqStr(a, "prompt"), a.getInteger("index"),

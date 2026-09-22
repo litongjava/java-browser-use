@@ -3,6 +3,7 @@ package nexus.io.ai.browser.service;
 import java.awt.Dimension;
 import java.awt.Toolkit;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -44,13 +45,13 @@ import com.microsoft.playwright.options.Geolocation;
 import com.microsoft.playwright.options.HttpCredentials;
 import com.microsoft.playwright.options.LoadState;
 import com.microsoft.playwright.options.MouseButton;
-import com.microsoft.playwright.options.RecordVideoSize;
 import com.microsoft.playwright.options.SelectOption;
 import com.microsoft.playwright.options.ServiceWorkerPolicy;
 
 import lombok.extern.slf4j.Slf4j;
 import nexus.io.model.body.RespBodyVo;
 import nexus.io.tio.utils.collect.Lists;
+import nexus.io.tio.utils.environment.EnvUtils;
 import nexus.io.tio.utils.snowflake.SnowflakeIdUtils;
 
 @Slf4j
@@ -91,12 +92,33 @@ public class PlaywrightService {
   /** wait_for_response 默认先回看多少秒内已经收到过的响应 */
   private static final int DEFAULT_RESPONSE_LOOKBACK_SECONDS = 10;
 
-  public long start(Long id, boolean headless, boolean record) {
+  /** 截图与可交互结构化文本的落盘根目录(相对进程工作目录,由 /data/** 静态路由对外提供) */
+  public static final String DATA_DIR = "data";
+
+  /** 每次截图前最多等页面进入 DOMCONTENTLOADED 多久(毫秒),等不到也照常截图 */
+  private static final double CAPTURE_SETTLE_TIMEOUT_MS = 1_500;
+
+  /**
+   * 启动一个任务的浏览器实例
+   *
+   * <p>一个任务一个实例:每次调用都会新建独立的 Playwright 与独立的持久化 profile,互不干扰。
+   * profile 目录按任务 ID 分开({@code ~/.config/browseruse/profiles/<id>}),所以同一个 id
+   * 重新 start 时登录态还在,不同任务之间则是隔离的。
+   *
+   * @param id       任务 ID,传 null 时自动生成雪花 ID
+   * @param headless 是否无头
+   * @return 该任务使用的 ID
+   */
+  public long start(Long id, boolean headless) {
+    long taskId = id == null ? SnowflakeIdUtils.id() : id;
+    if (INSTANCES.containsKey(taskId)) {
+      throw new IllegalStateException("该 id 已经有正在运行的浏览器实例：" + taskId + "，请先调用 close，或换一个 id");
+    }
+
     Playwright pw = Playwright.create();
-    Path profileDir = Paths.get(System.getProperty("user.home"), ".config", "browseruse", "profiles", "default");
-    Path downloadDir = Paths.get(System.getProperty("user.home"), "Downloads", "broswer");
-    Path videosDir = Paths.get(System.getProperty("user.home"), "Videos", "broswer");
-    log.info("user dir:{}", profileDir);
+    Path profileDir = profileDir(taskId);
+    Path downloadDir = Paths.get(userHome(), "Downloads", "broswer");
+    log.info("task {} user dir:{}", taskId, profileDir);
     LaunchPersistentContextOptions opts = new BrowserType.LaunchPersistentContextOptions().setHeadless(headless);
 
     opts.setIgnoreDefaultArgs(Lists.of("--enable-automation"));
@@ -107,27 +129,21 @@ public class PlaywrightService {
     log.info("size {} x {}", screenWidth, screenHeight);
 
     // 覆写/追加启动参数
-    opts.setArgs(Arrays.asList(
-        //
-        "--no-sandbox", "--disable-dev-shm-usage",
-        //
-        "--disable-web-security", "--disable-infobars",
-        //
-        "--disable-blink-features=AutomationControlled"));
+    opts.setArgs(chromiumArgs());
+
+    // Chromium 沙箱:见 chromiumArgs 的说明
+    opts.setChromiumSandbox(chromiumSandbox());
+
+    // 内嵌的 Chromium(单文件发行包)显式指定可执行文件,避免 Playwright 再去下载浏览器
+    Path executable = BundledBrowser.executablePath();
+    if (executable != null) {
+      opts.setExecutablePath(executable);
+      log.info("use bundled chromium:{}", executable);
+    }
 
     // 下载
     opts.setAcceptDownloads(true);
-
     opts.setDownloadsPath(downloadDir);
-    // opts.setRecordHarPath(Paths.get("trace.har"));
-    // opts.setRecordHarMode(HarMode.FULL);
-    // opts.setRecordHarContent(HarContentPolicy.EMBED);
-
-    // 录制
-    if (record) {
-      opts.setRecordVideoDir(videosDir);
-      opts.setRecordVideoSize(new RecordVideoSize(screenWidth, screenHeight));
-    }
 
     // 视窗 & 设备仿真
     opts.setViewportSize(screenWidth, screenHeight);
@@ -139,26 +155,74 @@ public class PlaywrightService {
     opts.setPermissions(Arrays.asList("clipboard-read", "clipboard-write", "notifications"));
 
     opts.setUserAgent(BrowserUserAgent.CHROME_127_WIN_10);
-    // opts.setGeolocation(new Geolocation(21.3, -157.8));
     opts.setServiceWorkers(ServiceWorkerPolicy.ALLOW);
 
     BrowserType chromium = pw.chromium();
     BrowserContext ctx = chromium.launchPersistentContext(profileDir, opts);
     Page firstPage = ctx.pages().get(0);
-    if (id == null) {
-      id = SnowflakeIdUtils.id();
-    }
 
-    Page page = ctx.pages().get(0);
     // 屏蔽 navigator.webdriver
-    page.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => false});");
+    firstPage.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => false});");
 
-    BrowserInstance instance = new BrowserInstance(pw, ctx, firstPage, profileDir, opts);
+    BrowserInstance instance = new BrowserInstance(taskId, pw, ctx, firstPage, profileDir, opts);
     attachListeners(instance, firstPage);
     attachRequestRecorder(instance);
-    INSTANCES.put(id, instance);
-    return id;
+    INSTANCES.put(taskId, instance);
+    return taskId;
   }
+
+  /**
+   * Chromium 启动参数
+   *
+   * <p>这里**不传** {@code --no-sandbox} 与 {@code --disable-web-security}:Chrome 把这两个
+   * 标志当成「不受支持的命令行标志」,启动时会打印
+   * {@code You are using an unsupported command-line flag: --no-sandbox. Stability and security will suffer.}
+   * 并在窗口上挂一条提示。
+   *
+   * <p>关键点是 {@code --no-sandbox} 根本不用我们加:Playwright 的 {@code chromiumSandbox}
+   * 默认就是 {@code false},它自己会往命令行里塞 {@code --no-sandbox}(见驱动的
+   * {@code _innerDefaultArgs}:{@code if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")})。
+   * 所以真正要去掉这个警告,必须把 {@code chromiumSandbox} 打开,见 {@link #chromiumSandbox()}。
+   */
+  static List<String> chromiumArgs() {
+    List<String> args = new ArrayList<>();
+    args.add("--disable-blink-features=AutomationControlled");
+    if (isLinux()) {
+      // 容器里 /dev/shm 往往只有 64MB,不加这个 Chrome 会随机崩
+      args.add("--disable-dev-shm-usage");
+    }
+    return args;
+  }
+
+  /**
+   * 是否开启 Chromium 沙箱
+   *
+   * <p>Windows/macOS 上开启:这样 Playwright 不会再传 {@code --no-sandbox},既消掉了那条
+   * 「不受支持的命令行标志」警告,又拿回了 Chrome 自己的进程沙箱(更安全)。
+   *
+   * <p>Linux 上关闭:容器里通常以 root 运行,而 root 不带 {@code --no-sandbox} 时 Chrome
+   * 直接拒绝启动({@code Running as root without --no-sandbox is not supported})。这条路上
+   * Chrome 仍会打印那条警告,这是容器里跑浏览器的固有代价。
+   */
+  static boolean chromiumSandbox() {
+    return !isLinux();
+  }
+
+  /** 当前系统是不是 Linux:命令行标志与路径差异都靠它判断 */
+  static boolean isLinux() {
+    String os = EnvUtils.get("os.name", "");
+    return os.toLowerCase().contains("linux");
+  }
+
+  private static String userHome() {
+    return EnvUtils.get("user.home", ".");
+  }
+
+  /** 每个任务一个持久化 profile 目录,保证任务之间互相隔离 */
+  private static Path profileDir(long taskId) {
+    return Paths.get(userHome(), ".config", "browseruse", "profiles", String.valueOf(taskId));
+  }
+
 
   /** 弹窗、控制台日志、页面错误:每个新页面都要挂一次 */
   private void attachListeners(BrowserInstance inst, Page page) {
@@ -249,27 +313,34 @@ public class PlaywrightService {
 
   }
 
-  /** 保留原 navigate */
-  public Response navigate(Long browserId, String url) {
-    BrowserInstance inst = INSTANCES.get(browserId);
-    return inst.page.navigate(url);
+  /** navigate 与 go_to_url 等价,返回 data.status */
+  public RespBodyVo navigate(Long browserId, String url) {
+    return goToUrl(browserId, url);
   }
 
   /**
-   * 执行 buildDomTree,把当前页面转成 AI 可读的结构化文本,并缓存本次快照
+   * 取浏览器当前状态:页签信息 + 页面结构化文本(可交互元素索引)
    *
-   * <p>返回的 text 每行形如 {@code [index]<tag attr='value'>文本/>},其中 index 就是
-   * click_element_by_index、input_text、upload_file、get_dropdown_options、
-   * select_dropdown_option 要用的元素索引。页面变化后需要重新调用。
+   * <p>执行 buildDomTree 把当前页面转成 AI 可读的结构化文本,并缓存本次快照。返回的 text 每行
+   * 形如 {@code [index]<tag attr='value'>文本/>},其中 index 就是 click_element_by_index、
+   * input_text、upload_file、get_dropdown_options、select_dropdown_option 要用的元素索引。
+   * 页面变化后需要重新调用。
    *
-   * @param browserId         浏览器实例 ID
+   * <p>同时会做两件落盘动作(都放在 {@code data/&lt;id&gt;/} 下,由 /data/** 静态路由对外提供):
+   * <ol>
+   * <li>截一张图,文件名是自增序号 {@code &lt;seq&gt;.png}</li>
+   * <li>把页签文本 + 可交互结构化文本写成同名 {@code &lt;seq&gt;.txt}</li>
+   * </ol>
+   * 返回的 data.seq / data.screenshot / data.state_file 就是这一对文件。
+   *
+   * @param browserId         任务 ID
    * @param highlight         是否在页面上绘制高亮框,默认 true
    * @param viewportExpansion 视口外扩像素,默认 0
    */
-  public RespBodyVo getDomText(Long browserId, Boolean highlight, Integer viewportExpansion) {
+  public RespBodyVo getBrowserState(Long browserId, Boolean highlight, Integer viewportExpansion) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
-      return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
+      return notFound(browserId);
     }
     boolean doHighlight = highlight == null || highlight;
     int expansion = viewportExpansion == null ? 0 : viewportExpansion;
@@ -284,7 +355,10 @@ public class PlaywrightService {
 
     Kv kv = Kv.by("url", inst.page.url());
     String text = state.getElementTree().clickableElementsToString(null);
+    String browserState = browserStateText(inst);
     kv.set("title", safeTitle(inst.page));
+    // 给模型读的页签块,格式见 browserStateText
+    kv.set("browser_state", browserState);
     kv.set("text", text);
     kv.set("tabs", tabs(inst));
     kv.set("pixels_above", state.getPixelsAbove());
@@ -293,8 +367,147 @@ public class PlaywrightService {
     kv.set("page_height", state.getPageHeight());
     // 供 diff_dom_text 比较"这一次快照和上一次差在哪"
     inst.lastDomText = text;
+
+    // 截图 + 同名的可交互结构化文本
+    Kv capture = capture(inst);
+    kv.set(capture);
+    String stateFile = writeStateFile(inst, capture.getInt("seq"), browserState, text);
+    if (stateFile != null) {
+      kv.set("state_file", stateFile);
+    }
     return RespBodyVo.ok(kv);
   }
+
+  /**
+   * 只重取一次快照,不落盘
+   *
+   * <p>diff_dom_text 用:它每次都要重新 buildDomTree,但不需要产生一对新的截图/文本文件,
+   * 否则对比一次页面就多两张垃圾文件。
+   */
+  private RespBodyVo buildState(BrowserInstance inst, Boolean highlight, Integer viewportExpansion) {
+    boolean doHighlight = highlight == null || highlight;
+    int expansion = viewportExpansion == null ? 0 : viewportExpansion;
+    DOMState state;
+    try {
+      state = DomService.getClickableElements(inst.page, doHighlight, -1, expansion);
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail("构建页面结构失败：" + briefMessage(e.getMessage()));
+    }
+    inst.domState = state;
+    String text = state.getElementTree().clickableElementsToString(null);
+    inst.lastDomText = text;
+    return RespBodyVo.ok(Kv.by("url", inst.page.url()).set("title", safeTitle(inst.page))
+        .set("browser_state", browserStateText(inst)).set("text", text).set("tabs", tabs(inst)));
+  }
+
+  /**
+   * 页签信息文本块,给模型直接读
+   *
+   * <p>格式固定为(编号从 1 开始):
+   *
+   * <pre>
+   * Browser tab: 1, Title: "哔哩哔哩 (゜-゜)つロ 干杯~-bilibili", URL: "https://www.bilibili.com/".
+   * Browser tab: 2,
+   * current tab is: 1
+   * </pre>
+   *
+   * <p>标题和 URL 都取不到的页签(新建但还没加载完的空白页)只输出 {@code Browser tab: N, }。
+   * 注意这里的编号是 1 基,而 data.tabs 里的 index 与 switch_tab 的 pageIndex 仍然是 0 基。
+   */
+  public static String browserStateText(BrowserInstance inst) {
+    List<Page> pages = inst.context.pages();
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < pages.size(); i++) {
+      Page page = pages.get(i);
+      String title = safeTitle(page);
+      String url = safeUrl(page);
+      sb.append("Browser tab: ").append(i + 1).append(", ");
+      if (title.isEmpty() && url.isEmpty()) {
+        sb.append('\n');
+        continue;
+      }
+      if (!title.isEmpty()) {
+        sb.append("Title: \"").append(title).append('"');
+      }
+      if (!url.isEmpty()) {
+        if (!title.isEmpty()) {
+          sb.append(", ");
+        }
+        sb.append("URL: \"").append(url).append('"');
+      }
+      sb.append(".\n");
+    }
+    sb.append("current tab is: ").append(pages.indexOf(inst.page) + 1);
+    return sb.toString();
+  }
+
+  private static String safeUrl(Page page) {
+    try {
+      String url = page.url();
+      return url == null ? "" : url;
+    } catch (PlaywrightException e) {
+      return "";
+    }
+  }
+
+  /** 截图与结构化文本的落盘目录:data/&lt;id&gt;/ */
+  public static Path dataDir(long taskId) {
+    return Paths.get(DATA_DIR, String.valueOf(taskId));
+  }
+
+  /**
+   * 给当前页面截图,序号自增
+   *
+   * <p>文件落在 {@code data/&lt;id&gt;/&lt;seq&gt;.png},返回值里的 screenshot 是可以直接 GET 的
+   * URL({@code /data/&lt;id&gt;/&lt;seq&gt;.png})。截图前会尽力等页面进入 DOMCONTENTLOADED,
+   * 等不到(超时)也照常截图,不会因为等待失败而丢掉这一张。
+   *
+   * @return 含 seq / screenshot / screenshot_path 的 Kv;截图失败时含 screenshot_error
+   */
+  public Kv capture(BrowserInstance inst) {
+    int seq = inst.captureSeq.incrementAndGet();
+    Kv kv = Kv.by("seq", seq);
+    Path dir = dataDir(inst.id);
+    Path png = dir.resolve(seq + ".png");
+    try {
+      Files.createDirectories(dir);
+      settle(inst);
+      inst.page.screenshot(new Page.ScreenshotOptions().setPath(png));
+      kv.set("screenshot", "/" + DATA_DIR + "/" + inst.id + "/" + seq + ".png");
+      kv.set("screenshot_path", png.toAbsolutePath().toString());
+    } catch (PlaywrightException e) {
+      kv.set("screenshot_error", briefMessage(e.getMessage()));
+      log.warn("任务 {} 第 {} 张截图失败:{}", inst.id, seq, briefMessage(e.getMessage()));
+    } catch (IOException e) {
+      kv.set("screenshot_error", e.getMessage());
+      log.warn("任务 {} 第 {} 张截图写文件失败:{}", inst.id, seq, e.getMessage());
+    }
+    return kv;
+  }
+
+  /** 截图前等页面稳定:页面已经加载完时立即返回,没加载完最多等 CAPTURE_SETTLE_TIMEOUT_MS */
+  private static void settle(BrowserInstance inst) {
+    try {
+      inst.page.waitForLoadState(LoadState.DOMCONTENTLOADED,
+          new Page.WaitForLoadStateOptions().setTimeout(CAPTURE_SETTLE_TIMEOUT_MS));
+    } catch (PlaywrightException e) {
+      log.debug("截图前等待页面稳定超时:{}", briefMessage(e.getMessage()));
+    }
+  }
+
+  /** 把页签文本 + 可交互结构化文本写成与截图同名的 .txt,返回对外 URL */
+  private static String writeStateFile(BrowserInstance inst, int seq, String browserState, String text) {
+    Path txt = dataDir(inst.id).resolve(seq + ".txt");
+    try {
+      Files.createDirectories(txt.getParent());
+      Files.write(txt, (browserState + "\n\n" + text).getBytes(StandardCharsets.UTF_8));
+      return "/" + DATA_DIR + "/" + inst.id + "/" + seq + ".txt";
+    } catch (IOException e) {
+      log.warn("任务 {} 第 {} 份结构化文本写文件失败:{}", inst.id, seq, e.getMessage());
+      return null;
+    }
+  }
+
 
   /** 所有标签页,index 可直接用于 switch_tab 与 close_tab */
   private List<Kv> tabs(BrowserInstance inst) {
@@ -319,7 +532,7 @@ public class PlaywrightService {
   /**
    * 把元素索引解析成定位器
    *
-   * <p>优先使用最近一次 get_dom_text 的 DOM 树快照,索引即结构化文本里的 [index];
+   * <p>优先使用最近一次 get_browser_state 的 DOM 树快照,索引即结构化文本里的 [index];
    * 还没有快照时回退为 CSS 选择器顺序索引。
    *
    * @return 索引越界或没有对应元素时返回 null
@@ -343,9 +556,9 @@ public class PlaywrightService {
     return inst.page.locator(selector).nth(index);
   }
 
-  /** 索引越界时补充说明,提醒客户端索引应当来自 get_dom_text */
+  /** 索引越界时补充说明,提醒客户端索引应当来自 get_browser_state */
   private static String indexHint(BrowserInstance inst) {
-    return inst.domState == null ? ",当前没有页面快照,请先调用 get_dom_text 获取元素索引" : "";
+    return inst.domState == null ? ",当前没有页面快照,请先调用 get_browser_state 获取元素索引" : "";
   }
 
   private static RespBodyVo notFound(Long browserId) {
@@ -353,7 +566,7 @@ public class PlaywrightService {
   }
 
   /**
-   * 按索引取元素,索引必须来自最近一次 get_dom_text
+   * 按索引取元素,索引必须来自最近一次 get_browser_state
    *
    * @return 越界或没有快照时返回 null
    */
@@ -365,7 +578,7 @@ public class PlaywrightService {
   private static String actionFailure(String action, PlaywrightException e) {
     String message = briefMessage(e.getMessage());
     if (message.startsWith("Timeout")) {
-      return action + " 失败：元素不存在或页面已变化,请重新调用 get_dom_text 获取元素索引";
+      return action + " 失败：元素不存在或页面已变化,请重新调用 get_browser_state 获取元素索引";
     }
     return action + " 失败：" + message;
   }
@@ -382,7 +595,7 @@ public class PlaywrightService {
   /**
    * 选择器/文本/角色/标签定位失败时的提示
    *
-   * <p>这些接口和快照索引无关,所以不能说「请重新调用 get_dom_text」;超时基本都是元素不存在或不可见
+   * <p>这些接口和快照索引无关,所以不能说「请重新调用 get_browser_state」;超时基本都是元素不存在或不可见
    * (实测百度首页的搜索框 #kw 被隐藏,fill 会等满 5 秒后失败)。
    */
   private static String locateFailure(String action, String target, PlaywrightException e) {
@@ -510,7 +723,7 @@ public class PlaywrightService {
   /**
    * 按索引动作,带索引失效重试
    *
-   * <p>索引来自最近一次 get_dom_text 的 xpath。Vue/React 一重渲染(悬浮菜单尤其明显),
+   * <p>索引来自最近一次 get_browser_state 的 xpath。Vue/React 一重渲染(悬浮菜单尤其明显),
    * xpath 指向的节点就没了,原来只能报「元素不存在或页面已变化」。这里失败后做两级补救:
    * 先等 300ms 用同一个 xpath 重试(动画或异步渲染的抖动),再重取一次临时快照,按
    * 「同 tag + 同文本且全页唯一」把元素找回来。都失败就照旧报错,不会乱点别的元素。
@@ -673,9 +886,17 @@ public class PlaywrightService {
     return RespBodyVo.ok(Kv.by("status", rsp == null ? 0 : rsp.status()).set("url", after));
   }
 
-  public RespBodyVo wait(Long browserId, Integer seconds) {
+  /**
+   * 固定等待若干秒
+   *
+   * <p>方法名不叫 wait:Object.wait 会抢走重载解析,调用处只能写成 this.wait 才不歧义。
+   */
+  public RespBodyVo waitSeconds(Long browserId, Integer seconds) {
     if (!INSTANCES.containsKey(browserId)) {
       return notFound(browserId);
+    }
+    if (seconds == null || seconds <= 0) {
+      return RespBodyVo.fail("wait 的 seconds 必须是正整数");
     }
     try {
       Thread.sleep(seconds * 1_000L);
@@ -891,7 +1112,7 @@ public class PlaywrightService {
   /**
    * 提取页面可见文本,extractLinks 为 true 时同时返回页面链接
    *
-   * <p>文本取 document.body.innerText,最多 20000 字符。读取前会临时隐藏 get_dom_text 画的
+   * <p>文本取 document.body.innerText,最多 20000 字符。读取前会临时隐藏 get_browser_state 画的
    * 高亮层,避免高亮序号混进正文。
    */
   public RespBodyVo extractStructuredData(Long browserId, String query, boolean extractLinks) {
@@ -2216,7 +2437,7 @@ public class PlaywrightService {
    * 一次拿到「页面现在是什么状态」需要的全部信息
    *
    * <p>替代 get_url + get_title + get_tabs + get_dialog + get_console_logs + get_requests 六次调用。
-   * 不返回 DOM 快照文本(那是 get_dom_text 的活),只做状态汇总。
+   * 不返回 DOM 快照文本(那是 get_browser_state 的活),只做状态汇总。
    *
    * <p>返回 data.url、data.title、data.tabs、data.dialog(带 seq/timestamp)、data.loading、
    * data.logs / data.errors(includeConsole=true)、data.requests(includeRequests=true)。
@@ -2254,7 +2475,7 @@ public class PlaywrightService {
   /**
    * 与上一次快照比较,返回新增/消失的行
    *
-   * <p>会重新执行一次 buildDomTree(和 get_dom_text 一样),再和上一次的文本按行做多重集差集。
+   * <p>会重新执行一次 buildDomTree(和 get_browser_state 一样),再和上一次的文本按行做多重集差集。
    * 判断「刚才那一下到底有没有让页面变化」比重新读整页省 token:data.changed=false 就说明
    * 快照内容一模一样。
    *
@@ -2267,7 +2488,7 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     String previous = inst.lastDomText;
-    RespBodyVo current = getDomText(browserId, highlight, viewportExpansion);
+    RespBodyVo current = buildState(inst, highlight, viewportExpansion);
     if (!current.isOk() || !(current.getData() instanceof Kv)) {
       return current;
     }
@@ -2330,7 +2551,7 @@ public class PlaywrightService {
    * <p>快照文本里只有语义属性,没有 id/class/href,想拿这些以前只能上 execute_js。这个接口按
    * 当前快照的 xpath 一次回查所有元素,给出 index、tag、xpath、id、className、href、name、text。
    *
-   * <p>索引仍然来自最近一次 get_dom_text;没有快照时直接报错。
+   * <p>索引仍然来自最近一次 get_browser_state;没有快照时直接报错。
    */
   public RespBodyVo getInteractiveMap(Long browserId) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -2339,7 +2560,7 @@ public class PlaywrightService {
     }
     DOMState state = inst.domState;
     if (state == null) {
-      return RespBodyVo.fail("get_interactive_map 需要先调用 get_dom_text 获取元素索引");
+      return RespBodyVo.fail("get_interactive_map 需要先调用 get_browser_state 获取元素索引");
     }
     List<Integer> indices = new ArrayList<>(state.getSelectorMap().keySet());
     indices.sort(null);

@@ -26,7 +26,7 @@ public class PlayWrightKeheLogin {
     String password = EnvUtils.getStr("kehe.password");
 
     PlaywrightService playwrightService = Aop.get(PlaywrightService.class);
-    long id = playwrightService.start(null, false, false);
+    long id = playwrightService.start(null, false);
     BrowserInstance instance = playwrightService.getInstance(id);
     Page page = instance.page;
     page.navigate("https://connect-identity-server.kehe.com/Account/Login");

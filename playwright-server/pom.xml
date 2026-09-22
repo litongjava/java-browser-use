@@ -1,8 +1,8 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <parent>
-    <groupId>com.litongjava</groupId>
-    <artifactId>java-browser-use</artifactId>
+    <groupId>nexus.io</groupId>
+    <artifactId>deepseek-browser-use</artifactId>
     <version>1.0.0</version>
   </parent>
   <artifactId>playwright-server</artifactId>
@@ -11,6 +11,17 @@
     <fastjson2.version>2.0.52</fastjson2.version>
     <tio-boot-admin.version>2.1.5</tio-boot-admin.version>
     <main.class>nexus.io.ai.browser.PlaywrightApp</main.class>
+    <!--
+      内嵌 Chromium 的存放目录。scripts/package/build-release.mjs 会先把它准备好,
+      production profile 再把它拷进 jar 的 browsers/ 下。目录不存在时这一步自动跳过,
+      所以开发态(不打包发行版)不受影响。
+    -->
+    <browsers.dir>${project.basedir}/build/browsers</browsers.dir>
+    <!--
+      Playwright 的 driver-bundle 里带着 5 个平台的 node,合计约 194MB,而一个发行版只需要
+      自己那个平台的。打包脚本按目标平台覆盖这个属性,shade 只保留 driver/<该平台>/**。
+    -->
+    <driver.platform>win32_x64</driver.platform>
   </properties>
   <dependencies>
     <!-- Lombok 用于简化代码 -->
@@ -78,20 +89,85 @@
       <id>production</id>
       <build>
         <plugins>
-          <!-- Spring Boot Maven 插件 -->
+          <!--
+            把准备好的内嵌 Chromium 拷进 classes,这样 repackage 出来的可执行 jar 自带浏览器,
+            用户 java -jar 启动时不需要再下载任何文件。
+          -->
           <plugin>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-maven-plugin</artifactId>
-            <version>2.7.4</version>
-            <configuration>
-              <mainClass>${main.class}</mainClass>
-              <excludeGroupIds>org.projectlombok</excludeGroupIds>
-            </configuration>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-resources-plugin</artifactId>
+            <version>3.3.1</version>
             <executions>
               <execution>
+                <id>copy-bundled-browser</id>
+                <phase>prepare-package</phase>
                 <goals>
-                  <goal>repackage</goal>
+                  <goal>copy-resources</goal>
                 </goals>
+                <configuration>
+                  <outputDirectory>${project.build.outputDirectory}/browsers</outputDirectory>
+                  <overwrite>true</overwrite>
+                  <resources>
+                    <resource>
+                      <directory>${browsers.dir}</directory>
+                      <filtering>false</filtering>
+                    </resource>
+                  </resources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+
+          <!--
+            打成一个可执行 fat jar:java -jar deepseek-browser-use-<版本>-<平台>.jar
+            只保留目标平台的 Playwright driver(node),把另外 4 个平台剔掉,能省 150MB 左右。
+          -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-shade-plugin</artifactId>
+            <version>3.2.4</version>
+            <executions>
+              <execution>
+                <phase>package</phase>
+                <goals>
+                  <goal>shade</goal>
+                </goals>
+                <configuration>
+                  <createDependencyReducedPom>false</createDependencyReducedPom>
+                  <shadedArtifactAttached>false</shadedArtifactAttached>
+                  <filters>
+                    <!--
+                      只保留目标平台的 driver,其余平台的 node 全部丢掉。
+                      注意 DriverJar.class 也在 driver-bundle 里、而且不在 driver/ 下,必须一起保留,
+                      否则运行时 Playwright.create() 会抛 ClassNotFoundException: ...driver.jar.DriverJar。
+                    -->
+                    <filter>
+                      <artifact>com.microsoft.playwright:driver-bundle</artifact>
+                      <includes>
+                        <include>driver/${driver.platform}/**</include>
+                        <include>com/microsoft/playwright/impl/driver/jar/**</include>
+                      </includes>
+                    </filter>
+                    <!-- 依赖里的签名文件会让 java -jar 报 SecurityException -->
+                    <filter>
+                      <artifact>*:*</artifact>
+                      <excludes>
+                        <exclude>META-INF/*.SF</exclude>
+                        <exclude>META-INF/*.DSA</exclude>
+                        <exclude>META-INF/*.RSA</exclude>
+                        <exclude>module-info.class</exclude>
+                      </excludes>
+                    </filter>
+                  </filters>
+                  <transformers>
+                    <transformer
+                      implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                      <mainClass>${main.class}</mainClass>
+                    </transformer>
+                    <transformer
+                      implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+                  </transformers>
+                </configuration>
               </execution>
             </executions>
           </plugin>
