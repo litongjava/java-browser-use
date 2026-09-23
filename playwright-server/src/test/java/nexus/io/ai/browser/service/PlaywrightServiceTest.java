@@ -72,21 +72,82 @@ public class PlaywrightServiceTest {
   }
 
   /**
-   * Playwright 的 chromiumSandbox 默认是 false,它自己会加 --no-sandbox。非 Linux 上必须显式开启
-   * 沙箱,否则上面那条警告又会回来。
+   * 沙箱默认按平台来:普通桌面(Windows / macOS)开着,Linux 上关着
+   *
+   * <p>
+   * 这条断言盯的是「别悄悄改回去」:沙箱关掉之后不只是隔离变差,窗口上还会多一条
+   * {@code You are using an unsupported command-line flag: --no-sandbox} 提示条。Linux 保持关闭是因为
+   * 容器里通常以 root 运行,Chrome 会直接拒绝启动。
+   *
+   * <p>
+   * Edge 也一样开着 —— 前提是它走 CDP(端口)那条路,见下一条断言。
    */
   @Test
-  public void sandboxIsOnOutsideLinux() {
-    if (!PlaywrightService.isLinux()) {
-      assertTrue("非 Linux 平台必须开启 Chromium 沙箱,否则 Playwright 会自己加 --no-sandbox",
-          PlaywrightService.chromiumSandbox());
+  public void sandboxFollowsPlatformByDefault() {
+    boolean linux = PlaywrightService.isLinux();
+    assertEquals("非 Linux(普通桌面)上的 Chrome 默认应当开启沙箱,Linux 默认关闭", !linux,
+        PlaywrightService.chromiumSandbox(BrowserChoice.CHROME, true));
+    assertEquals("内置 Chromium 与 Chrome 同一条路,默认值应当一致", !linux,
+        PlaywrightService.chromiumSandbox(BrowserChoice.CHROMIUM, true));
+    assertEquals("Edge 走 CDP 那条路,沙箱同样默认开着", !linux,
+        PlaywrightService.chromiumSandbox(BrowserChoice.EDGE, false));
+  }
+
+  /**
+   * Edge 一旦走回 Playwright 的管道启动,沙箱必须自动关掉
+   *
+   * <p>
+   * 实测(Edge 145 / Windows):开沙箱 + 管道启动 = Edge 启动即退出。这条断言是给「以后有人把 Edge 改回
+   * {@code launchPersistentContext}」准备的保险 —— 那样改的话浏览器会起不来,而这里会先把沙箱关掉。
+   */
+  @Test
+  public void sandboxTurnsItselfOffForEdgeOverThePipe() {
+    assertFalse("Edge + 管道启动不能开沙箱,否则浏览器起不来",
+        PlaywrightService.chromiumSandbox(BrowserChoice.EDGE, true));
+  }
+
+  /** 两种取值都要能显式覆盖:容器里关掉、Linux 桌面上打开 */
+  @Test
+  public void sandboxCanBeConfiguredBothWays() {
+    try {
+      System.setProperty(PlaywrightService.KEY_SANDBOX, "false");
+      assertFalse("browser.chromium.sandbox=false 时应当关掉沙箱",
+          PlaywrightService.chromiumSandbox(BrowserChoice.CHROME, true));
+      System.setProperty(PlaywrightService.KEY_SANDBOX, "true");
+      assertTrue("browser.chromium.sandbox=true 时应当开启沙箱",
+          PlaywrightService.chromiumSandbox(BrowserChoice.CHROME, true));
+      assertTrue("Edge 走 CDP 时,显式开启同样生效",
+          PlaywrightService.chromiumSandbox(BrowserChoice.EDGE, false));
+      assertFalse("但 Edge 走管道时仍然要关掉(开了浏览器就起不来)",
+          PlaywrightService.chromiumSandbox(BrowserChoice.EDGE, true));
+      System.setProperty(PlaywrightService.KEY_SANDBOX, " true ");
+      assertTrue("配置值两端有空格也要认", PlaywrightService.chromiumSandbox(BrowserChoice.CHROME, true));
+    } finally {
+      System.clearProperty(PlaywrightService.KEY_SANDBOX);
+    }
+  }
+
+  /** CDP 那条路(自己拉浏览器)不经过 Playwright,关沙箱时得自己补 --no-sandbox,开沙箱时不能补 */
+  @Test
+  public void cdpArgsFollowTheSandboxDecision() {
+    try {
+      System.setProperty(PlaywrightService.KEY_SANDBOX, "false");
+      assertTrue("关沙箱时 CDP 那条路要自己加 --no-sandbox",
+          PlaywrightService.cdpArgs(true, BrowserChoice.CHROME).contains("--no-sandbox"));
+      System.setProperty(PlaywrightService.KEY_SANDBOX, "true");
+      assertFalse("开沙箱时不能出现 --no-sandbox",
+          PlaywrightService.cdpArgs(true, BrowserChoice.CHROME).contains("--no-sandbox"));
+      assertFalse("Edge 走 CDP,同样不该出现 --no-sandbox",
+          PlaywrightService.cdpArgs(true, BrowserChoice.EDGE).contains("--no-sandbox"));
+    } finally {
+      System.clearProperty(PlaywrightService.KEY_SANDBOX);
     }
   }
 
   /**
-   * 一个任务一个实例,但不是「一个任务一个 driver」:Playwright 全进程共用一个,隔离靠
-   * BrowserContext。所以 BrowserInstance 不该再持有 Playwright —— 一旦持有,close 时很容易
-   * 顺手把它关掉,把其它任务的浏览器一起搞死。
+   * 一个任务一个实例,但不是「一个任务一个 driver」:Playwright 全进程共用一个,浏览器与 profile
+   * 也是全进程共用的(见 PlaywrightService.SharedBrowser)。所以 BrowserInstance 不该再持有
+   * Playwright —— 一旦持有,close 时很容易顺手把它关掉,把其它任务的浏览器一起搞死。
    */
   @Test
   public void browserInstanceDoesNotOwnPlaywright() {
@@ -109,17 +170,42 @@ public class PlaywrightServiceTest {
     assertEquals("Playwright.create() 应该只在共享 driver 的懒加载里出现一次,实际 " + calls + " 次", 1, calls);
   }
 
-  /** close 只该关任务自己的上下文,不能关共享的 driver */
+  /** close 只该关任务自己的页签与共用的浏览器上下文,不能关共享的 driver */
   @Test
   public void closeDoesNotShutdownSharedDriver() throws Exception {
     String text = readServiceSource();
     assertTrue("共享 driver 的收尾应该交给 shutdown hook", text.contains("addShutdownHook"));
-    // close(Long) 里不能出现任何对 Playwright 实例的 close()
+    // close(Long) 里不能出现任何对 Playwright 实例的 close()(注释里提到不算)
     int closeMethod = text.indexOf("public RespBodyVo close(Long browserId)");
     assertTrue("找不到 close(Long) 方法,测试需要跟着改", closeMethod > 0);
     String body = stripComments(text.substring(closeMethod, text.indexOf("\n  }", closeMethod)));
     assertFalse("close(Long) 里不能关 Playwright:那是全进程共享的 driver,关掉会连累其它任务",
         body.contains("Playwright"));
+  }
+
+  /**
+   * 浏览器与 profile 全进程共用,任务之间靠页签隔离
+   *
+   * <p>所以取页签一律走 {@code pagesOf(inst)},不能直接用 {@code inst.context.pages()} —— 后者是
+   * 所有任务的页签,会让 get_tabs / switch_tab 的索引串到别的任务上。
+   */
+  @Test
+  public void tabListingGoesThroughTaskPages() throws Exception {
+    String text = stripComments(readServiceSource());
+    assertFalse("不能直接用 inst.context.pages():页签要按任务过滤,用 pagesOf(inst)",
+        text.contains("inst.context.pages()"));
+  }
+
+  /**
+   * 启动浏览器必须走「先本机 Chrome、再内嵌 Chromium」的顺序
+   *
+   * <p>用 Playwright 自带的 Chromium 是这次改动要去掉的默认行为,一旦被挪回去,只有跑起来才会发现。
+   */
+  @Test
+  public void chromeIsPreferredOverBundledChromium() throws Exception {
+    String text = stripComments(readServiceSource());
+    assertTrue("启动时要先问本机安装的 Google Chrome", text.contains("ChromeBrowser.executablePath()"));
+    assertTrue("没有 Chrome 时才退回内嵌 Chromium", text.contains("BundledBrowser.executablePath()"));
   }
 
   private static String readServiceSource() throws Exception {

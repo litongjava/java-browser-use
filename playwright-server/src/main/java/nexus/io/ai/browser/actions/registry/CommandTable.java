@@ -35,8 +35,16 @@ public class CommandTable {
     put("start", (svc, id, a) -> {
       // 不传 headless 时按无头处理,避免在服务器上误弹出窗口
       Boolean headless = a.getBoolean("headless");
-      long newId = svc.start(id, headless == null || headless);
-      return RespBodyVo.ok(Kv.by("id", newId));
+      // 不传 browser 时按配置里的默认类型(browser.type / browser.engine)处理,行为与以前一致;
+      // 传了不认识的值会在 svc.start 里被拒掉,错误信息里带上可选值(见 BrowserType)
+      long newId = svc.start(id, headless == null || headless, a.getString("browser"));
+      Kv data = Kv.by("id", newId);
+      // 这次任务实际用的浏览器与 profile:用的哪个浏览器、是不是本机 Chrome、有没有用上用户自己的 profile
+      Kv browser = svc.browserInfo(newId);
+      if (browser != null) {
+        data.set("browser", browser);
+      }
+      return RespBodyVo.ok(data);
     });
     put("close", (svc, id, a) -> svc.close(id));
 

@@ -23,14 +23,20 @@ import nexus.io.ai.browser.actions.registry.CommandTable;
 /**
  * 校验技能文档与命令表保持一致,避免文档漂移
  *
- * <p>技能文档在仓库根的 {@code .dsh/skills/deepseek-browser-use/SKILL.md},而 Maven 测试的工作
- * 目录是 playwright-server,所以用 .. 回到仓库根。文档不存在时跳过整个类,便于单独拷贝模块构建。
+ * <p>技能文档是仓库根的 {@code SKILL.md}(装进 DSH 时位于
+ * {@code .dsh/skills/deepseek-browser-use/SKILL.md},两个位置都认),而 Maven 测试的工作目录是
+ * playwright-server,所以用 .. 回到仓库根。文档不存在时跳过整个类,便于单独拷贝模块构建。
  *
  * <p>覆盖三件事:命令表里的每个方法都写进了文档、文档里没有旧接口名与旧包名、frontmatter 合法。
  */
 public class SkillDocConsistencyTest {
 
-  private static final Path SKILL_PATH = Paths.get("..", ".dsh", "skills", "deepseek-browser-use", "SKILL.md");
+  /** 技能名:frontmatter 的 name,也是装进 DSH 时用的目录名 */
+  private static final String SKILL_NAME = "deepseek-browser-use";
+
+  /** 依次尝试的位置:仓库根的 SKILL.md、装成技能时的 .dsh 目录 */
+  private static final List<Path> SKILL_PATHS = List.of(Paths.get("..", "SKILL.md"),
+      Paths.get("..", ".dsh", "skills", SKILL_NAME, "SKILL.md"));
 
   /** 文档里形如 `method_name` 的命令名 */
   private static final Pattern DOC_COMMAND = Pattern.compile("`([a-z][a-z0-9_]{2,})`");
@@ -53,8 +59,15 @@ public class SkillDocConsistencyTest {
 
   @BeforeClass
   public static void loadDoc() throws IOException {
-    Assume.assumeTrue("技能文档不存在:" + SKILL_PATH.toAbsolutePath().normalize(), Files.exists(SKILL_PATH));
-    doc = new String(Files.readAllBytes(SKILL_PATH), StandardCharsets.UTF_8);
+    Path found = null;
+    for (Path candidate : SKILL_PATHS) {
+      if (Files.exists(candidate)) {
+        found = candidate;
+        break;
+      }
+    }
+    Assume.assumeTrue("技能文档不存在:" + SKILL_PATHS.get(0).toAbsolutePath().normalize(), found != null);
+    doc = new String(Files.readAllBytes(found), StandardCharsets.UTF_8);
   }
 
   /** 命令表里的每个方法都要在文档里出现,否则模型根本不知道有这个能力 */
@@ -112,7 +125,7 @@ public class SkillDocConsistencyTest {
     assertTrue("frontmatter 缺少 name", name != null && !name.isEmpty());
     assertTrue("frontmatter 缺少 description", description != null && description.length() >= 10);
     assertTrue("name 必须是 kebab-case:" + name, name.matches("[a-z0-9]+(-[a-z0-9]+)*"));
-    assertEquals("name 必须与所在目录同名", SKILL_PATH.getParent().getFileName().toString(), name);
+    assertEquals("name 必须与技能名一致", SKILL_NAME, name);
   }
 
   @Test

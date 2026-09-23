@@ -2,12 +2,14 @@
 
 **给 DeepSeek Harness（以及任何会调 HTTP 的智能体）用的浏览器中间件。**
 
-智能体自己读不了网页、点不了按钮。这个服务把一台真实的 Chromium 包成一个 HTTP 端点：智能体发一条 `{id, method, params}`，服务就去操作浏览器，然后把页面变成两样它能读懂的东西 ——
+智能体自己读不了网页、点不了按钮。这个服务把一台真实的浏览器包成一个 HTTP 端点：智能体发一条 `{id, method, params}`，服务就去操作浏览器，然后把页面变成两样它能读懂的东西 ——
 
 - **可交互结构化文本**：整页 DOM 压成 `[index]<a >登录/>` 这样的行，`[index]` 就是可以点的元素编号；
 - **截图**：每次页面变化自动留一张，落在 `data/<id>/` 下，可以直接喂给视觉模型。
 
-它不是一个抓取库，也不是无头爬虫框架：它是一个**长驻的、有状态的浏览器服务**，一个任务一个独立实例，登录态、页签、Cookie 都跟着任务走。
+它不是一个抓取库，也不是无头爬虫框架：它是一个**长驻的、有状态的浏览器服务** —— 一个浏览器进程、一份持久化 profile，多个任务靠页签隔离，登录态一直留着。
+
+默认直接用**本机安装的 Google Chrome**（没有才退回内嵌 Chromium），所以 Google 登录之类的站点不会因为「这是个自动化浏览器」而拒绝；profile 是所有任务共用的，agent 第一次登录之后，后续任务不用再登。
 
 ---
 
@@ -15,9 +17,9 @@
 
 | 智能体想要的 | 纯 HTTP 抓取 | DeepSeek Browser Use |
 | --- | --- | --- |
-| 看到 JS 渲染后的页面 | 拿不到 | 真实 Chromium，渲染完再读 |
+| 看到 JS 渲染后的页面 | 拿不到 | 真实浏览器，渲染完再读 |
 | 点击、填表、翻页 | 做不到 | 按索引点击/输入/勾选/拖拽 |
-| 保持登录态 | 要自己维护 Cookie | 每个任务一个持久化 profile |
+| 保持登录态 | 要自己维护 Cookie | 一份共享的持久化 profile，登录一次长期有效 |
 | 「现在页面长什么样」 | 只有 HTML 字符串 | 结构化文本 + 截图，token 可控 |
 | 一次推理跑完一段操作 | 一次请求一个动作 | `commands` 批量，动作和读取混排 |
 | 事后回看某一步 | 没有留档 | `data/<id>/<序号>.png` + `.txt` |
@@ -29,6 +31,8 @@
 ## 二、下载即用（发行版）
 
 发行版是**单文件可执行 jar**，内嵌了对应平台的 Chromium，**下载后不需要再下载任何文件**。
+
+> 内嵌的 Chromium 只是兜底：只要这台机器上装了 Google Chrome，服务就用它（见下文「用哪个浏览器、哪份 profile」），内嵌的那份不会被解压。
 
 | 平台 | 文件 |
 | --- | --- |
@@ -115,7 +119,7 @@ Content-Type: application/json
 
 完整的方法清单、参数、返回字段、坑与限制都在技能文档里：
 
-> **[`.dsh/skills/deepseek-browser-use/SKILL.md`](.dsh/skills/deepseek-browser-use/SKILL.md)**
+> **[`SKILL.md`](SKILL.md)**（装进 DSH 时对应 `.dsh/skills/deepseek-browser-use/SKILL.md`）
 
 那份文档是给智能体读的，也是给人读的参考手册，**以它为准**。
 
@@ -131,15 +135,149 @@ Content-Type: application/json
 
 ## 四、核心概念
 
-### 一个任务一个实例
+### 一个浏览器，多个任务
 
-每次 `start` 都新建一套独立的 Chromium + 持久化 profile，任务之间完全隔离：
+浏览器是**全进程共享**的：一个 Chrome 进程、一份 profile，任务之间靠**页签**隔离。
 
-- profile 在 `~/.config/browseruse/profiles/<id>`，**同一个 id 重新 `start` 时登录态还在**；
-- 同一个 id 不能重复 `start`（会明确报错，提示先 `close` 或换 id）；
-- 不同任务用不同 id，可以并发跑，互不干扰。
+- 第一个 `start` 会把浏览器拉起来，之后每个 `start` 只是认领/新开自己的页签；
+- `close` 只关掉该任务自己的页签，最后一个任务关闭时才把浏览器收掉；
+- **浏览器类型**、有头/无头、profile 目录、可执行文件是**浏览器级别**的属性：与正在运行的那个不一致时，若已经没有任务在跑就按新配置重建（改了配置、换了浏览器都不用重启服务），若还有任务在跑就明确报错，不会把别人的页签弄没；
+- `start` 的返回里带 `data.browser`，说明这次到底用的哪个浏览器、哪份 profile：
 
-**隔离的单位是浏览器上下文，不是 Playwright 的 driver。** `Playwright.create()` 会拉起一个 node 子进程并握手，每次约 350～400ms，还常驻一份内存；但「一个任务一个实例」并不需要各自一个 driver —— 真正需要隔离的是 `BrowserContext`（独立 profile、独立浏览器进程）。所以服务全进程共用一个 driver，`start` 直接从 `launchPersistentContext()` 开始：
+```json
+{"data":{"id":1001,"browser":{"type":"chrome","chrome":true,"userProfile":false,"engine":"chromium",
+  "mode":"managed",
+  "profileDir":"C:\\Users\\you\\.config\\browseruse\\profiles\\shared",
+  "executable":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "profileDirectory":"Default","headless":true}}}
+```
+
+**为什么不能一个任务一个浏览器？** 用户数据目录天生是单例：同一个 `User Data` 目录同时只允许一个
+Chrome 进程，第二个进程会把命令行交给已有实例然后自己退出。所以「共用一份 profile（登录态只养一次）」
+和「一个任务一个浏览器」只能二选一，这里选了前者 —— 这也正是原来「一个任务一个 profile」那套的替代。
+
+**隔离的单位是页签，不是浏览器。** 每个任务有自己的 `pages` 集合：`get_browser_state` 只列自己的页签，
+`switch_tab` 的索引也只在任务自己的页签里数；弹窗、`new_tab` 开出来的新页签会归属到开它的任务。
+代价是上下文级设置（Cookie、地理位置、离线、额外请求头、权限）现在是**所有任务共享**的 —— 它们本来就
+挂在同一个 `BrowserContext` 上。
+
+### 用哪个浏览器、哪份 profile
+
+`start` 时可以按站点挑浏览器（`browser` 参数，也接受配置项 `browser.type` 作为默认值）：
+
+```shell
+# 用本机安装的 Microsoft Edge 跑这一次任务
+curl -X POST http://127.0.0.1:10049/playwright/command \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"start","params":{"browser":"edge"}}'
+```
+
+| `browser` | 浏览器 | 引擎 | profile | 什么时候 |
+| --- | --- | --- | --- | --- |
+| 不传 / `auto` | 本机 Google Chrome，没装则内置 Chromium | Chromium | `browser.profileDir`（默认 `~/.config/browseruse/profiles/shared`） | 默认（推荐） |
+| `chrome` | **只**用本机 Google Chrome | Chromium | 同上；打开 `browser.chrome.useUserProfile` 时是用户自己的 `User Data` | 需要 Google 登录之类的站点，或者要确认「本机 Chrome 下的表现」 |
+| `edge` | **只**用本机 Microsoft Edge | Chromium | `browser.edge.profileDir`（默认 `~/.config/browseruse/profiles/edge`），走 CDP 那条路 | 站点在 Chrome 下用不了、或者要对照两个浏览器的差异 |
+| `chromium` | **只**用内置的那份（发行版内嵌 / 开发态是 Playwright 自带的），完全不碰本机 Chrome | Chromium | `browser.profileDir` | 怀疑本机 Chrome 的扩展或登录态干扰时做对照 |
+| `firefox` | Playwright 自带的那份 Firefox（本机装的普通 Firefox 接不上 juggler 协议） | Firefox | `browser.profileDir` | 站点在 Chromium 下用不了，见下一节 |
+
+别名也认（`msedge` / `google-chrome` / `bundled` / `ff` …）；写了不认识的值会直接失败并列出可选值：
+`start 失败：无法识别的浏览器类型：safari，可选值：auto / chromium / chrome / edge / firefox`。
+
+**`auto` 与显式取值的区别是「能不能悄悄换一个」**：不传 `browser` 时服务按老规矩退让（本机没有 Chrome
+就用内置 Chromium），并把原因写进 `data.browser.note`；显式写了 `chrome` / `edge` 就是「我就要这个」，
+没装会直接报错并说清怎么改 —— 否则「明明要了 Edge，结果用 Chrome 跑出另一种页面」这种问题很难查。
+
+**一次只能有一个浏览器。** 类型可以在任务之间切换（把在跑的任务 `close` 掉再 `start` 即可，不用重启
+服务），但不能在任务运行中切换：那会连累别的任务的页签，服务会明确报错。想同时用两个浏览器（例如一边
+Chrome 一边 Edge），再起一个服务进程，给它们配不同的端口与 profile 目录。
+
+**profile 目录是跟着「浏览器产品」走的**：内置 Chromium 与本机 Chrome 共用 `browser.profileDir`
+（同一 Chromium 家族，也是原来的行为，不动已有登录态）；Edge 单独一份 —— Edge 打开 Chrome 的 `User Data`
+会把它当外来 profile 处理，而且两家 Cookie 的 App-Bound 加密密钥不同，混用只会得到一份读不出登录态的
+目录；Firefox 沿用 `browser.profileDir`（保持原行为，免得把已经养起来的登录态挪走）。所以**换浏览器等于
+换一套登录态**，需要登录的站点要重新登一次，登录态随后同样长期留在那份 profile 里。
+
+Edge 那条路**不做 UA 伪装**：内置 Chromium 会把自己伪装成 Chrome（版本与真实 Chrome 不一致），而本机
+Chrome 与 Edge 都用各自的 UA —— 所以 `navigator.userAgent` 里出现 `Edg/` 才说明这次真的用上了 Edge。
+也不支持「用你自己日常那份 Edge profile」：原因与 Chrome 那边一样（136 起不允许在默认用户数据目录上开
+远程调试）。
+
+**Edge 走的是「自己拉进程 + CDP」这条路**（`data.browser.mode` 是 `cdp`，与「用用户自己的 Chrome profile」
+是同一条路），不是 Playwright 的 `launchPersistentContext`。原因在沙箱：实测 Edge 配上沙箱时，Playwright
+那条路用的 `--remote-debugging-pipe` 会让 Edge 启动即退出，换成 `--remote-debugging-port` 就正常（详见
+下面「关于 Chromium 沙箱」）。这条路的代价有两条，用之前先知道：
+
+- `set_credentials`（HTTP 基本认证）用不了：凭据只能在 Playwright 创建上下文时设置。失败信息里会提示改用
+  `browser=chrome` / `chromium`。
+- 页面触发的下载落到浏览器自己的下载目录，不是 `~/Downloads/broswer`。`pdf` 命令不受影响（路径由服务自己算）。
+
+用本机 Chrome 的好处是它就是用户日常在用的那个浏览器，Google 登录之类的站点不会因为「这是个自动化浏览器」
+而拒绝；profile 是所有任务共用的，**agent 第一次登录某个站点后，登录态就留在 profile 里，后续任务不用再登**。
+
+托管 profile 的位置可以改（`browser.profileDir`，默认 `~/.config/browseruse/profiles/shared`）；换目录等于换一套登录态。
+
+> **为什么不能直接用用户自己的 Chrome profile？** Chrome 136 起不允许在**默认用户数据目录**上开启远程调试
+> （`DevTools remote debugging requires a non-default data directory`），`--remote-debugging-pipe` 与
+> `--remote-debugging-port` 都被拒绝，所以 Playwright / Puppeteer / Selenium 都接不上你日常那份 profile；
+> 把 profile 复制到别处也不行 —— Chrome 的 App-Bound 加密会让 Cookie 解不开（实测原 profile 有 1421 个
+> Cookie，复制后读到 0 个）。要真的用上用户 profile，需要这台机器允许远程调试默认 profile：给
+> `HKLM\SOFTWARE\Policies\Google\Chrome` 加 `DWORD RemoteDebuggingAllowed=1`（需管理员，机器级生效），
+> 然后把 `browser.chrome.useUserProfile` 打开 —— 这时服务会自己拉 Chrome、从它的输出里读调试端口，再用
+> `connectOverCDP` 接上（`data.browser.mode` 会是 `cdp`，且要求 Chrome 当前没有在运行）。
+
+用户 profile 用不上时（Chrome 正在运行、启动失败等），`start` 会**退回托管 profile**，并把原因放进
+`data.browser.note`；`browser.chrome.profileFallback=false` 可以让它直接报错而不是悄悄换一份。
+
+### 换成 Firefox：`browser.engine=firefox`
+
+默认 `chromium`（本机 Google Chrome，没装才退回内嵌 Chromium），行为与以前完全一致；配成 `firefox` 时
+改走 `playwright().firefox().launchPersistentContext(...)`，用 Playwright 自带的那份 Firefox 配同一份托管 profile：
+
+```shell
+mvn spring-boot:run -Dspring-boot.run.jvmArguments="-Dbrowser.engine=firefox"
+```
+
+**为什么需要这个开关**：有的站点在 Chromium 下用不了。中国商标网统一身份认证
+（`sso.cnipa.gov.cn/am/`）的 SPA 会做开发者工具检测（disable-devtool 的 Performance 检测器），
+Chromium 会走到空白页或 HTTP 400；同一流程在 Firefox 139 下能正常渲染出登录表单。对照记录见
+`playwright-server/target/cnipa-diagnosis/`。
+
+几处差异是引擎能力差异，不是配置错了：
+
+| 差异 | 说明 |
+| --- | --- |
+| `pdf` 命令 | 只有 Chromium 支持，Firefox 下返回明确的中文失败原因 |
+| 用户自己的 Chrome profile | `browser.chrome.useUserProfile` 对 Firefox 无效（那条路是 CDP，Firefox 没有 CDP） |
+| 启动参数 | 没有 `--no-sandbox` / `chromiumSandbox` / `--profile-directory`，Firefox 下不传 |
+| 本机装的 Firefox | 用不上：Playwright 的 Firefox 是打过补丁的构建（juggler 协议），一般不用配 `browser.firefox.path` |
+| UA | 不覆写成 Chrome，UA 就是 Firefox 自己的 |
+
+`start` 的返回里会多一个 `data.browser.engine`，用它确认这次到底跑的是哪个引擎。引擎是浏览器级配置：
+改了之后若还有任务在跑，`start` 会报错而不是把别人的页签弄没；空闲时下一次 `start` 会自动重建。
+**换引擎 = 换一套 profile 格式，所以要重新登录一次**。
+
+### 调用追踪日志：每次请求与响应都留档
+
+每一次调用的请求体与响应体都会落到 `<启动目录>/logs/trace/<日期>/` 下，便于排查与追踪：
+
+| 文件 | 内容 |
+| --- | --- |
+| `steps.log` | 每次调用一行：时间、序号、任务 ID、方法、成败、耗时、关键字段 —— 人看的时间线 |
+| `calls.jsonl` | 每次调用一行 JSON：摘要 + 完整请求体 + 批量每一步的成败 —— 给程序过滤 |
+| `000001-1001-get_browser_state.json` | 这一次调用的完整请求与完整响应（含整页 `data.text`） |
+
+配置项：`browser.trace.enabled`（默认开）、`browser.trace.dir`、`browser.trace.maxRecordChars`。
+写盘失败只留警告，不会影响浏览器命令；日志**不做脱敏、不会自动清理**，里面有敏感值时请自行清理。
+
+客户端这一侧还有一个把请求也留档的小脚本 `scripts/trace/browse.ps1`：它按序号把发出去的请求
+（`NNN.req.json`）与收回来的响应（`NNN.res.json`）成对存进 `logs/agent/<会话>/`，并维护一份
+`steps.log`。好处是**请求在发送前就落盘**，连服务没起来、请求根本没发出去这种情况也能看出来。
+
+### driver 与自愈
+
+**共享的还有 Playwright 的 driver。** `Playwright.create()` 会拉起一个 node 子进程并握手，每次约
+350～400ms，还常驻一份内存；但共享浏览器并不需要每个任务一个 driver。所以服务全进程共用一个 driver，
+`start` 直接从启动浏览器开始：
 
 | | 每个任务一个 driver | 共享一个 driver（现在） |
 | --- | --- | --- |
@@ -148,7 +286,9 @@ Content-Type: application/json
 
 代价是 driver 成了单点：它一旦崩，所有任务一起断。所以 `start` 里带了自愈 —— 第一次失败就把共享实例判死、重建一个再试一次（实测 driver 被杀后，下一次 `start` 会在 ~340ms 内重建并成功）。
 
-`close` 只关掉该任务自己的浏览器上下文，**不会**动共享的 driver，因此关一个任务不会连累别的任务。driver 本身由 JVM 退出时的 shutdown hook 收尾；即使进程被硬杀（`taskkill /F`），driver 也会因为管道关闭自己退出，不会留下孤儿进程。
+`close` 只关掉该任务自己的页签，**不会**动共享的 driver，也不会连累别的任务。driver 与（用用户 profile 时）
+我们自己拉起来的 Chrome 都由 JVM 退出时的 shutdown hook 收尾；即使进程被硬杀（`taskkill /F`），driver 也会
+因为管道关闭自己退出，不会留下孤儿进程。
 
 ### get_browser_state：智能体的「眼睛」
 
@@ -210,7 +350,13 @@ mvn spring-boot:run
 mvn test
 ```
 
-测试里有几条「防漂移」的检查：技能文档必须覆盖命令表里的每个方法、文档里不能出现旧方法名、`browser.properties` 里的 Chromium 修订号必须和当前 Playwright 依赖要求的一致。
+测试里有几条「防漂移」的检查：技能文档必须覆盖命令表里的每个方法、文档里不能出现旧方法名、`browser.properties` 里的 Chromium 修订号必须和当前 Playwright 依赖要求的一致、页签列表必须走任务自己的 `pages`（不能再直接读 `context.pages()`）。
+
+集成测试用的是**临时用户数据目录**（`browser.chrome.userDataDir` 指向临时目录），不会碰你日常那份 Chrome profile。想在这台机器上验证「用用户自己的 profile」这条路，用带开关的冒烟测试（会往真实 profile 里写历史记录，所以默认不跑）：
+
+```shell
+mvn test -Dtest=ChromeUserProfileSmokeTest -Dsmoke.chrome.userProfile=true
+```
 
 ### 打发行版
 
@@ -281,14 +427,16 @@ deepseek-browser-use/
 │   │   │   ├── ActionService.java         方法分发与 commands 批量执行
 │   │   │   ├── PlaywrightService.java     所有浏览器操作
 │   │   │   ├── BrowserInstance.java       一个任务的全部运行时状态
+│   │   │   ├── ChromeBrowser.java         本机 Google Chrome 与用户 profile 的探测
+│   │   │   ├── ChromeLauncher.java        用用户 profile 时自己拉 Chrome 并读出调试端口
 │   │   │   └── BundledBrowser.java        内嵌 Chromium 的解压与定位
 │   │   └── dom/                            buildDomTree 与结构化文本
 │   └── src/main/resources/
 │       ├── app.properties                 端口
-│       ├── browser.properties             内嵌 Chromium 的修订号
+│       ├── browser.properties             内嵌 Chromium 修订号 + 浏览器/profile 配置
 │       └── dom/dom_tree/                  DOM 转结构化文本的 JS
 ├── scripts/package/build-release.mjs      发行版打包脚本
-├── .dsh/skills/deepseek-browser-use/      给智能体读的技能文档
+├── SKILL.md                               给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
 └── dist/                                  发行版产物(构建后生成)
 ```
 
@@ -309,16 +457,37 @@ deepseek-browser-use/
 
 ### 关于 Chromium 沙箱
 
-Windows / macOS 上服务会显式**开启** Chromium 沙箱；Linux 上关闭（容器里通常以 root 运行，不带 `--no-sandbox` 时 Chrome 会直接拒绝启动）。
+**默认开启**（`PlaywrightService.chromiumSandbox(BrowserChoice, boolean)`）：在普通桌面环境（Windows / macOS）
+上，本机 Chrome、内置 Chromium 与 Edge 的进程沙箱都能正常工作，关掉它换不来任何东西，只换来更差的隔离和
+窗口上那条 `You are using an unsupported command-line flag: --no-sandbox. Stability and security will suffer.`
+提示条。
 
-这么做顺带消掉了那条很常见的警告：
+| 平台 / 浏览器 | 默认 | 原因 |
+| --- | --- | --- |
+| Windows / macOS 上的 `chrome`、`chromium`、`auto` | **开启** | 普通桌面环境，沙箱可用；开着之后那条提示条也不会再出现 |
+| Windows / macOS 上的 `edge` | **开启** | Edge 走的是 CDP（端口）那条路，沙箱不影响启动。实测：开沙箱 + Playwright 的 `--remote-debugging-pipe` 会让 Edge 启动即退出（`Target page, context or browser has been closed`），换成 `--remote-debugging-port` 就一切正常 —— 问题在「沙箱 + 管道」这个组合，所以解决办法是换启动方式，而不是关沙箱 |
+| Linux 上的任何浏览器 | 关闭（与以前一致） | 服务多数跑在容器里、以 root 运行，而 Chrome 以 root 启动时会直接报 `Running as root without --no-sandbox is not supported` 并退出 |
 
+要改就用 `browser.chromium.sandbox`：`true` 始终开启（Linux 桌面上非 root 跑时可以用），`false` 始终关闭
+（回到以前那种「带提示条、没有沙箱」的跑法）。代码里还留了一道保险：万一 Edge 被改回 Playwright 的管道
+启动，沙箱会自动关掉并打一条警告，而不是让浏览器起不来。
+
+```shell
+# 容器里以 root 跑:必须关
+java -Dbrowser.chromium.sandbox=false -jar deepseek-browser-use.jar
 ```
-You are using an unsupported command-line flag: --no-sandbox. Stability and security will suffer.
-```
 
-值得说清楚的是：**这个标志不是本服务加的**。Playwright 的 `chromiumSandbox` 默认就是 `false`，它自己会往命令行里塞 `--no-sandbox`（见驱动的 `_innerDefaultArgs`：`if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")`）。所以只把自己传的参数删掉是没用的，必须显式开启沙箱。服务仅在 Linux 上额外传入 `--disable-dev-shm-usage`。
+值得说清楚的是：**`--no-sandbox` 是 Playwright 自己加的**，不是本服务传的。Playwright 的
+`chromiumSandbox` 默认就是 `false`，它会往命令行里塞 `--no-sandbox`（见驱动的 `_innerDefaultArgs`：
+`if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")`），所以只要不显式开启沙箱，
+这条标志就一直在。本服务把 `chromiumSandbox` 显式设为上面那张表的结论，两条启动路径（Playwright 的
+`launchPersistentContext` 与 CDP 那条自己拉 Chrome 的路）都看同一个开关，不会一半开一半关 —— CDP 那条路
+不经过 Playwright，关沙箱时由服务自己补 `--no-sandbox`。服务仅在 Linux 上额外传入
+`--disable-dev-shm-usage`（容器里 `/dev/shm` 往往只有 64MB）。
 
 如果提示中出现 `--disable-blink-features=AutomationControlled`，说明正在运行的浏览器仍使用旧版启动参数。项目已移除该参数；更新后端并重新启动浏览器后生效。移除后不再通过此参数隐藏浏览器的自动化特征，部分网站的自动化检测表现可能变化。
 
-这条改动有对应的单元测试（`PlaywrightServiceTest`）盯着：只要有人把 `--no-sandbox`、`--disable-web-security` 之类加回启动参数，或者把非 Linux 上的沙箱关掉，构建就会失败。
+这条行为有对应的单元测试（`PlaywrightServiceTest.sandboxFollowsPlatformByDefault` 与
+`sandboxCanBeConfiguredBothWays`）盯着：平台默认值被改掉、或者配置项失效，构建就会失败。
+真实浏览器上还有两个冒烟测试兜着：`BrowserChoiceSmokeTest`（`-Dsmoke.chromium=true`，内置 Chromium +
+沙箱开启）与 `EdgeBrowserSmokeTest`（`-Dsmoke.edge=true`，Edge + CDP + 沙箱开启）。

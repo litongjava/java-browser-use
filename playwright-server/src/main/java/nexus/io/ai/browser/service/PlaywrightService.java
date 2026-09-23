@@ -10,9 +10,12 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -26,6 +29,7 @@ import nexus.io.ai.browser.consts.BrowserUserAgent;
 import nexus.io.ai.browser.dom.model.DOMElementNode;
 import nexus.io.ai.browser.dom.model.DOMState;
 import nexus.io.ai.browser.dom.service.DomService;
+import com.microsoft.playwright.Browser;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.BrowserType.LaunchPersistentContextOptions;
@@ -60,6 +64,20 @@ public class PlaywrightService {
   private static final ConcurrentHashMap<Long, BrowserInstance> INSTANCES = new ConcurrentHashMap<>();
 
   /**
+   * 全进程共享的浏览器
+   *
+   * <p>
+   * 一个 Chrome 进程 + 一个 profile(默认就是用户自己那份 Chrome profile),所有任务共用。任务不是
+   * 「一套独立的浏览器」,而是共用浏览器上的一组页签。
+   *
+   * <p>
+   * 为什么不能一个任务一份 profile 了:用户数据目录天生是单例 —— 同一个 User Data 目录同时只允许
+   * 一个 Chrome 进程,第二个进程会把命令行交给已有实例然后自己退出,Playwright 只会看到「进程退了」。
+   * 所以「用用户自己的 profile」与「一个任务一个浏览器」二选一,这里选了前者。
+   */
+  private static volatile SharedBrowser sharedBrowser;
+
+  /**
    * 全进程共享的 Playwright(driver)
    *
    * <p>
@@ -69,7 +87,12 @@ public class PlaywrightService {
 
   static {
     // driver 是一个 node 子进程,服务被 Ctrl+C / kill 时要把一起收掉,别留下孤儿进程
+    // 用用户 profile 时我们自己拉的那个 Chrome 同理,不然会一直占着人家的 profile
     Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+      SharedBrowser browser = sharedBrowser;
+      if (browser != null) {
+        ChromeLauncher.stop(browser.process);
+      }
       Playwright current = sharedPlaywright;
       if (current != null) {
         try {
@@ -100,6 +123,20 @@ public class PlaywrightService {
   /** 等待类接口的默认超时(毫秒) */
   private static final double DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 
+  /**
+   * 是否开启 Chromium 沙箱
+   *
+   * <p>
+   * 不配时按平台与浏览器默认(非 Linux 且不是 Edge 时开,其余关),见 {@link #chromiumSandbox(BrowserChoice)}。
+   */
+  public static final String KEY_SANDBOX = "browser.chromium.sandbox";
+
+  /** 用用户 profile 时,等 Chrome 把调试端口打出来的上限(毫秒) */
+  private static final long CDP_LAUNCH_TIMEOUT_MS = 60_000;
+
+  /** 用用户 profile 时,connectOverCDP 的连接超时(毫秒) */
+  private static final double CDP_CONNECT_TIMEOUT_MS = 30_000;
+
   /** 记录请求体/返回体时的截断长度(字符),避免把大响应塞进内存和日志 */
   private static final int MAX_RECORDED_BODY_CHARS = 4_000;
 
@@ -122,53 +159,605 @@ public class PlaywrightService {
   private static final double CAPTURE_SETTLE_TIMEOUT_MS = 1_500;
 
   /**
-   * 启动一个任务的浏览器实例
+   * 启动一个任务的浏览器(浏览器类型按配置里的默认值)
+   *
+   * <p>等价于 {@code start(id, headless, null)},见 {@link #start(Long, boolean, String)}。
+   */
+  public long start(Long id, boolean headless) {
+    return start(id, headless, null);
+  }
+
+  /**
+   * 启动一个任务的浏览器,并指定用哪个浏览器
    *
    * <p>
-   * 一个任务一个实例,但**不是**一个任务一个 driver:全进程共用一个 Playwright(见
-   * {@link #playwright()}),这里直接从 {@code launchPersistentContext()} 开始。隔离靠的是
-   * 每个任务自己的 BrowserContext 与持久化 profile 目录
-   * ({@code ~/.config/browseruse/profiles/<id>}),所以同一个 id 重新 start 时登录态还在,
-   * 不同任务之间互不干扰。
+   * 浏览器与 profile 是全进程共用的(见 {@link SharedBrowser}):所有任务用同一个浏览器进程、同一份
+   * profile,任务之间靠**页签**隔离。所以这里的 {@code browser} 决定的是「这台服务当前用哪个浏览器」,
+   * 而不是「这个任务单独起一个浏览器」。
+   *
+   * <p>
+   * {@code browser} 的取值见 {@link BrowserChoice}:{@code auto}(不传时的默认,行为与以前完全一致:本机
+   * Google Chrome 优先,没装退回内置 Chromium)、{@code chromium}(只内置那一份,不碰本机 Chrome)、
+   * {@code chrome}(只本机 Google Chrome,没装直接失败)、{@code edge}(只本机 Microsoft Edge,没装直接
+   * 失败)、{@code firefox}(Playwright 自带的那份)。
+   *
+   * <p>
+   * 换浏览器等于换一个进程(profile 也跟着换):正在跑的任务与这个类型不一致时,这里会明确报错而不是
+   * 悄悄换掉别人的浏览器 —— 先 {@code close} 掉在跑的任务再换。
    *
    * @param id       任务 ID,传 null 时自动生成雪花 ID
    * @param headless 是否无头
+   * @param browser  浏览器类型;null 或空串表示用配置里的默认值({@code browser.type} / 老的
+   *                 {@code browser.engine})
    * @return 该任务使用的 ID
+   * @throws IllegalArgumentException 传了不认识的值
    */
-  public long start(Long id, boolean headless) {
+  public long start(Long id, boolean headless, String browser) {
+    BrowserChoice requested = null;
+    if (browser != null && !browser.isBlank()) {
+      requested = BrowserChoice.parse(browser);
+      if (requested == null) {
+        throw new IllegalArgumentException("无法识别的浏览器类型：" + browser + "，可选值：" + BrowserChoice.choices());
+      }
+    }
     long taskId = id == null ? SnowflakeIdUtils.id() : id;
     if (INSTANCES.containsKey(taskId)) {
       throw new IllegalStateException("该 id 已经有正在运行的浏览器实例：" + taskId + "，请先调用 close，或换一个 id");
     }
+    long startedAt = System.currentTimeMillis();
+    SharedBrowser shared = sharedBrowser(headless, requested);
+    BrowserInstance instance = newTaskInstance(taskId, shared);
+    INSTANCES.put(taskId, instance);
+    log.info("task {} 浏览器就绪(browser={}),耗时 {}ms", taskId, shared.resolvedType.id(),
+        System.currentTimeMillis() - startedAt);
+    return taskId;
+  }
 
-    Path profileDir = profileDir(taskId);
-    Path downloadDir = Paths.get(userHome(), "Downloads", "broswer");
-    log.info("task {} user dir:{}", taskId, profileDir);
+  /**
+   * 共享浏览器:一个浏览器进程、一份 profile,多个任务共用
+   *
+   * <p>
+   * 用哪个浏览器由 {@link #resolvedType} 记着(内置 Chromium / 本机 Chrome / 本机 Edge / Firefox,
+   * 见 {@link BrowserChoice}):类型、可执行文件、profile 目录都是**浏览器级**属性,同一个浏览器进程
+   * 不能中途换,所以换类型要等任务都关掉(见 {@link #sharedBrowser(boolean, BrowserChoice)})。
+   *
+   * <p>
+   * 之所以不能再「一个任务一个浏览器」:用户数据目录天生是单例 —— 同一个 User Data 目录同时只允许
+   * 一个浏览器进程,第二个进程会把命令行交给已有实例然后自己退出。所以「用用户自己的 profile」与
+   * 「一个任务一个浏览器」只能二选一,这里选了前者。
+   */
+  static final class SharedBrowser {
+    /** 浏览器实际使用的 profile 目录 */
+    final Path profileDir;
+    /** 实际使用的可执行文件;null 表示交给 Playwright 自己解析 */
+    final Path executable;
+    /** 用的是本机安装的 Google Chrome(而不是内嵌/Playwright 自带的 Chromium) */
+    final boolean chrome;
+    /** profileDir 是用户自己的 Chrome 用户数据目录 */
+    final boolean userProfile;
+    final boolean headless;
+    /** 这次用的是哪个引擎(见 {@link BrowserEngine},由 {@link BrowserChoice} 决定) */
+    final BrowserEngine engine;
+    /**
+     * 实际用的浏览器类型,已经落成确定的那个值({@code auto} 不会出现在这里)
+     *
+     * <p>请求方要 {@code auto} 时,这里记的是它最终落到的那个(本机 Chrome 或内置 Chromium),
+     * 否则「这次到底用的哪个浏览器」就没法如实回报了。
+     */
+    final BrowserChoice resolvedType;
+    /** 持久化上下文模式的启动参数;CDP 模式(自己拉 Chrome)下为 null */
+    final LaunchPersistentContextOptions opts;
+    /** 没能用上用户 profile 时的原因,会一起返回给调用方 */
+    final String profileNote;
+    volatile BrowserContext context;
+    /** CDP 模式(自己拉 Chrome)下的连接;托管 profile 模式为 null */
+    volatile Browser browser;
+    /** CDP 模式下我们自己拉起来的 Chrome 进程 */
+    volatile Process process;
+    /**
+     * 接上时就已经存在的页签
+     *
+     * <p>
+     * 用用户自己的 profile 时,Chrome 可能把上次的会话恢复出来 —— 那些页签是用户自己的,不属于任何
+     * 任务,任何任务都不该认领它们(否则第一个任务会直接操作人家正在看的页面)。
+     */
+    final Set<Page> foreignPages = ConcurrentHashMap.newKeySet();
+
+    SharedBrowser(Path profileDir, Path executable, boolean chrome, boolean userProfile, boolean headless,
+        LaunchPersistentContextOptions opts, String profileNote, BrowserChoice resolvedType) {
+      this.profileDir = profileDir;
+      this.executable = executable;
+      this.chrome = chrome;
+      this.userProfile = userProfile;
+      this.headless = headless;
+      this.opts = opts;
+      this.profileNote = profileNote;
+      this.resolvedType = resolvedType == null ? BrowserChoice.resolve(null) : resolvedType;
+      // 引擎由类型推出来,不单独记:两者能不一致的写法迟早会不一致
+      this.engine = this.resolvedType.engine();
+    }
+
+    /**
+     * 这次请求要的浏览器,是不是就是正在跑的这个
+     *
+     * <p>
+     * 浏览器类型、引擎、有头/无头、可执行文件、profile 目录都是浏览器级别的属性,只有全对得上才能复用;
+     * 对不上就得换一个进程(所以在任务运行中不能切换,见 {@link #sharedBrowser(boolean, BrowserChoice)})。
+     *
+     * @param requested 这次请求的类型;null 表示没指定(按配置里的默认值算)
+     */
+    boolean matches(boolean requestedHeadless, BrowserChoice requested) {
+      BrowserChoice want = BrowserChoice.resolve(requested);
+      if (resolvedType != want || engine != want.engine()) {
+        return false;
+      }
+      if (headless != requestedHeadless) {
+        return false;
+      }
+      if (!Objects.equals(executable, want.executable())) {
+        return false;
+      }
+      Path configured = userProfile ? ChromeBrowser.userDataDir() : want.profileDir();
+      return configured != null && configured.toAbsolutePath().normalize().equals(profileDir.toAbsolutePath().normalize());
+    }
+
+    /** 一句话说清「现在是哪个浏览器」,用在「不能中途切换」的报错里 */
+    String describe() {
+      return "browser=" + resolvedType.id() + "，headless=" + headless + "，profile=" + profileDir;
+    }
+  }
+
+  /**
+   * 拿共享浏览器,没有就起一个
+   *
+   * <p>
+   * 浏览器类型、有头/无头、可执行文件、profile 目录都是浏览器级别的属性,同一个浏览器不能中途切换:
+   * <ul>
+   * <li>正在跑的浏览器与这次请求**完全一致** → 直接复用;</li>
+   * <li>不一致但已经没有任务在跑 → 关掉它,按这次请求重新起一个(所以换浏览器类型、改配置都不用重启服务);</li>
+   * <li>不一致而还有任务在跑 → 明确报错,既不悄悄沿用旧配置,也不把别人的页签弄没。</li>
+   * </ul>
+   *
+   * @param requested 这次请求的浏览器类型;null 表示没指定(按配置里的默认值算)
+   */
+  private static SharedBrowser sharedBrowser(boolean headless, BrowserChoice requested) {
+    SharedBrowser current = sharedBrowser;
+    if (current != null) {
+      if (current.matches(headless, requested)) {
+        return current;
+      }
+      if (!INSTANCES.isEmpty()) {
+        throw new IllegalStateException("浏览器已经在运行（" + current.describe() + "）：所有任务共用同一个浏览器，"
+            + "不能中途切换浏览器类型、有头/无头或 profile，请先 close 掉正在运行的任务；"
+            + "想同时用两个浏览器（例如一边 Chrome 一边 Edge）请再起一个服务进程，并给它们配不同的端口与 profile 目录");
+      }
+      log.info("浏览器配置与正在运行的不一致,重建共享浏览器({} -> browser={}, headless={})", current.describe(),
+          BrowserChoice.resolve(requested).id(), headless);
+      closeSharedBrowser();
+    }
+    synchronized (PlaywrightService.class) {
+      if (sharedBrowser == null) {
+        sharedBrowser = launchSharedBrowser(headless, requested);
+      }
+      return sharedBrowser;
+    }
+  }
+
+  /**
+   * 起浏览器:按 {@link BrowserChoice} 分成几条路
+   *
+   * <p>
+   * 共同点是「托管 profile + 持久化上下文」,差别只在用哪个可执行文件、哪份 profile,以及要不要走
+   * 「用户自己的 Chrome profile + CDP」那条路:
+   * <ul>
+   * <li><b>firefox</b>:Playwright 自带的那份 Firefox,没有 CDP、没有 {@code --profile-directory};</li>
+   * <li><b>edge</b>:本机 Edge + Edge 自己一份托管 profile(Edge 打不开 Chrome 的 profile);</li>
+   * <li><b>chromium</b>:内置 Chromium(发行包内嵌,开发态是 Playwright 自带的那份),不碰本机 Chrome;</li>
+   * <li><b>chrome</b>:本机 Google Chrome,必要时走 CDP(见 {@link #launchOverCdp});</li>
+   * <li><b>auto</b>(不传 {@code browser} 时的默认):本机 Chrome 优先,没装退回内置 Chromium,并把原因放进
+   * {@code start} 返回的 {@code data.browser.note} —— 与以前的版本完全一致。</li>
+   * </ul>
+   *
+   * <p>
+   * 显式的 {@code chrome} / {@code edge} 与 {@code auto} 的关键差别是**不悄悄退让**:明明要了 Edge 却起了
+   * Chrome,页面表现不一样,事后很难查,所以这条路直接失败并说清怎么改(见
+   * {@link BrowserChoice#notFoundMessage()})。
+   *
+   * @param requested 这次请求的浏览器类型;null 表示没指定(按配置里的默认值算)
+   */
+  private static SharedBrowser launchSharedBrowser(boolean headless, BrowserChoice requested) {
+    BrowserChoice type = BrowserChoice.resolve(requested);
+    if (type.isFirefox()) {
+      return launchFirefox(headless);
+    }
+    if (type.isEdge()) {
+      return launchEdge(headless);
+    }
+    return launchChromiumFamily(headless, requested);
+  }
+
+  /**
+   * Firefox:Playwright 自带的那份,配同一份托管 profile
+   *
+   * <p>
+   * 这条路没有「本机安装的 Chrome / 用户自己的 profile / CDP」这些概念:Playwright 的 Firefox 是一份
+   * 打过补丁的构建(走 juggler 协议),本机装的普通 Firefox 接不上,所以能用上的只有它自己那份。
+   */
+  private static SharedBrowser launchFirefox(boolean headless) {
+    Path firefox = BrowserEngine.firefoxExecutablePath();
+    String note = firefox == null
+        ? "browser=firefox：使用 Playwright 自带的 Firefox（本机安装的普通 Firefox 接不上 Playwright 的 juggler 协议，所以不复用）"
+        : null;
+    log.info("启动 Firefox（browser=firefox）：profileDir={}, headless={}", BrowserChoice.FIREFOX.profileDir(), headless);
+    return launch(firefox, BrowserChoice.FIREFOX.profileDir(), false, headless, note, null, BrowserChoice.FIREFOX);
+  }
+
+  /**
+   * Edge:本机安装的 Microsoft Edge + Edge 自己一份托管 profile
+   *
+   * <p>
+   * 没装就明确失败,不回退 —— 想要别的浏览器请显式改 {@code browser}(见 {@link BrowserChoice#choices()})。
+   */
+  private static SharedBrowser launchEdge(boolean headless) {
+    Path edge = EdgeBrowser.executablePath();
+    if (edge == null) {
+      throw new IllegalStateException(BrowserChoice.EDGE.notFoundMessage());
+    }
+    Path profileDir = BrowserChoice.EDGE.profileDir();
+    // 全新的空 profile 目录会让 Edge 走首启引导(向导页/默认浏览器询问),补一个哨兵文件跳过它
+    EdgeBrowser.prepareProfileDir(profileDir);
+    String note = "browser=edge：使用本机安装的 Microsoft Edge（profile 是 Edge 自己一份，与本机 Chrome 那份不通用）";
+    log.info("启动 Microsoft Edge（browser=edge）：executable={}, profileDir={}, headless={}", edge, profileDir,
+        headless);
+    // 走「自己拉进程 + CDP」那条路,而不是 Playwright 的 launchPersistentContext:后者用管道调试,
+    // 而 Edge 配上沙箱时管道启动会立刻退出(见 chromiumSandbox 的说明)
+    return launchOverCdp(edge, profileDir, false, headless, note, BrowserChoice.EDGE);
+  }
+
+  /**
+   * Chromium 系:内置 Chromium、本机 Chrome,以及 {@code auto} 的「本机 Chrome 优先」这条路
+   *
+   * <p>
+   * {@code useUserProfile}(用你日常那份 Chrome profile)只对本机 Chrome 有意义:内置 Chromium 没有用户
+   * 数据目录这个概念,而 Edge 走的是它自己的方法。
+   */
+  private static SharedBrowser launchChromiumFamily(boolean headless, BrowserChoice requested) {
+    BrowserChoice type = BrowserChoice.resolve(requested);
+    if (type == BrowserChoice.CHROMIUM) {
+      Path bundled = BundledBrowser.executablePath();
+      String note;
+      if (requested == BrowserChoice.CHROMIUM) {
+        note = bundled == null
+            ? "browser=chromium：开发态没有内嵌 Chromium，用 Playwright 自带的 Chromium（首次使用会自动下载）"
+            : "browser=chromium：使用内置 Chromium，不使用本机安装的 Google Chrome";
+      } else {
+        // 只有 auto 会走到这里:本机没有可用的 Chrome,按老规矩退回内置 Chromium
+        note = "没有找到本机安装的 Google Chrome，改用内嵌/Playwright 自带的 Chromium";
+      }
+      return launch(bundled, BrowserChoice.CHROMIUM.profileDir(), false, headless, note, null, BrowserChoice.CHROMIUM);
+    }
+
+    // 到这里 type 一定是 CHROME:显式要了本机 Chrome,或者在 auto 下这台机器上确实有 Chrome
+    Path chrome = ChromeBrowser.executablePath();
+    if (chrome == null) {
+      throw new IllegalStateException(BrowserChoice.CHROME.notFoundMessage());
+    }
+    Path userDataDir = !ChromeBrowser.useUserProfile() ? null : ChromeBrowser.userDataDir();
+    boolean userProfileFallback = ChromeBrowser.profileFallback();
+    String note = null;
+    if (userDataDir == null && ChromeBrowser.useUserProfile()) {
+      note = "没有找到 Google Chrome 的用户数据目录，改用托管 profile";
+    } else if (userDataDir != null && ChromeBrowser.profileInUse(userDataDir)) {
+      note = "Google Chrome 正在运行，用户 profile 被占用，改用托管 profile（关掉 Chrome 后重新 start 即可用上用户 profile）";
+      userDataDir = null;
+    }
+
+    if (userDataDir != null) {
+      try {
+        return launchOverCdp(chrome, userDataDir, true, headless, null, BrowserChoice.CHROME);
+      } catch (RuntimeException e) {
+        if (!userProfileFallback) {
+          throw e;
+        }
+        note = "用用户 profile 启动失败，改用托管 profile：" + briefMessage(e.getMessage())
+            + profileBusyHint(e);
+        log.warn("用 Google Chrome 用户 profile 启动失败,改用托管 profile:{}", briefMessage(e.getMessage()));
+      }
+    } else if (note != null && !userProfileFallback) {
+      throw new IllegalStateException("无法使用 Google Chrome 用户 profile：" + note
+          + "（browser.chrome.profileFallback=false 时不会退回托管 profile）");
+    }
+    return launch(chrome, BrowserChoice.CHROME.profileDir(), false, headless, note, null, BrowserChoice.CHROME);
+  }
+
+  /**
+   * 自己拉进程、再用 CDP 接上
+   *
+   * <p>
+   * 走这条路而不是 Playwright 的 {@code launchPersistentContext},是因为那条路用
+   * {@code --remote-debugging-pipe}:
+   * <ul>
+   * <li>本机 Chrome 的用户 profile:Chrome 136 起拒绝在默认用户数据目录上用 pipe 调试,只能换成
+   * {@code --remote-debugging-port}(见 {@link ChromeLauncher});</li>
+   * <li>本机 Edge:开沙箱时 pipe 启动会让 Edge 立刻退出,换端口就正常(见
+   * {@link #chromiumSandbox(BrowserChoice)})。</li>
+   * </ul>
+   *
+   * <p>
+   * 代价是拿不到 Playwright 持久化上下文那些便利(视口、下载目录、HTTP 认证都要在创建时给),所以视口与
+   * 弹窗相关的东西改成启动参数,见 {@link #cdpArgs(boolean, BrowserChoice)};HTTP 认证凭据
+   * ({@code set_credentials})在这条路上用不了,调用时会明确失败。
+   *
+   * @param executable  要拉起来的浏览器可执行文件
+   * @param profileDir  用户数据目录(Chrome 的用户 profile,或 Edge 自己那份托管 profile)
+   * @param userProfile 这次用的是不是用户自己的 Chrome profile(决定要不要认领已有页签、要不要带
+   *                    {@code --profile-directory})
+   * @param type        浏览器类型:决定额外启动参数取哪一份、以及返回里的 {@code type}
+   */
+  private static SharedBrowser launchOverCdp(Path executable, Path profileDir, boolean userProfile, boolean headless,
+      String profileNote, BrowserChoice type) {
+    List<String> args = cdpArgs(headless, type);
+    // --profile-directory 是本机 Chrome 用户数据目录里的概念,Edge 自己那份托管 profile 没有
+    args.addAll(type.profileArgs());
+    args.addAll(type.extraArgs());
+    ChromeLauncher.Launched launched = ChromeLauncher.launch(executable, profileDir, args, CDP_LAUNCH_TIMEOUT_MS);
+    try {
+      Browser browser = playwright().chromium().connectOverCDP(launched.endpoint(),
+          new BrowserType.ConnectOverCDPOptions().setTimeout(CDP_CONNECT_TIMEOUT_MS));
+      List<BrowserContext> contexts = browser.contexts();
+      if (contexts.isEmpty()) {
+        throw new IllegalStateException("连上了浏览器,但没拿到默认浏览器上下文");
+      }
+      BrowserContext context = contexts.get(0);
+      log.info("已接上浏览器(自己拉进程 + CDP):browser={}, profile={}, 调试端点 {}", type.id(), profileDir,
+          launched.endpoint());
+
+      SharedBrowser shared = new SharedBrowser(profileDir, executable, type.isGoogleChrome(), userProfile, headless,
+          null, profileNote, type);
+      shared.browser = browser;
+      shared.process = launched.process();
+      shared.context = context;
+      // CDP 模式下**一律不认领接上时已经存在的页签**,任务宁可自己新开一个,原因有两个:
+      // 1. 用用户 profile 时,那些页签是用户自己的(可能恢复了上次的会话),任何任务都不该动;
+      // 2. 自己拉进程时,浏览器启动时那个页签(新标签页/会话恢复)会被它自己的启动流程换掉 ——
+      //    实测认领它之后第一个 go_to_url 会报「Frame has been detached」。
+      shared.foreignPages.addAll(context.pages());
+      if (!shared.foreignPages.isEmpty()) {
+        log.info("接上时已有 {} 个页签,不会被任何任务认领(任务各自新开页签)", shared.foreignPages.size());
+      }
+      browser.onDisconnected(disconnected -> onSharedBrowserClosed(shared));
+      return shared;
+    } catch (RuntimeException e) {
+      ChromeLauncher.stop(launched.process());
+      throw e;
+    }
+  }
+
+  /**
+   * 「启动后立即退出」时补一句最可能的原因
+   *
+   * <p>
+   * 这个失败几乎只有一个来源:那个 profile 上已经有一个浏览器在运行,新进程把命令行交给它然后自己退出。
+   * 命令行读得到时 {@link ChromeBrowser#profileInUse(Path)} 会提前拦住,读不到时只能走到这里 —— 所以
+   * 这句话是调用方唯一能得到的解释,不能只丢一句「进程退出码 0」。
+   */
+  private static String profileBusyHint(RuntimeException e) {
+    if (e instanceof ChromeLauncher.ExitedEarlyException) {
+      return "（这个 profile 上很可能已经有一个浏览器在运行：新进程会把命令行交给它然后自己退出。"
+          + "关掉之后重新 start 就能用上用户 profile）";
+    }
+    return "";
+  }
+
+  /**
+   * 真正启动浏览器(托管 profile 路径):参数已经算好,这里只负责 launchPersistentContext 与上下文级监听
+   *
+   * @param executable 这次要用的浏览器可执行文件;null 表示交给 Playwright 自己解析(内置 Chromium 在
+   *                   开发态、内置 Firefox 都是这条路)
+   * @param type       这次用的浏览器类型,决定引擎、启动参数体例,以及返回里的 {@code browser}
+   */
+  private static SharedBrowser launch(Path executable, Path profileDir, boolean userProfile, boolean headless,
+      String profileNote, LaunchPersistentContextOptions existingOptions, BrowserChoice type) {
+    BrowserChoice resolved = type == null ? BrowserChoice.resolve(null) : type;
+    LaunchPersistentContextOptions opts = existingOptions != null ? existingOptions
+        : resolved.isFirefox() ? buildFirefoxOptions(headless, executable)
+            : buildOptions(headless, executable, userProfile, resolved);
+    try {
+      Files.createDirectories(profileDir);
+    } catch (IOException e) {
+      log.warn("创建 profile 目录失败 {}:{}", profileDir, e.getMessage());
+    }
+    log.info("启动浏览器:browser={}, engine={}, executable={}, profileDir={}, 用户 profile={}, headless={}",
+        resolved.id(), resolved.engine().id(), executable, profileDir, userProfile, headless);
+    BrowserContext context = launchContext(profileDir, opts, resolved.engine());
+    SharedBrowser browser = new SharedBrowser(profileDir, executable, resolved.isGoogleChrome(), userProfile,
+        headless, opts, profileNote, resolved);
+    browser.context = context;
+    context.onClose(closed -> onSharedBrowserClosed(browser));
+    return browser;
+  }
+
+  /**
+   * 共享浏览器被关掉:最后一个窗口被人工关掉、浏览器崩了,或者我们自己 close
+   *
+   * <p>
+   * 页签跟着浏览器一起没了,所以把所有任务一起清掉,下一次 {@code start} 会重新拉起浏览器。这里
+   * **不抢类锁**:主动 {@code context.close()} 时这个回调是在关闭流程里触发的,抢锁会和调用方互相等待。
+   */
+  private static void onSharedBrowserClosed(SharedBrowser browser) {
+    if (sharedBrowser == browser) {
+      sharedBrowser = null;
+    }
+    for (BrowserInstance instance : INSTANCES.values()) {
+      if (instance.context == browser.context) {
+        instance.detached = true;
+        INSTANCES.remove(instance.id);
+        log.info("浏览器已关闭,任务 {} 一并移除", instance.id);
+      }
+    }
+  }
+
+  /**
+   * 给任务分配页签
+   *
+   * <p>
+   * 优先用浏览器里还没有归属的页签(启动时那个 about:blank),没有就新开一个。任务之间靠页签隔离,
+   * 所以每个任务拿到的都是自己的一组页签。
+   */
+  private BrowserInstance newTaskInstance(long taskId, SharedBrowser browser) {
+    BrowserContext context = browser.context;
+    Page page = unclaimedPage(browser);
+    if (page == null) {
+      page = context.newPage();
+    }
+    BrowserInstance instance = new BrowserInstance(taskId, context, page, browser.profileDir, browser.opts);
+    claimPage(instance, page);
+    return instance;
+  }
+
+  /**
+   * 浏览器里还没有归属任务的页签(通常是启动时那个 about:blank)
+   *
+   * <p>
+   * 用用户自己的 profile 时,Chrome 可能把上次的会话恢复出来,那些页签是用户自己的
+   * ({@link SharedBrowser#foreignPages}),不算「没人认领」,任务宁可自己新开一个页签。
+   */
+  private static Page unclaimedPage(SharedBrowser browser) {
+    Set<Page> claimed = new HashSet<>(browser.foreignPages);
+    for (BrowserInstance instance : INSTANCES.values()) {
+      claimed.addAll(instance.pages);
+    }
+    for (Page page : browser.context.pages()) {
+      if (!claimed.contains(page)) {
+        return page;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 把一个页签划给某个任务
+   *
+   * <p>
+   * 新开的页签(弹窗、new_tab、最后一个页签被人工关掉后的补页签)都要走这里:登记归属、挂监听、
+   * 补上任务已经注册过的路由规则。重复认领同一个页签是安全的,监听不会挂两遍。
+   */
+  private void claimPage(BrowserInstance instance, Page page) {
+    if (page == null || !instance.pages.add(page)) {
+      return;
+    }
+    // 屏蔽 navigator.webdriver:每个页签都要挂一次,弹窗也算
+    try {
+      page.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => false});");
+    } catch (PlaywrightException e) {
+      log.debug("挂载 webdriver 屏蔽脚本失败:{}", briefMessage(e.getMessage()));
+    }
+    attachListeners(instance, page);
+    attachRequestRecorder(instance, page);
+    applyRoutes(instance, page);
+    if (instance.page == null || instance.page.isClosed()) {
+      instance.page = page;
+    }
+  }
+
+  /** 任务自己的页签,顺序与浏览器里的顺序一致(索引即 switch_tab 的 pageIndex) */
+  static List<Page> pagesOf(BrowserInstance instance) {
+    List<Page> all = instance.context.pages();
+    if (instance.pages.size() > all.size()) {
+      // 页签被外部关掉后清掉残留引用,避免集合无限增长
+      instance.pages.retainAll(new HashSet<>(all));
+    }
+    List<Page> mine = new ArrayList<>();
+    for (Page page : all) {
+      if (instance.pages.contains(page)) {
+        mine.add(page);
+      }
+    }
+    return mine;
+  }
+
+  /**
+   * 这次任务实际用的浏览器与 profile,放在 {@code start} 的返回里,便于确认有没有用上用户的登录态
+   *
+   * <p>
+   * {@code type} 是实际用的浏览器类型(见 {@link BrowserChoice},{@code auto} 已经落成确定值),
+   * {@code chrome} 表示「用的是不是本机安装的 Google Chrome」,{@code userProfile} 表示「用的是不是用户
+   * 自己那份 Chrome profile(现成的登录态)」,{@code mode} 是 {@code cdp} / {@code managed}。
+   */
+  public Kv browserInfo(Long taskId) {
+    BrowserInstance instance = INSTANCES.get(taskId);
+    SharedBrowser browser = sharedBrowser;
+    if (instance == null || browser == null) {
+      return null;
+    }
+    Kv info = Kv.by("chrome", browser.chrome).set("userProfile", browser.userProfile)
+        .set("engine", browser.engine.id())
+        // 这次实际用的浏览器类型:已经落成确定的值(auto 不会出现在这里),觉得「怎么不是我用惯的那个」
+        // 时先看它
+        .set("type", browser.resolvedType.id())
+        .set("profileDir", browser.profileDir.toAbsolutePath().toString())
+        .set("headless", browser.headless)
+        // cdp = 自己拉的用户 Chrome(connectOverCDP),managed = Playwright 持久化上下文
+        .set("mode", browser.browser != null ? "cdp" : "managed");
+    if (browser.resolvedType.isGoogleChrome()) {
+      // --profile-directory 是本机 Chrome 的概念:内置 Chromium 不传它,Edge 与 Firefox 也没有这一项
+      info.set("profileDirectory", ChromeBrowser.profileDirectory());
+    }
+    if (browser.executable != null) {
+      info.set("executable", browser.executable.toAbsolutePath().toString());
+    }
+    if (browser.profileNote != null) {
+      info.set("note", browser.profileNote);
+    }
+    return info;
+  }
+
+  /**
+   * 启动参数(Chromium 系:内置 Chromium、本机 Chrome、本机 Edge 共用这一套)
+   *
+   * @param executable  这次要用的可执行文件;null 表示交给 Playwright 自己解析(开发态的内置 Chromium)
+   * @param userProfile 用用户自己的 Chrome 用户数据目录时才需要子 profile
+   * @param type        浏览器类型:只有「本机 Chrome」才按它自己的身份出现,内置 Chromium 要伪装 UA,
+   *                    Edge 则必须保留它自己的 UA(见下)
+   */
+  private static LaunchPersistentContextOptions buildOptions(boolean headless, Path executable, boolean userProfile,
+      BrowserChoice type) {
     LaunchPersistentContextOptions opts = new BrowserType.LaunchPersistentContextOptions().setHeadless(headless);
 
     opts.setIgnoreDefaultArgs(Lists.of("--enable-automation"));
 
-    Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
-    int screenWidth = (screenSize.width / 32) * 28;
-    int screenHeight = screenSize.height;
-    log.info("size {} x {}", screenWidth, screenHeight);
+    Dimension window = windowSize();
+    int screenWidth = window.width;
+    int screenHeight = window.height;
 
     // 覆写/追加启动参数
-    opts.setArgs(chromiumArgs());
+    List<String> args = chromiumArgs();
+    if (userProfile) {
+      // 用户数据目录里可能有多个子 profile(Default / Profile 1 / ...),指定用哪一个
+      args.addAll(ChromeBrowser.profileArgs());
+    }
+    if (type.isEdge()) {
+      // Edge 自己的参数(默认没有;调用方可以用 browser.edge.extraArgs 补)
+      args.addAll(EdgeBrowser.extraArgs());
+    } else {
+      // 调用方自己补的参数(语言、代理、--disable-extensions 之类)
+      args.addAll(ChromeBrowser.extraArgs());
+    }
+    opts.setArgs(args);
 
-    // Chromium 沙箱:见 chromiumArgs 的说明
-    opts.setChromiumSandbox(chromiumSandbox());
+    // Chromium 沙箱:见 chromiumSandbox 的说明(这条路径走管道,Edge 走不了这里)
+    opts.setChromiumSandbox(chromiumSandbox(type, true));
 
-    // 内嵌的 Chromium(单文件发行包)显式指定可执行文件,避免 Playwright 再去下载浏览器
-    Path executable = BundledBrowser.executablePath();
+    // 可执行文件:本机 Chrome / Edge / 发行包内嵌的 Chromium;都没有时交给 Playwright 自己解析
+    // (开发态会用它自己下载的浏览器)
     if (executable != null) {
       opts.setExecutablePath(executable);
-      log.info("use bundled chromium:{}", executable);
+      log.info("浏览器可执行文件:{}", executable);
     }
 
     // 下载
     opts.setAcceptDownloads(true);
-    opts.setDownloadsPath(downloadDir);
+    opts.setDownloadsPath(Paths.get(userHome(), "Downloads", "broswer"));
 
     // 视窗 & 设备仿真
     opts.setViewportSize(screenWidth, screenHeight);
@@ -179,22 +768,70 @@ public class PlaywrightService {
     // 权限 & HTTP 头
     opts.setPermissions(Arrays.asList("clipboard-read", "clipboard-write", "notifications"));
 
-    opts.setUserAgent(BrowserUserAgent.CHROME_127_WIN_10);
+    if (type == BrowserChoice.CHROMIUM) {
+      // 内置/Playwright 自带的 Chromium 版本与真实 Chrome 不一致,统一伪装成 Windows 上的 Chrome;
+      // 本机 Chrome 与 Edge 直接用自己的 UA —— 尤其 Edge:改掉的话 UA 里就没有 Edg/ 了,
+      // 「这次到底用的哪个浏览器」在站点侧也就看不出来了
+      opts.setUserAgent(BrowserUserAgent.CHROME_127_WIN_10);
+    }
     opts.setServiceWorkers(ServiceWorkerPolicy.ALLOW);
 
-    long startedAt = System.currentTimeMillis();
-    BrowserContext ctx = launchContext(profileDir, opts);
-    Page firstPage = ctx.pages().get(0);
+    return opts;
+  }
 
-    // 屏蔽 navigator.webdriver
-    firstPage.addInitScript("Object.defineProperty(navigator, 'webdriver', {get: () => false});");
+  /**
+   * Firefox 的启动参数
+   *
+   * <p>
+   * 与 Chromium 那份的差别不是「少抄了几行」,而是**这些选项在 Firefox 下根本不存在**:
+   * <ul>
+   * <li>{@code ignoreDefaultArgs} 里的 {@code --enable-automation} 是 Chromium 的启动标志;</li>
+   * <li>{@code chromiumSandbox} 只对 Chromium 生效(Playwright 会把 {@code chromiumSandbox} 传给它,
+   * Firefox 会报「选项不被支持」);</li>
+   * <li>{@code serviceWorkers} 策略也是 Chromium 特有;</li>
+   * <li>UA 不能覆写成 Chrome:注释里说得很清楚,Firefox 的价值就在于它是 Firefox —— 覆写 UA 会让
+   * 「用哪个引擎」这件事失去意义,而且 UA 与引擎行为不一致本身就是异常信号。这里直接用 Firefox
+   * 自己的 UA。</li>
+   * </ul>
+   *
+   * <p>
+   * 保留的是两边通用的部分:持久化上下文、下载、视口、设备仿真、权限(见
+   * {@link BrowserEngine#firefoxPermissions()})与 {@code userPrefs}(见
+   * {@link BrowserEngine#firefoxUserPrefs()})。
+   */
+  private static LaunchPersistentContextOptions buildFirefoxOptions(boolean headless, Path executable) {
+    LaunchPersistentContextOptions opts = new BrowserType.LaunchPersistentContextOptions().setHeadless(headless);
 
-    BrowserInstance instance = new BrowserInstance(taskId, ctx, firstPage, profileDir, opts);
-    attachListeners(instance, firstPage);
-    attachRequestRecorder(instance);
-    INSTANCES.put(taskId, instance);
-    log.info("task {} 浏览器就绪,耗时 {}ms", taskId, System.currentTimeMillis() - startedAt);
-    return taskId;
+    Dimension window = windowSize();
+    opts.setArgs(BrowserEngine.firefoxExtraArgs());
+    opts.setFirefoxUserPrefs(BrowserEngine.firefoxUserPrefs());
+
+    if (executable != null) {
+      opts.setExecutablePath(executable);
+      log.info("Firefox 可执行文件:{}", executable);
+    }
+
+    opts.setAcceptDownloads(true);
+    opts.setDownloadsPath(Paths.get(userHome(), "Downloads", "broswer"));
+
+    opts.setViewportSize(window.width, window.height);
+    opts.setDeviceScaleFactor(1.0);
+    opts.setIsMobile(false);
+    opts.setHasTouch(false);
+
+    opts.setPermissions(BrowserEngine.firefoxPermissions());
+
+    return opts;
+  }
+
+  /**
+   * 窗口/视口尺寸:屏幕宽度的 28/32,高度取满
+   *
+   * <p>Chromium 与 Firefox 共用同一套算法,免得两个引擎的窗口大小不一致(排查时看到的页面布局也就不一致)。
+   */
+  static Dimension windowSize() {
+    Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
+    return new Dimension((screenSize.width / 32) * 28, screenSize.height);
   }
 
   /**
@@ -202,9 +839,9 @@ public class PlaywrightService {
    *
    * <p>
    * {@code Playwright.create()} 会拉起一个 node driver 进程并完成握手,每次大约几百毫秒, 而且每个实例都常驻一个
-   * node 进程。但「一个任务一个实例」并不需要各自一个 driver —— 隔离的单位是 BrowserContext:每个任务有自己的
-   * {@code launchPersistentContext}(独立 profile、独立浏览器进程)。所以全进程共用一个
-   * driver,{@code start} 直接从 {@code launchPersistentContext()} 开始。
+   * node 进程。但服务里根本不需要多个 driver:浏览器本身就只有一份(见 {@link SharedBrowser}),一个 driver
+   * 能同时管着它下面的所有上下文与页签。所以全进程共用一个 driver,{@code start} 只在这个共享浏览器上开一个
+   * 页签。
    */
   private static Playwright playwright() {
     Playwright current = sharedPlaywright;
@@ -242,23 +879,29 @@ public class PlaywrightService {
   }
 
   /**
-   * 用共享的 Playwright 起一个持久化上下文
+   * 用共享的 Playwright 起一个持久化上下文(按引擎选 chromium / firefox)
    *
    * <p>
    * 第一次失败时把共享实例判死、重建一个再试一次:driver 进程可能已经被上一次任务带崩了, 重建比让用户去重启整个服务划算。第二次还失败就把异常抛出去。
    */
-  private static BrowserContext launchContext(Path profileDir, LaunchPersistentContextOptions opts) {
+  private static BrowserContext launchContext(Path profileDir, LaunchPersistentContextOptions opts,
+      BrowserEngine engine) {
     try {
-      return playwright().chromium().launchPersistentContext(profileDir, opts);
+      return playwrightType(engine).launchPersistentContext(profileDir, opts);
     } catch (RuntimeException first) {
       log.warn("启动浏览器失败,重建共享 Playwright 后重试一次:{}", first.getMessage());
       discardPlaywright();
-      return playwright().chromium().launchPersistentContext(profileDir, opts);
+      return playwrightType(engine).launchPersistentContext(profileDir, opts);
     }
   }
 
+  /** 引擎 → Playwright 的浏览器类型({@code playwright().chromium()} / {@code playwright().firefox()}) */
+  private static com.microsoft.playwright.BrowserType playwrightType(BrowserEngine engine) {
+    return engine.isFirefox() ? playwright().firefox() : playwright().chromium();
+  }
+
   /**
-   * Chromium 启动参数
+   * 浏览器启动参数
    *
    * <p>
    * 这里**不传** {@code --no-sandbox} 与 {@code --disable-web-security}:Chrome 把这两个
@@ -267,10 +910,11 @@ public class PlaywrightService {
    * 并在窗口上挂一条提示。
    *
    * <p>
-   * 关键点是 {@code --no-sandbox} 根本不用我们加:Playwright 的 {@code chromiumSandbox} 默认就是
-   * {@code false},它自己会往命令行里塞 {@code --no-sandbox}(见驱动的
-   * {@code _innerDefaultArgs}:{@code if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")})。
-   * 所以真正要去掉这个警告,必须把 {@code chromiumSandbox} 打开,见 {@link #chromiumSandbox()}。
+   * 注意 {@code --no-sandbox} 不是这里加的,而是 Playwright 自己加的:它的
+   * {@code chromiumSandbox} 默认就是 {@code false},见驱动的
+   * {@code _innerDefaultArgs}:{@code if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")}。
+   * 本项目默认**开启**沙箱(见 {@link #chromiumSandbox(BrowserChoice)}),所以那条警告条默认不会再出现;
+   * 只有把 {@code browser.chromium.sandbox=false}(或者跑在 Linux / Edge 上)时才会有。
    */
   static List<String> chromiumArgs() {
     List<String> args = new ArrayList<>();
@@ -286,16 +930,97 @@ public class PlaywrightService {
    * 是否开启 Chromium 沙箱
    *
    * <p>
-   * Windows/macOS 上开启:这样 Playwright 不会再传 {@code --no-sandbox},既消掉了那条
-   * 「不受支持的命令行标志」警告,又拿回了 Chrome 自己的进程沙箱(更安全)。
+   * 默认**开着**(Windows / macOS 这类普通桌面环境):本机 Chrome 与内置 Chromium 的进程沙箱都能正常
+   * 工作,关掉它换不来任何东西,只换来窗口上那条
+   * {@code You are using an unsupported command-line flag: --no-sandbox. Stability and security will suffer.}
+   * 提示条和更差的隔离。开着之后 Playwright 不会再往命令行里塞 {@code --no-sandbox}
+   * (见驱动的 {@code _innerDefaultArgs}:{@code if (options.chromiumSandbox !== true) chromeArguments.push("--no-sandbox")}),
+   * CDP 那条路(自己拉 Chrome)也不会再加它 —— 两边都看这个开关,不会一半开一半关。
    *
    * <p>
-   * Linux 上关闭:容器里通常以 root 运行,而 root 不带 {@code --no-sandbox} 时 Chrome
-   * 直接拒绝启动({@code Running as root without --no-sandbox is not supported})。这条路上
-   * Chrome 仍会打印那条警告,这是容器里跑浏览器的固有代价。
+   * Linux 上默认**关着**,与以前的版本一致:服务多数跑在容器里、以 root 运行,而 Chrome 以 root 启动时
+   * 会直接报 {@code Running as root without --no-sandbox is not supported} 并退出。Linux 桌面(非 root、
+   * 内核允许用户命名空间)想开就配 {@code browser.chromium.sandbox=true}。
+   *
+   * <p>
+   * <b>Edge 默认也开着,但它必须走 CDP 那条路</b>(见 {@link #launchOverCdp}):实测
+   * (Edge 145.0.3800.97 / Windows)开沙箱时,Playwright 的 {@code launchPersistentContext}
+   * (用 {@code --remote-debugging-pipe})拉起来的 Edge 会启动即退出,报
+   * {@code Target page, context or browser has been closed};把启动方式换成
+   * {@code --remote-debugging-port} 就一切正常。也就是说问题在「沙箱 + 管道」这个组合,不在 Edge 或
+   * 沙箱本身 —— 所以 {@code browser=edge} 走自己拉进程 + CDP,沙箱照样开着。下面这个
+   * {@code overPipe} 参数就是为这件事留的:谁把 Edge 弄回管道启动,这里会自动把沙箱关掉(并打一条
+   * 警告),而不是让浏览器起不来。
+   *
+   * <p>
+   * 三种取值都用 {@code browser.chromium.sandbox} 覆盖:
+   * <ul>
+   * <li>{@code true}:始终开启(容器里以 root 跑时 Chrome 会起不来,见上;Edge 走管道时会被忽略);</li>
+   * <li>{@code false}:始终关闭,回到以前那种「带提示条、没有沙箱」的跑法;</li>
+   * <li>不配:按平台默认(非 Linux 开,Linux 关)。</li>
+   * </ul>
+   *
+   * @param type    这次用的是哪个浏览器
+   * @param overPipe 这次是不是用 Playwright 的 {@code launchPersistentContext}(管道)启动的
    */
-  static boolean chromiumSandbox() {
+  static boolean chromiumSandbox(BrowserChoice type, boolean overPipe) {
+    boolean edgeOverPipe = overPipe && type != null && type.isEdge();
+    String configured = ChromeBrowser.config(KEY_SANDBOX);
+    if (configured != null) {
+      boolean wanted = Boolean.parseBoolean(configured.trim());
+      if (wanted && edgeOverPipe) {
+        log.warn("browser.chromium.sandbox=true 与 Edge 的管道启动不兼容（实测 Edge 会启动即退出），"
+            + "这次仍按关闭处理；用 browser=edge 时它走的是 CDP,沙箱是开着的");
+      }
+      return wanted && !edgeOverPipe;
+    }
+    if (edgeOverPipe) {
+      return false;
+    }
     return !isLinux();
+  }
+
+  /**
+   * 用用户自己的 profile 时,我们自己拉 Chrome 用的启动参数
+   *
+   * <p>
+   * 这条路径上没有 Playwright 帮忙兜底(它那些默认参数是配 {@code launchPersistentContext} 的),
+   * 所以只挑真正需要的:不弹首启/默认浏览器询问、别拦弹窗(服务靠弹窗切页签)、后台页签不要被降频
+   * (否则等待会莫名超时)、沙箱按 {@link #chromiumSandbox(BrowserChoice)} 的决定走(关着时这条路径得自己加
+   * {@code --no-sandbox},Playwright 管不到它)。视口在 CDP 模式下没有 {@code setViewportSize} 的初始值,
+   * 用 {@code --window-size} 给一个,页面级视口后续仍可用 {@code set_viewport} 调整。
+   *
+   * @param type 这次拉起来的是哪个浏览器:只影响沙箱这一个开关
+   */
+  static List<String> cdpArgs(boolean headless, BrowserChoice type) {
+    List<String> args = new ArrayList<>(chromiumArgs());
+    // 0 = 让浏览器自己挑端口,端口号从它的 stderr("DevTools listening on ws://...")里读
+    args.add("--remote-debugging-port=0");
+    args.add("--no-first-run");
+    args.add("--no-default-browser-check");
+    args.add("--disable-search-engine-choice-screen");
+    args.add("--disable-breakpad");
+    // 点击 target=_blank / window.open 会开新页签,不能让弹窗拦截把这条路掐了
+    args.add("--disable-popup-blocking");
+    args.add("--disable-prompt-on-repost");
+    args.add("--disable-hang-monitor");
+    args.add("--disable-background-timer-throttling");
+    args.add("--disable-renderer-backgrounding");
+    args.add("--disable-backgrounding-occluded-windows");
+    args.add("--metrics-recording-only");
+    args.add("--force-color-profile=srgb");
+    if (!chromiumSandbox(type, false)) {
+      // 这条路径不经过 Playwright,chromiumSandbox=false 不会自动变成 --no-sandbox,得自己加
+      args.add("--no-sandbox");
+    }
+    Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
+    args.add("--window-size=" + (screenSize.width / 32) * 28 + "," + screenSize.height);
+    if (headless) {
+      args.add("--headless=new");
+      args.add("--hide-scrollbars");
+      args.add("--mute-audio");
+    }
+    return args;
   }
 
   /** 当前系统是不是 Linux:命令行标志与路径差异都靠它判断 */
@@ -308,12 +1033,7 @@ public class PlaywrightService {
     return EnvUtils.get("user.home", ".");
   }
 
-  /** 每个任务一个持久化 profile 目录,保证任务之间互相隔离 */
-  private static Path profileDir(long taskId) {
-    return Paths.get(userHome(), ".config", "browseruse", "profiles", String.valueOf(taskId));
-  }
-
-  /** 弹窗、控制台日志、页面错误:每个新页面都要挂一次 */
+  /** 弹窗、控制台日志、页面错误、弹窗页签:每个页签都要挂一次 */
   private void attachListeners(BrowserInstance inst, Page page) {
     page.onDialog(dialog -> {
       Kv info = Kv.by("type", dialog.type()).set("message", dialog.message()).set("defaultValue", dialog.defaultValue())
@@ -328,26 +1048,97 @@ public class PlaywrightService {
     });
     page.onConsoleMessage(msg -> addBounded(inst.consoleLogs, msg.type() + ": " + msg.text()));
     page.onPageError(error -> addBounded(inst.pageErrors, error));
+    // 这个页签弹出的新窗口归同一个任务,别人看不见
+    page.onPopup(popup -> claimPage(inst, popup));
+    // 页签被人工关掉(共用浏览器时很常见)后要有人接管「当前页」
+    page.onClose(closed -> onPageClosed(inst, closed));
   }
 
-  /** 记录网络请求,onResponse 时回填状态码;带请求体的记下 postData,便于排查提交了什么 */
-  private void attachRequestRecorder(BrowserInstance inst) {
-    inst.context.onRequest(request -> {
+  /**
+   * 页签被关掉后的收尾
+   *
+   * <p>
+   * 关掉的是任务当前页时,换成该任务还活着的页签;一个都不剩就补一个新页签,别让任务直接变成不可用
+   * (共用用户 profile 时,人工在窗口里点掉一个页签是很常见的操作)。任务自己正在 close 时跳过。
+   */
+  private void onPageClosed(BrowserInstance inst, Page page) {
+    inst.pages.remove(page);
+    if (inst.detached || inst.page != page) {
+      return;
+    }
+    recoverCurrentPage(inst);
+  }
+
+  /** 当前页没了:换成任务里还活着的页签,一个都不剩就补一个新的 */
+  private void recoverCurrentPage(BrowserInstance inst) {
+    List<Page> live = pagesOf(inst);
+    if (!live.isEmpty()) {
+      inst.page = live.get(0);
+      activate(inst.page);
+      return;
+    }
+    try {
+      Page fresh = inst.context.newPage();
+      inst.page = fresh;
+      claimPage(inst, fresh);
+      log.info("任务 {} 已经没有可用页签,已补一个新页签", inst.id);
+    } catch (PlaywrightException e) {
+      log.warn("任务 {} 补页签失败(浏览器可能已经关闭):{}", inst.id, briefMessage(e.getMessage()));
+    }
+  }
+
+  /**
+   * 记录网络请求,onResponse 时回填状态码;带请求体的记下 postData,便于排查提交了什么
+   *
+   * <p>
+   * 挂在**页签**上而不是上下文上:上下文是所有任务共用的,挂上下文会把别人的流量也记进这个任务的
+   * {@code get_requests}。
+   */
+  private void attachRequestRecorder(BrowserInstance inst, Page page) {
+    page.onRequest(request -> {
       Kv entry = requestInfo(request);
       addBoundedRequest(inst.requests, entry);
       inst.requestIndex.put(request, entry);
     });
-    inst.context.onResponse(response -> {
+    page.onResponse(response -> {
       Kv entry = inst.requestIndex.remove(response.request());
       if (entry != null) {
         entry.set("status", response.status()).set("respondedAt", System.currentTimeMillis());
       }
       rememberResponse(inst, response, entry == null ? requestInfo(response.request()) : entry);
     });
-    inst.context.onRequestFailed(request -> {
+    page.onRequestFailed(request -> {
       Kv entry = inst.requestIndex.remove(request);
       if (entry != null)
         entry.set("failure", request.failure()).set("finishedAt", System.currentTimeMillis());
+    });
+  }
+
+  /**
+   * 把任务已经注册过的路由规则补挂到新页签上
+   *
+   * <p>
+   * 路由挂在页签上(而不是共用的上下文上),所以弹窗、new_tab 出来的新页签要自己补一遍,
+   * 否则「只在这个任务里 mock 接口」会莫名其妙失效。
+   */
+  private static void applyRoutes(BrowserInstance inst, Page page) {
+    for (String urlPattern : inst.routedPatterns) {
+      registerRoute(inst, page, urlPattern);
+    }
+  }
+
+  private static void registerRoute(BrowserInstance inst, Page page, String urlPattern) {
+    page.route(urlPattern, route -> {
+      Kv current = inst.routes.get(urlPattern);
+      if (current == null || "resume".equals(current.getStr("action"))) {
+        route.resume();
+      } else if ("mock".equals(current.getStr("action"))) {
+        route.fulfill(new Route.FulfillOptions().setStatus(current.getInt("status"))
+            .setBody(current.getStr("body") == null ? "" : current.getStr("body"))
+            .setContentType(current.getStr("contentType")));
+      } else {
+        route.abort();
+      }
     });
   }
 
@@ -517,7 +1308,7 @@ public class PlaywrightService {
    * data.tabs 里的 index 与 switch_tab 的 pageIndex 仍然是 0 基。
    */
   public static String browserStateText(BrowserInstance inst) {
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     StringBuilder sb = new StringBuilder();
     for (int i = 0; i < pages.size(); i++) {
       Page page = pages.get(i);
@@ -611,9 +1402,9 @@ public class PlaywrightService {
     }
   }
 
-  /** 所有标签页,index 可直接用于 switch_tab 与 close_tab */
+  /** 这个任务自己的标签页,index 可直接用于 switch_tab 与 close_tab(别的任务的页签不算在内) */
   private List<Kv> tabs(BrowserInstance inst) {
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     List<Kv> tabs = new ArrayList<>();
     for (int i = 0; i < pages.size(); i++) {
       Page page = pages.get(i);
@@ -790,7 +1581,7 @@ public class PlaywrightService {
 
   /** 动作前后探针:url、页签数、正文长度,用于观察变化，不能证明业务成功或失败 */
   private static Kv stateProbe(BrowserInstance inst) {
-    Kv probe = Kv.by("url", inst.page.url()).set("tabCount", inst.context.pages().size());
+    Kv probe = Kv.by("url", inst.page.url()).set("tabCount", pagesOf(inst).size());
     try {
       Object fingerprint = inst.page.evaluate("""
           () => {
@@ -1078,7 +1869,7 @@ public class PlaywrightService {
    */
   private void adoptNewTab(BrowserInstance inst, int tabCountBefore) {
     for (int i = 0; i < 15; i++) {
-      List<Page> pages = inst.context.pages();
+      List<Page> pages = pagesOf(inst);
       if (pages.size() > tabCountBefore) {
         Page newest = pages.get(pages.size() - 1);
         inst.page = newest;
@@ -1134,7 +1925,7 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     if (pageIndex < 0 || pageIndex >= pages.size()) {
       return RespBodyVo.fail("switch_tab 页签索引越界: " + pageIndex);
     }
@@ -1149,16 +1940,17 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     if (pageIndex < 0 || pageIndex >= pages.size()) {
       return RespBodyVo.fail("close_tab 页签索引越界: " + pageIndex);
     }
     Page toClose = pages.get(pageIndex);
+    boolean wasCurrent = inst.page == toClose;
     toClose.close();
-    // 如果关闭了当前页，则切换到第一个可用页
-    if (inst.page == toClose && pages.size() > 1) {
-      inst.page = pages.get(0);
-      activate(inst.page);
+    inst.pages.remove(toClose);
+    if (wasCurrent) {
+      // 关掉的是当前页:换一个还活着的页签,人工看到的窗口也跟着切
+      recoverCurrentPage(inst);
     }
     return RespBodyVo.ok();
   }
@@ -1191,7 +1983,7 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     if (pageIndex == null) {
       activate(inst.page);
       return RespBodyVo.ok(Kv.by("pageIndex", pages.indexOf(inst.page)).set("url", inst.page.url()));
@@ -1215,7 +2007,7 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     for (int i = 0; i < pages.size(); i++) {
       String current = pages.get(i).url();
       if (urlMatches(current, url)) {
@@ -1238,7 +2030,7 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     Page keep;
     if (pageIndex == null) {
       keep = inst.page;
@@ -1262,7 +2054,7 @@ public class PlaywrightService {
     }
     inst.page = keep;
     activate(keep);
-    List<Page> remaining = inst.context.pages();
+    List<Page> remaining = pagesOf(inst);
     return RespBodyVo.ok(Kv.by("closed", closed).set("remaining", remaining.size())
         .set("pageIndex", remaining.indexOf(keep)).set("url", keep.url()));
   }
@@ -1675,7 +2467,7 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
-    int tabCountBefore = inst.context.pages().size();
+    int tabCountBefore = pagesOf(inst).size();
     Kv before = stateProbe(inst);
     try {
       inst.page.locator(selector).first().click(clickOptions());
@@ -1926,14 +2718,14 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     Page page = inst.context.newPage();
-    attachListeners(inst, page);
+    claimPage(inst, page);
     if (url != null && !url.isEmpty()) {
       page.navigate(url);
     }
     inst.page = page;
     // 新建页签后同样带到最前,便于人工观察
     activate(page);
-    List<Page> pages = inst.context.pages();
+    List<Page> pages = pagesOf(inst);
     return RespBodyVo.ok(Kv.by("pageIndex", pages.indexOf(page)).set("url", page.url()));
   }
 
@@ -2135,6 +2927,13 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
+    SharedBrowser browser = sharedBrowser;
+    if (browser != null && browser.engine.isFirefox()) {
+      // 与其让 Playwright 抛一句英文的「only supported in Chromium」,不如直接说清怎么改
+      return RespBodyVo.fail("pdf 失败：PDF 导出只有 Chromium 支持，当前引擎是 firefox"
+          + "（browser=firefox 或 browser.engine=firefox），需要 PDF 时请换成 Chromium 系的浏览器再 start："
+          + "browser=chrome / browser=chromium / browser=edge");
+    }
     String target = (path == null || path.isEmpty()) ? defaultPdfPath() : path;
     try {
       ensureParent(target);
@@ -2283,7 +3082,11 @@ public class PlaywrightService {
   }
 
   /**
-   * HTTP 基本认证凭据只能在上下文创建时设置,因此该接口会重建上下文(当前页面会丢失,登录态保留在 profile 里)
+   * HTTP 基本认证凭据只能在上下文创建时设置,因此该接口会重建整个浏览器
+   *
+   * <p>
+   * 浏览器是所有任务共用的,重建会换掉整个 Chrome 进程(其它任务的页签会一起消失),所以只允许在
+   * 「当前只有一个任务」时调用。登录态在 profile 里,重建后还在。
    */
   public RespBodyVo setCredentials(Long browserId, String username, String password) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -2291,7 +3094,17 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     if (inst.opts == null) {
-      return RespBodyVo.fail("set_credentials 失败：该实例不支持重建上下文");
+      // opts 为空 = 这次浏览器是「自己拉进程 + CDP 接上」起来的(用户自己的 Chrome profile,或 Edge):
+      // 这种上下文的创建参数不在我们手里,HTTP 认证凭据没地方设
+      SharedBrowser shared = sharedBrowser;
+      boolean edge = shared != null && shared.resolvedType.isEdge();
+      return RespBodyVo.fail("set_credentials 失败：当前浏览器走的是「自己拉进程 + CDP 接入」这条启动路径（"
+          + (edge ? "browser=edge" : "用用户自己的 Chrome profile") + "），HTTP 认证凭据只能在 Playwright "
+          + "创建上下文时设置，这条路径上没法重建上下文"
+          + (edge ? "；需要 HTTP 基本认证时改用 browser=chrome 或 browser=chromium（托管 profile 那条路）" : ""));
+    }
+    if (INSTANCES.size() > 1) {
+      return RespBodyVo.fail("set_credentials 会重建整个浏览器，而所有任务共用同一个浏览器与 profile；请先 close 掉其它任务再试");
     }
     inst.opts.setHttpCredentials(new HttpCredentials(username, password));
     restartContext(inst);
@@ -2381,7 +3194,14 @@ public class PlaywrightService {
 
   // ==================== 网络 ====================
 
-  /** action 取 abort(拦截)或 mock(返回自定义响应) */
+  /**
+   * action 取 abort(拦截)或 mock(返回自定义响应)
+   *
+   * <p>
+   * 规则挂在**这个任务的页签**上(而不是共用的上下文上):共用用户 profile 之后所有任务在同一个
+   * 浏览器里,挂上下文会让别的任务也被拦。弹窗、new_tab 出来的新页签会自动补上已有规则,
+   * 见 {@link #applyRoutes(BrowserInstance, Page)}。
+   */
   public RespBodyVo route(Long browserId, String urlPattern, String action, String body, Integer status,
       String contentType) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -2395,18 +3215,9 @@ public class PlaywrightService {
     inst.routes.put(urlPattern, rule);
 
     if (inst.routedPatterns.add(urlPattern)) {
-      inst.context.route(urlPattern, route -> {
-        Kv current = inst.routes.get(urlPattern);
-        if (current == null || "resume".equals(current.getStr("action"))) {
-          route.resume();
-        } else if ("mock".equals(current.getStr("action"))) {
-          route.fulfill(new Route.FulfillOptions().setStatus(current.getInt("status"))
-              .setBody(current.getStr("body") == null ? "" : current.getStr("body"))
-              .setContentType(current.getStr("contentType")));
-        } else {
-          route.abort();
-        }
-      });
+      for (Page page : pagesOf(inst)) {
+        registerRoute(inst, page, urlPattern);
+      }
     }
     return RespBodyVo.ok(Kv.by("urlPattern", urlPattern).set("action", rule.getStr("action")));
   }
@@ -2417,13 +3228,17 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     if (urlPattern == null || urlPattern.isEmpty()) {
-      inst.context.unrouteAll();
+      for (Page page : pagesOf(inst)) {
+        page.unrouteAll();
+      }
       inst.routes.clear();
       inst.routedPatterns.clear();
     } else {
       inst.routes.remove(urlPattern);
       if (inst.routedPatterns.remove(urlPattern)) {
-        inst.context.unroute(urlPattern);
+        for (Page page : pagesOf(inst)) {
+          page.unroute(urlPattern);
+        }
       }
     }
     return RespBodyVo.ok();
@@ -2886,18 +3701,30 @@ public class PlaywrightService {
     return String.valueOf(status);
   }
 
+  /**
+   * 结束一个任务
+   *
+   * <p>
+   * 只关掉这个任务自己的页签:浏览器、profile 与 Playwright driver 都是共用的,关掉会连累别的任务。
+   * 最后一个任务关闭时才把浏览器一起收掉(用户 profile 的占用也随之释放)。
+   */
   public RespBodyVo close(Long browserId) {
     BrowserInstance inst = INSTANCES.remove(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
     }
-    if (inst.context != null) {
+    inst.detached = true;
+    for (Page page : pagesOf(inst)) {
       try {
-        inst.context.close();
+        page.close();
       } catch (RuntimeException e) {
-        // 上下文可能已经因为浏览器崩溃而失效,这里不该让 close 变成失败
-        log.warn("关闭任务 {} 的浏览器上下文失败:{}", browserId, e.getMessage());
+        // 页签可能已经因为浏览器崩溃而失效,这里不该让 close 变成失败
+        log.warn("关闭任务 {} 的页签失败:{}", browserId, e.getMessage());
       }
+    }
+    inst.pages.clear();
+    if (INSTANCES.isEmpty()) {
+      closeSharedBrowser();
     }
     // 注意:这里**不关** Playwright。它是全进程共享的 driver,关掉会把其它任务的浏览器一起搞死;
     // 它由 JVM 退出时的 shutdown hook 负责收尾。
@@ -2905,30 +3732,70 @@ public class PlaywrightService {
   }
 
   /**
-   * 重建任务自己的浏览器上下文
+   * 关掉共享浏览器(最后一个任务关闭、或者要重建上下文时调用)
    *
    * <p>
-   * 用在 {@code set_credentials} 这类需要换掉整个上下文(代理、认证)的接口上。只换 BrowserContext,共享的
-   * Playwright 不动。
+   * 用用户 profile 时浏览器是我们自己拉起来的,得连进程一起收掉,否则用户下次打开 Chrome 会被告知
+   * 「Chrome 未正常关闭」;{@code browser.close()} 会通过 CDP 让 Chrome 自己优雅退出,
+   * {@link ChromeLauncher#stop(Process)} 只是兜底。
+   */
+  private static void closeSharedBrowser() {
+    SharedBrowser browser;
+    synchronized (PlaywrightService.class) {
+      browser = sharedBrowser;
+      // 先置空再 close:onClose 回调里也会置空,但它不抢锁,顺序反了也没关系
+      sharedBrowser = null;
+    }
+    if (browser == null || (browser.context == null && browser.process == null)) {
+      return;
+    }
+    try {
+      if (browser.browser != null) {
+        browser.browser.close();
+      } else if (browser.context != null) {
+        browser.context.close();
+      }
+      log.info("共享浏览器已关闭(profile:{})", browser.profileDir);
+    } catch (RuntimeException e) {
+      log.warn("关闭共享浏览器失败:{}", e.getMessage());
+    } finally {
+      ChromeLauncher.stop(browser.process);
+    }
+  }
+
+  /**
+   * 重建共享浏览器
+   *
+   * <p>
+   * 用在 {@code set_credentials} 这类只能在上文创建时生效的设置上(HTTP 基本认证、代理)。因为浏览器
+   * 是所有任务共用的,重建会换掉整个 Chrome 进程,所以只允许在「只有这一个任务」时调用。
    */
   public BrowserInstance restartContext(BrowserInstance instance) {
-    try {
-      instance.page.close();
-      instance.context.close();
-    } catch (Exception e) {
-      log.error(e.getMessage());
+    SharedBrowser browser = sharedBrowser;
+    if (browser == null) {
+      return instance;
     }
-    try {
-      BrowserContext context = launchContext(instance.profileDir, instance.opts);
-      log.info("new context:{}", context);
-      Page firstPage = context.pages().get(0);
-      instance.context = context;
-      instance.page = firstPage;
-      attachListeners(instance, firstPage);
-      attachRequestRecorder(instance);
-    } catch (Exception e) {
-      log.error(e.getMessage(), e);
+    // 重建前后都要保住这个任务的页签归属:先摘掉,重建完再认领一个新页签
+    instance.detached = true;
+    instance.pages.clear();
+    closeSharedBrowser();
+    SharedBrowser fresh;
+    synchronized (PlaywrightService.class) {
+      fresh = launch(browser.executable, browser.profileDir, browser.userProfile, browser.headless, browser.profileNote,
+          browser.opts, browser.resolvedType);
+      sharedBrowser = fresh;
     }
+    instance.detached = false;
+    instance.context = fresh.context;
+    instance.profileDir = fresh.profileDir;
+    instance.opts = fresh.opts;
+    Page page = unclaimedPage(fresh);
+    if (page == null) {
+      page = fresh.context.newPage();
+    }
+    instance.page = page;
+    claimPage(instance, page);
+    log.info("任务 {} 的浏览器上下文已重建:{}", instance.id, fresh.context);
     return instance;
   }
 

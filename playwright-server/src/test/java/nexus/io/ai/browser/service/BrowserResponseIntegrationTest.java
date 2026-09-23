@@ -4,6 +4,7 @@ import static org.junit.Assert.*;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
@@ -23,8 +24,15 @@ public class BrowserResponseIntegrationTest {
   private static Long id;
   private static HttpServer server;
   private static String base;
+  private static Path testProfileDir;
 
   @BeforeClass public static void start() throws Exception {
+    // 测试必须用一份临时 profile:默认那份托管 profile(~/.config/browseruse/profiles/shared)是开发机
+    // 上真正在用的登录态,跑测试不该往里写东西。浏览器本身仍然优先用本机安装的 Chrome。
+    testProfileDir = Files.createTempDirectory("browser-use-test-profile");
+    System.setProperty(ChromeBrowser.KEY_PROFILE_DIR, testProfileDir.toString());
+    ChromeBrowser.resetForTests();
+
     server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
     server.createContext("/", exchange -> {
       boolean api = exchange.getRequestURI().getPath().equals("/query");
@@ -47,12 +55,81 @@ public class BrowserResponseIntegrationTest {
   @AfterClass public static void stop() {
     if (id != null) service.close(id);
     if (server != null) server.stop(0);
+    System.clearProperty(ChromeBrowser.KEY_PROFILE_DIR);
+    ChromeBrowser.resetForTests();
+    if (testProfileDir != null) {
+      try (java.util.stream.Stream<Path> paths = Files.walk(testProfileDir)) {
+        for (Path path : paths.sorted(java.util.Comparator.reverseOrder()).toList()) {
+          Files.deleteIfExists(path);
+        }
+      } catch (Exception e) {
+        // 临时目录删不掉不影响测试结果
+      }
+    }
   }
 
   private Page page() { return service.getInstance(id).page; }
   private Kv data(RespBodyVo response) {
     assertTrue(response.getMsg(), response.isOk());
     return (Kv) response.getData();
+  }
+
+  /**
+   * 所有任务共用同一个浏览器与 profile,但页签各自独立
+   *
+   * <p>这是这次改动的核心:不再一个任务一份 profile(用户 profile 天生只能有一个 Chrome 进程),
+   * 隔离改由页签承担。关掉一个任务不能影响另一个任务的页签。
+   */
+  @Test public void tasksShareOneBrowserButOwnTheirTabs() {
+    Long second = service.start(null, true);
+    try {
+      BrowserInstance first = service.getInstance(id);
+      BrowserInstance other = service.getInstance(second);
+      assertSame("所有任务共用同一个浏览器上下文", first.context, other.context);
+      assertEquals("所有任务共用同一个 profile", first.profileDir, other.profileDir);
+      assertNotSame("页签不共用", first.page, other.page);
+
+      // start 返回的 browser 信息要如实说明这次用的浏览器与 profile
+      Kv info = service.browserInfo(id);
+      assertEquals("本机装了 Chrome 就该用它", true, info.get("chrome"));
+      assertEquals("默认不碰用户自己的 profile", false, info.get("userProfile"));
+      assertEquals("默认走托管 profile(Playwright 持久化上下文)", "managed", info.getStr("mode"));
+      assertEquals("托管 profile 目录要听配置的", testProfileDir.toAbsolutePath().toString(), info.getStr("profileDir"));
+
+      int firstTabsBefore = ((List<?>) data(service.getBrowserState(id, false, 0)).get("tabs")).size();
+      assertEquals("新任务的页签列表里只有自己的页签", 1,
+          ((List<?>) data(service.getBrowserState(second, false, 0)).get("tabs")).size());
+
+      assertTrue(service.close(second).isOk());
+      assertNull("关掉的任务要从实例表里移除", service.getInstance(second));
+      assertEquals("关掉一个任务不影响另一个任务的页签", firstTabsBefore,
+          ((List<?>) data(service.getBrowserState(id, false, 0)).get("tabs")).size());
+    } finally {
+      if (service.getInstance(second) != null) service.close(second);
+    }
+  }
+
+  /**
+   * 走命令表调 {@code start}:返回里必须带 {@code data.browser}
+   *
+   * <p>调用方(智能体)靠它判断这次到底用没用上本机 Chrome 与用户的登录态,所以这是对外的契约,
+   * 不能只在服务内部有这个信息。
+   */
+  @Test public void startCommandReportsWhichBrowserItUsed() {
+    RespBodyVo response = actions.execute(null, "start", JSONObject.parseObject("{\"headless\":true}"));
+    Kv data = data(response);
+    Long started = ((Number) data.get("id")).longValue();
+    try {
+      Kv browser = (Kv) data.get("browser");
+      assertNotNull("start 的返回里应当有 data.browser", browser);
+      assertEquals("本机装了 Chrome 就该用它", true, browser.get("chrome"));
+      assertEquals("默认不碰用户自己的 profile", false, browser.get("userProfile"));
+      assertEquals("默认走托管 profile", "managed", browser.getStr("mode"));
+      assertEquals(testProfileDir.toAbsolutePath().toString(), browser.getStr("profileDir"));
+      assertEquals("应当能看出用的是哪个可执行文件", true, browser.getStr("executable") != null);
+    } finally {
+      service.close(started);
+    }
   }
 
   @Test public void currentFormStateAndReadonlyErrors() {
@@ -155,6 +232,42 @@ public class BrowserResponseIntegrationTest {
     assertEquals(popup.getInt("tabCountBefore") + 1, popup.getInt("tabCountAfter").intValue());
     Page original = page();
     for (Page other : service.getInstance(id).context.pages()) if (other != original) other.close();
+  }
+
+  /**
+   * {@code start} 的 {@code browser} 参数:返回里如实报类型,不认识的值直接拒掉
+   *
+   * <p>
+   * 「不能中途换浏览器」这条是刻意的:浏览器与 profile 全进程共用,任务还在跑就换会连累别人的页签,
+   * 所以宁可明确失败,也不悄悄重建。
+   */
+  @Test public void startRejectsUnknownBrowserAndSwitchingWhileRunning() {
+    // 1) 返回里要能看出这次用的是哪个浏览器(auto 已经落成确定值)
+    Kv info = service.browserInfo(id);
+    String current = info.getStr("type");
+    assertNotNull("start 的返回里应当有 data.browser.type", current);
+    assertNotEquals("auto 不该出现在返回里,应当落成确定的类型", "auto", current);
+    assertTrue("类型必须是文档里的取值之一:" + current, BrowserChoice.CHOICES.contains(current));
+
+    // 2) 不认识的值:失败信息里要带可选值,免得调用方猜
+    RespBodyVo unknown = actions.execute(null, "start",
+        JSONObject.parseObject("{\"headless\":true,\"browser\":\"safari\"}"));
+    assertFalse("不认识浏览器类型时 start 应当失败", unknown.isOk());
+    assertTrue("失败原因要列出可选值,实际:" + unknown.getMsg(), unknown.getMsg().contains("chrome"));
+    assertTrue("失败原因要提到 edge,实际:" + unknown.getMsg(), unknown.getMsg().contains("edge"));
+    Object failedData = unknown.getData();
+    assertTrue("失败时不该返回新建的实例 id",
+        failedData == null || !((Kv) failedData).containsKey("id"));
+
+    // 3) 任务还在跑的时候换浏览器类型:明确失败,不重建
+    String other = "chrome".equals(current) ? "edge" : "chrome";
+    RespBodyVo switched = actions.execute(null, "start",
+        JSONObject.parseObject("{\"headless\":true,\"browser\":\"" + other + "\"}"));
+    assertFalse("任务运行中换浏览器类型应当失败", switched.isOk());
+    assertTrue("失败原因要说清是共用浏览器导致的,实际:" + switched.getMsg(),
+        switched.getMsg().contains("不能中途切换"));
+    assertTrue("失败原因要带上当前正在用的浏览器,实际:" + switched.getMsg(),
+        switched.getMsg().contains(current));
   }
 
   @Test public void repeatedUrlResponsesAreCorrelatedAndTruncationIsExplicit() {

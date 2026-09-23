@@ -40,6 +40,10 @@ import nexus.io.tio.http.server.util.CORSUtils;
  * {@code data/<id>/<seq>.png}(序号从 1 开始递增),并在响应的 data 里回填
  * {@code seq} / {@code screenshot}(可直接 GET 的 URL)/ {@code screenshot_path}。
  * 截图列表就是这次任务的页面变化历史,视觉模型可以直接按 URL 取图。
+ *
+ * <p>每一次调用(请求体 + 响应体)都会另外留一份审计日志到 {@code logs/trace/<日期>/} 下,见
+ * {@link CommandTraceLog}:{@code steps.log} 是给人看的时间线,{@code calls.jsonl} 供程序过滤,
+ * 每次调用还有一个完整报文的 {@code .json}。排查「第几步开始不对」时先看这份日志。
  */
 @Slf4j
 public class PlaywrightHandler implements HttpRequestHandler {
@@ -55,9 +59,15 @@ public class PlaywrightHandler implements HttpRequestHandler {
 
   @Override
   public HttpResponse handle(HttpRequest request) throws Exception {
+    long startedAt = System.currentTimeMillis();
     HttpResponse response = TioRequestContext.getResponse();
     CORSUtils.enableCORS(response);
-    response.body(ResponseFormatter.format(dispatch(request), request.getBodyString()));
+    String body = request.getBodyString();
+    RespBodyVo result = ResponseFormatter.format(dispatch(request), body);
+    // 每一次「请求 → 响应」都落一份到 logs/trace/<日期>/ 下(见 CommandTraceLog)。
+    // 它自己吞掉所有异常:磁盘满、目录没权限都不会让浏览器命令失败。
+    CommandTraceLog.record(body, result, startedAt);
+    response.body(result);
     return response;
   }
 

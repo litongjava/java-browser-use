@@ -12,7 +12,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-
 import com.jfinal.kit.Kv;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType.LaunchPersistentContextOptions;
@@ -31,6 +30,24 @@ public class BrowserInstance {
   public LaunchPersistentContextOptions opts;
   /** 最近一次 get_browser_state 的 DOM 树快照,按索引操作元素时使用 */
   public DOMState domState;
+
+  /**
+   * 这个任务自己的页签
+   *
+   * <p>
+   * 浏览器与 profile 现在是全进程共用的(见 {@code PlaywrightService.SharedBrowser}),任务之间的
+   * 隔离靠的就是这个集合:每个任务只看得到自己的页签,{@code get_tabs} / {@code switch_tab} 的
+   * 索引也只在这个集合里数。页签被关掉后由 {@code page.onClose} 回调移除。
+   */
+  public final Set<Page> pages = ConcurrentHashMap.newKeySet();
+
+  /**
+   * 任务是否正在被关闭(close / 重建浏览器)
+   *
+   * <p>
+   * 关闭过程中页签会一个个关掉,{@code onClose} 回调不该再自动补新页签,否则关不干净。
+   */
+  public volatile boolean detached;
 
   /**
    * 截图序号:每次「可能改变页面」的指令执行后自增一次
@@ -93,7 +110,7 @@ public class BrowserInstance {
    *
    * <p>
    * 注意这里**不持有** Playwright:它是整个进程共用的 driver(见
-   * {@link PlaywrightService#playwright()}),任务的隔离单位是 BrowserContext 与 profile 目录。
+   * {@link PlaywrightService#playwright()}),任务之间靠 BrowserContext 里的页签集合与 profile 目录区分。
    */
   public BrowserInstance(long id, BrowserContext ctx, Page pg, Path profileDir, LaunchPersistentContextOptions opts) {
     this.id = id;

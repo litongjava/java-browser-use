@@ -1,12 +1,12 @@
 ---
 name: deepseek-browser-use
-description: 通过 HTTP 接口驱动真实浏览器完成网页任务：一个任务一个独立浏览器实例，用 get_browser_state 取回可交互结构化页面文本与元素索引，按索引点击/输入/勾选/悬停/拖拽/双击，下拉框、上传文件、多标签页、等待、鼠标、截图与 PDF、Cookie 与本地存储、浏览器设置、弹窗与控制台、网络拦截、执行任意 JavaScript、批量指令；每次页面变化自动截图、每次取状态自动落盘截图与结构化文本（截图只留档，非必要不要读图，读文本即可，以节省 token）。当任务需要真实浏览器（JS 渲染、登录态、点击交互）而不是纯 HTTP 抓取时使用。
+description: 通过 HTTP 接口驱动真实浏览器完成网页任务：默认使用本机安装的 Google Chrome 与一份共享的持久化 profile（所有任务共用一个浏览器进程，任务之间按页签隔离，登录一次长期有效），用 get_browser_state 取回可交互结构化页面文本与元素索引，按索引点击/输入/勾选/悬停/拖拽/双击，下拉框、上传文件、多标签页、等待、鼠标、截图与 PDF、Cookie 与本地存储、浏览器设置、弹窗与控制台、网络拦截、执行任意 JavaScript、批量指令；每次页面变化自动截图、每次取状态自动落盘截图与结构化文本（截图只留档，非必要不要读图，读文本即可，以节省 token）。当任务需要真实浏览器（JS 渲染、登录态、点击交互）而不是纯 HTTP 抓取时使用。
 whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点击、勾选、滚动、截图、执行 JS 或提取页面内容时；服务默认地址 http://localhost:10049。读页面只用 get_browser_state 的文本字段，非必要不要读它返回的图片。
 ---
 
 # DeepSeek Browser Use（HTTP 浏览器自动化）
 
-这是给智能体用的浏览器中间件：一个 tio-boot 服务，用 HTTP 驱动真实的 Chromium，把网页变成「可交互结构化文本 + 截图」。
+这是给智能体用的浏览器中间件：一个 tio-boot 服务，用 HTTP 驱动真实的浏览器（默认是**本机安装的 Google Chrome**，配一份**共享的持久化 profile**），把网页变成「可交互结构化文本 + 截图」。
 
 - 默认地址：`http://localhost:10049`（端口来自 `playwright-server/src/main/resources/app.properties` 的 `server.port`）
 - 启动服务：`java -jar deepseek-browser-use-<版本>-<平台>.jar`（发行包），或开发态在 `playwright-server` 目录执行 `mvn spring-boot:run`
@@ -117,17 +117,68 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
 
 ## 二、任务与浏览器实例
 
-**一个任务一个实例。** 每次 `start` 都会新建一套独立的 Chromium + 持久化 profile，任务之间完全隔离。
+**一个浏览器，多个任务。** 服务用的是**本机安装的 Google Chrome**（没装才退回内嵌 Chromium）和**一份共享的持久化 profile**（默认在 `~/.config/browseruse/profiles/shared`）：所有任务共用同一个 Chrome 进程与同一份 profile，任务之间靠**页签**隔离。登录一次就留在 profile 里，后续任务不用再登。
 
-> 隔离的单位是**浏览器上下文**（独立 profile、独立浏览器进程），Playwright 的 driver 则是整个服务共用的一个。这对调用方完全透明：一个任务崩了不影响别的任务，`close` 也只关掉自己那套。
+> 为什么不再一个任务一份 profile：用户数据目录天生是单例 —— 同一个目录同时只允许一个 Chrome 进程（第二个进程会把命令行交给已有实例然后自己退出），所以「共用一份 profile」和「一个任务一个浏览器」只能二选一。现在的取舍是：**共用浏览器与 profile，页签按任务隔离**。
+>
+> 想直接用用户日常那份 profile（现成的 Cookie 与登录态）？Chrome 136 起**不允许在默认用户数据目录上开启远程调试**（Playwright / Puppeteer / Selenium 一视同仁），所以默认不走这条路。只有在服务端把 `browser.chrome.useUserProfile` 打开、并且这台机器允许远程调试默认 profile（企业策略 `RemoteDebuggingAllowed=1`，或 Chrome 低于 136）时才会用上，这时 `data.browser.mode` 是 `cdp`。
+
+### 用哪个浏览器：`start` 时选（`browser` 参数）
+
+**一个站点在这个浏览器下用不了，就换一个再试** —— 这是最容易见效的一招，不用改服务端配置。`start` 时传 `browser` 即可：
+
+```json
+{"method":"start","params":{"headless":true,"browser":"edge"}}
+```
+
+| `browser` 取值 | 用的是什么 | 说明 |
+| --- | --- | --- |
+| 不传（或 `auto`） | 本机安装的 Google Chrome，没装则内置 Chromium | 默认，行为与以前完全一致 |
+| `chrome` | 本机安装的 Google Chrome | 没装会**直接失败**（不会偷偷换成内置的），失败信息里会说怎么改 |
+| `edge` | 本机安装的 Microsoft Edge | 同上；Edge 用**它自己一份 profile**，登录态与 Chrome 那份不通用 |
+| `chromium` | 内置的那份 Chromium（发行包内嵌；开发态是 Playwright 自带的） | 完全不碰本机 Chrome，适合「怀疑是本机 Chrome 的扩展／登录态干扰」时对照 |
+| `firefox` | Playwright 自带的 Firefox | 等价于服务端把 `browser.engine` 配成 `firefox`，见下 |
+
+也可以简写成 `msedge` / `google-chrome` / `ff` 这些别名；写了不认识的值会返回 `start 失败：无法识别的浏览器类型：xxx，可选值：auto / chromium / chrome / edge / firefox`。
+
+**先看返回再干活**：`data.browser.type` 就是这次实际用的浏览器（`auto` 不会出现在这里，已经落成确定值），配合 `data.browser.chrome` / `userProfile` / `mode` / `profileDir` 一起看。`data.browser.note` 非空时说明服务替你做了退让（例如「没有找到本机安装的 Google Chrome，改用内嵌/Playwright 自带的 Chromium」）。
+
+**什么时候换**：站点明确报「浏览器不支持」、页面白屏但换引擎就好、或者需要对照「同一页面在两个浏览器下的差异」时。换了浏览器**不保证**一定有救 —— 但比反复重试同一个浏览器划算。
+
+**注意三件事**：
+
+- **一次只能有一个浏览器**：浏览器与 profile 全进程共用。任务还在跑时 `start` 传一个不同的 `browser` 会返回 `start 失败：浏览器已经在运行（browser=chrome，headless=true，profile=…）：所有任务共用同一个浏览器，不能中途切换浏览器类型…`。要换就先 `close` 掉在跑的任务，再 `start`；**不用重启服务**。
+- **换浏览器等于换一套登录态**：`chrome`／`chromium` 共用 `browser.profileDir` 那一份；`edge` 用它自己那份（`~/.config/browseruse/profiles/edge`）；`firefox` 的 profile 格式与 Chromium 系不通用。所以换过去之后，需要登录的站点要重新登一次（登录态会留在那份 profile 里，后续任务不用再登）。
+- **`edge` 走的是「自己拉进程 + CDP」这条路**（`data.browser.mode` 是 `cdp`，和用用户自己的 Chrome profile 一样）：这样才能带着沙箱跑（实测 Edge 配上沙箱时，Playwright 的管道启动会让它启动即退出）。随之而来的差别有两条：`set_credentials` 在这条路上不可用；页面触发的下载落到浏览器自己的下载目录（不是 `~/Downloads/broswer`，`pdf` 命令不受影响，它自己算路径）。
+- **`edge` 这条路用的是浏览器自己的 UA**（含 `Edg/`）。内置 Chromium 会伪装成 Chrome 的 UA，本机 Chrome 与 Edge 都用各自的 UA —— 所以 UA 里出现 `Edg/` 才说明这次真的用上了 Edge。
+
+### 用哪个引擎：Chrome 还是 Firefox（`browser.engine`）
+
+默认 `chromium`：本机安装的 Google Chrome，没装才退回内嵌/Playwright 自带的 Chromium —— 与以前完全一致。服务端把 `browser.engine` 配成 `firefox` 时改走 `playwright().firefox().launchPersistentContext(...)`：Playwright 自带的那份 Firefox（版本由 Playwright 依赖决定），配同一份托管 profile。**`start` 时传 `browser=firefox` 是同一件事**（不用改服务端配置），引擎与浏览器类型的关系见上一节。
+
+**什么时候需要切**：有的站点在 Chromium 下根本用不了。中国商标网统一身份认证（`sso.cnipa.gov.cn/am/`）的 SPA 会做开发者工具检测（disable-devtool 的 Performance 检测器），Chromium（本机 Chrome 与内嵌 Chromium 都一样）会走到空白页或 HTTP 400，而 Firefox 139 下同一流程能正常渲染出登录表单。切过去之后 `start` 的返回里 `data.browser.engine` 是 `firefox`、`data.browser.chrome` 与 `data.browser.userProfile` 都是 `false`、`mode` 是 `managed`。
+
+**注意这几处与 Chromium 不同**（是引擎能力差异，不是配置错了）：
+
+| 差别 | 说明 |
+| --- | --- |
+| `pdf` 命令 | 只有 Chromium 支持，Firefox 下会直接返回失败原因（提示换成 Chromium 系的浏览器：`browser=chrome` / `chromium` / `edge`），不要以为是自己参数写错了 |
+| 用户自己的 Chrome profile | `browser.chrome.useUserProfile` 与 Firefox 无关，打开也不会被 Firefox 用上 |
+| 启动参数 | 没有 `--no-sandbox`／`chromiumSandbox`／`--profile-directory` 这些 Chromium 概念，Firefox 下不传 |
+| 本机装的 Firefox | 用不上：Playwright 的 Firefox 是打过补丁的构建（走 juggler 协议），`browser.firefox.path` 一般不需要配 |
+| UA | **不覆写成 Chrome**：Firefox 的价值就在于它是 Firefox，UA 里会是 `Firefox/<版本>` |
+
+`browser.engine` 是**浏览器级**配置：改了它之后，如果还有任务在跑，`start` 会明确报错而不是把别人的页签弄没；没有任务在跑时，下一次 `start` 会自动把旧浏览器收掉、按新引擎重建。登录态跟着 profile 走，**换引擎会换一套登录态**（Chromium 与 Firefox 的 profile 格式不通用），所以切过去之后需要重新登录一次。
 
 - `id` 就是任务标识。`start` 时自己指定（例如用业务里的任务号），不传则自动生成雪花 ID。
-- 每个任务的 profile 目录是 `~/.config/browseruse/profiles/<id>`：**同一个 id 重新 start 时登录态还在**（cookie、localStorage 都留着），不同任务之间互不干扰。
+- 每个任务有**自己的一组页签**：`get_tabs` / `data.tabs` / `switch_tab` 的索引只在这个任务的页签里数，别的任务的页签看不见也点不到。弹窗与 `new_tab` 开出来的新页签归开它的任务。
 - **同一个 `id` 不能重复 `start`**：会返回 `start 失败：该 id 已经有正在运行的浏览器实例：1001，请先调用 close，或换一个 id`。要重来就先 `close` 再 `start`。
-- 实例本身只在内存里，服务重启后 id 失效（profile 还在）。
+- `close` 只关掉这个任务的页签；**最后一个任务关闭时**浏览器才会一起退出（profile 的占用也随之释放）。
+- 实例本身只在内存里，服务重启后 id 失效（登录态在 profile 里，仍在）。
+- `start` 的返回里有 `data.browser`：`type`（这次实际用的浏览器：`chrome`／`edge`／`chromium`／`firefox`）、`chrome`（是否用上了本机 Chrome）、`userProfile`（是否用上了用户自己的 profile）、`engine`、`mode`（`managed` = Playwright 的托管 profile，`cdp` = 服务自己拉进程再接上：用户自己的 Chrome profile 与 `edge` 都是这条）、`executable`、`profileDir`、`profileDirectory`、`headless`，以及服务替你做了退让时的 `note`。**看到 `userProfile=false` 就说明这次不是用户日常那份登录态**，需要登录的站点要重新走登录流程或请人协助；**看到 `type` 不是你要的那个，先看 `note`**（见上节「用哪个浏览器」）。
 - 服务没有鉴权，默认只监听本机；对外暴露前必须自行加访问控制。
 
-> 换任务不需要换 profile 复用登录态了：登录态跟着任务 ID 走。想让「新任务继承已登录状态」，用同一个 id 重新 `start` 即可。
+> 登录态不跟着任务 ID 走，而是跟着共享 profile 走：换任务、换 id 都不影响。`userProfile=false` 时用的是托管 profile（`~/.config/browseruse/profiles/shared`），那份 profile 里的登录态是 agent 自己养起来的 —— 第一次登录之后同样会长期保留。
 
 ## 三、get_browser_state：页签信息 + 元素索引
 
@@ -231,6 +282,23 @@ current tab is: 1
 - 批量调用时**每一步的结果里都有它自己那一步的截图**，所以一次批量请求就能拿到整段操作的页面变化历史。
 - 这些文件不会自动清理，`data/` 已经加进 `.gitignore`；不需要时直接删目录即可。
 
+### 调用追踪日志（`logs/trace/`）
+
+除了页面留档，**每一次调用本身**也会被服务记一份到本地：请求体与响应体原样落盘，便于事后排查「我到底发了什么、服务回了什么」。每个自然日一个目录 `logs/trace/<日期>/`：
+
+| 文件 | 内容 | 用途 |
+| --- | --- | --- |
+| `steps.log` | 每次调用一行：时间、序号、任务 ID、方法、成功与否、耗时、关键字段 | **人看的时间线**，一眼看出第几步开始不对 |
+| `calls.jsonl` | 每次调用一行 JSON：摘要 + 完整请求体；批量 `commands` 还会把每一步的成败单列出来 | 程序过滤（按 id/method 找某几次调用） |
+| `000001-1001-get_browser_state.json` | 这一次调用的**完整**请求与**完整**响应（含整页 `data.text`） | 要看原始报文、要复现某一步时的唯一凭据 |
+
+要点：
+
+- 排查顺序建议：先看 `steps.log` 定位出问题的那一步 → 再用同名序号的 `.json` 看完整报文 → 最后按里面的 `data/<id>/<seq>.txt` 与 `.png` 看当时页面。三者序号可以互相印证。
+- 写盘失败（磁盘满、目录没权限）只留一条警告，**不会让浏览器命令失败**，所以不能把它当成「命令成功」的证据；反过来，命令失败也不代表日志写失败。
+- 开关与服务端配置：`browser.trace.enabled`（默认开）、`browser.trace.dir`（默认 `<启动目录>/logs/trace`）、`browser.trace.maxRecordChars`（单条完整报文上限，默认 800 万字符）。
+- 日志不会自动清理，也不做脱敏：**页面上的内容、以及你发过去的参数都会原样存下来**，里面有密码等敏感值时记得自己清理 `logs/trace/`。
+
 ## 五、智能体的交互循环
 
 1. `start` 一次，自己指定或用返回的 `id`（整个任务复用同一个实例）。
@@ -254,8 +322,8 @@ current tab is: 1
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `start` | `id`(可选), `headless`(bool，默认 `true`) | 新建一个独立实例；返回 `data.id`。传 `id` 就把它当任务 ID |
-| `close` | `id` | 关闭这个任务的浏览器上下文（profile 保留，下次同 id `start` 登录态还在） |
+| `start` | `id`(可选), `headless`(bool，默认 `true`), `browser`(可选，见下) | 开始一个任务；返回 `data.id`，以及 `data.browser`（这次用的浏览器与 profile，见第二节）。传 `id` 就把它当任务 ID。第一个任务会把共享的浏览器拉起来，之后的任务只是各领自己的页签 |
+| `close` | `id` | 关掉**这个任务自己的页签**，别的任务不受影响；**最后一个任务关闭时**浏览器才一起退出（登录态留在 profile 里，下次还在） |
 
 ### 导航与页面信息
 
@@ -402,7 +470,7 @@ current tab is: 1
 | `set_geolocation` | `id`, `latitude`, `longitude` | 会同时授予 `geolocation` 权限 |
 | `set_offline` | `id`, `offline`(bool) | 断网 / 恢复 |
 | `set_headers` | `id`, `headersJson` | 形如 `{"X-Key":"v"}` |
-| `set_credentials` | `id`, `username`, `password` | HTTP 基本认证；**会重建上下文，当前页面丢失**（登录态仍在 profile 里） |
+| `set_credentials` | `id`, `username`, `password` | HTTP 基本认证。凭据只能在创建上下文时设置，所以**会重建整个浏览器**：当前页面丢失，**且会失败** —— 浏览器是所有任务共用的，只允许在「当前只有这一个任务」时调用（否则提示先 `close` 掉其它任务）；走 CDP 那条路时（`data.browser.mode=cdp`：用户自己的 Chrome profile 或 `browser=edge`）不支持，会直接返回失败原因，需要基本认证就改用 `browser=chrome`／`chromium` |
 | `set_media` | `id`, `colorScheme` | `light` / `dark` / `no-preference` |
 
 ### 弹窗与控制台
@@ -586,7 +654,7 @@ document.querySelector('#kw').value = 'x'                     // 直接赋值
 - `data.imageBase64` 是 PNG 的 base64，需要向用户展示验证图片时可以使用；取到图片不代表验证已完成。
 - 用户直接在浏览器里操作不会自动更新人工请求记录，`get_human_input` 可能仍为 `pending`。不要只等该字段，也不能直接跳过验证：重新读取页面，确认登录或验证已成功后才继续后续步骤；一般页面变化本身不足以证明验证成功。
 - **验证码有时效**：实测税务系统的图片验证码约 **120 秒**过期，而且**一次性**（用过的码再提交必然失败）。所以拿到答复后要**立刻**提交，不要攒着；提交失败先换一张新图再让人看，别拿旧码重试。
-- **登录态跟着任务 ID 走**：profile 目录是 `~/.config/browseruse/profiles/<id>`，同一个 id 重新 `start` 可以复用保存的登录态；是否仍有效由网站决定，登录过期时再次请求用户协助。
+- **登录态跟着共享 profile 走，不跟任务 ID 走**：所有任务用的是同一份 profile（`data.browser.profileDir`），换任务、换 id 都不影响；是否仍有效由网站决定，登录过期时再次请求用户协助。若 `data.browser.userProfile=false`（退回托管 profile，例如 Chrome 正在运行）或 `chrome=false`（没装 Chrome），说明这次不是用户日常那份登录态，需要重新走登录流程。
 - 有头模式（`headless=false`）下配合 `bring_to_front` / `request_human_input`，人工能直接看到智能体停在哪一页，接力最顺。
 
 ```shell
@@ -666,9 +734,9 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 9. **`execute_js` 没有超时**：脚本里不要写死循环或长时间轮询，否则请求一直挂着；页面上弹模态框时弹窗会被自动确认，也可以用 `set_dialog_behavior` 改成自动取消。
 10. `execute_js` 的 `body` 上限 100000 字符；返回 DOM 元素只会得到 `ref: <Node>`。
 11. `get_browser_state` 的 `highlight=true` 会在页面上加一层高亮框，它是页面里真实存在的 DOM（`extract_structured_data` 读取正文时会临时隐藏它）；人工观察时很有用，纯自动跑可以传 `highlight=false`。
-12. **不要用同一个 `id` 重复 `start`**：会直接返回失败，提示先 `close` 或换一个 id。一个任务一个实例，不同任务用不同 id。
-13. 一个实例只对应一个当前 Page，**不要并发对同一个 `id` 发请求**；并发任务请各自 `start` 一个实例。
-14. `set_credentials` 会重建上下文，当前页面会丢；`headless=false` 会弹出真实窗口，只适合本机调试。
+12. **不要用同一个 `id` 重复 `start`**：会直接返回失败，提示先 `close` 或换一个 id。不同任务用不同 id（浏览器与 profile 是共用的，隔离靠各自的页签）。
+13. 一个任务只对应一个当前 Page，**不要并发对同一个 `id` 发请求**；并发任务请各自 `start` 一个任务（共用浏览器，各有各的页签）。
+14. `set_credentials` 会重建整个浏览器（所有任务共用），只能在「当前只有一个任务」时用，走 CDP 那条路时（用户自己的 Chrome profile 或 `browser=edge`）不可用；`headless=false` 会弹出真实窗口，只适合本机调试。
 15. 服务无鉴权且 `execute_js` 能执行任意脚本，对外部署前必须加访问控制。
 16. **不可见元素既不进快照，也不能用选择器操作**：实测百度首页的真实搜索框 `INPUT#kw`（`offsetParent === null`，被新的 AI 输入框取代而隐藏）不在 `data.text` 里，只剩提交按钮；`input_text_by_selector` 作用在它上面会等满 5 秒后返回 `input_text_by_selector 失败：[ELEMENT_HIDDEN] 元素当前不可见: 选择器 #kw`。这种元素只能用 `execute_js` 直接设值并派发事件：
 
@@ -690,3 +758,4 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 26. **截图序号是任务级的，不是调用级的**：`seq` 只增不减，`close` 再 `start` 同一个 id 也会接着往上加（文件不删就继续累加）。想要干净的一轮就从空的 `data/<id>/` 目录开始。
 27. **`data/<id>/` 里的文件不会自动清理**，长期跑要自己定期清理；服务只监听本机，`/data/**` 也没有鉴权，别把它暴露到公网。
 28. **非必要不要读 `get_browser_state`（以及任何自动截图）返回的图片**：`data.screenshot` / `data.screenshot_path` 只是地址，把图读进上下文非常贵，而定位和操作要的信息全在 `data.browser_state` + `data.text` 里。默认只读文本字段；确认页面变化用 `data.changed` / `diff_dom_text`；只有验证码、二维码、图表、纯图片元素这类文本表达不了的场景才取图，并且优先 `get_element_screenshot` 只截那一个元素。详见开头的省 token 铁律。
+29. **登录页白屏时可以尝试 Firefox 139**：先记录最终 URL、HTTP 状态和控制台错误，区分 `/login` 返回 HTTP 400 的空白页与跳转到 `about:blank`，不要直接归因于沙盒或 DevTools。2026-09-22 国家知识产权局登录页实测中，**Playwright 1.53.0 + Firefox 139.0** 两次正常显示登录表单；**Playwright 1.63.0 + Firefox 155.0** 两次出现 HTTP 412 → 400 后白屏。遇到类似现象，可用前一组合、全新会话从官网入口重试，并观察至少一分钟；这只是排障候选，不保证适用于所有网站，也不代表已成功登录。Firefox 应通过 `playwright.firefox()` 启动，不能把 Firefox 路径填进 Chrome 配置；当前 HTTP `start` 没有 Firefox 切换参数，可使用[独立诊断脚本](scripts/diagnostics/README.md)。详见[问题记录与复测证据](scripts/diagnostics/RESULTS-2026-09-22.md)。
