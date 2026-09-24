@@ -75,7 +75,15 @@ public final class WindowsOcr {
       // 脚本每次落一份临时文件:随包发布的是资源,不能直接拿资源 URL 当 -File 参数(打包进 jar 之后没有真实路径)
       scriptFile = Files.createTempFile("dsh-ocr-", ".ps1");
       byte[] body = readResource();
-      // PowerShell 5.1 按 BOM 判断脚本编码;不写 BOM 时脚本里的中文会被按本地代码页(GBK)解读
+      // PowerShell 5.1 按 BOM 判断脚本编码;不写 BOM 时脚本里的中文会被按本地代码页(GBK)解读,
+      // 于是中文注释变成乱码、乱码还会吃掉后面的引号,报出来却是 "Missing closing '}'" 这类语法错
+      // (实测复现过)。这里统一补 BOM;资源里若已经带了 BOM 就先剥掉,免得变成双 BOM ——
+      // 双 BOM 会让脚本开头多出一个 \uFEFF 字符,一样解析失败。
+      if (body.length >= 3 && (body[0] & 0xFF) == 0xEF && (body[1] & 0xFF) == 0xBB && (body[2] & 0xFF) == 0xBF) {
+        byte[] stripped = new byte[body.length - 3];
+        System.arraycopy(body, 3, stripped, 0, stripped.length);
+        body = stripped;
+      }
       byte[] withBom = new byte[body.length + 3];
       withBom[0] = (byte) 0xEF;
       withBom[1] = (byte) 0xBB;

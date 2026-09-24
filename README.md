@@ -582,11 +582,30 @@ deepseek-browser-use/
   scripts\run\stop-server.cmd -Port 10049
   ```
 
-  `start-server` 优先用 WMI(`Win32_Process.Create`)创建进程：该进程由 `WmiPrvSE` 创建，不在当前进程的 Job 里，宿主的 `taskkill /T` 不会带走它；拿不到 WMI 时退回 `Start-Process` 并明确提示。pid 落在 `logs/server/server-<端口>.pid`，日志在 `logs/server/server-<端口>.{out,err}.log`。
+  `start-server` 优先用 WMI(`Win32_Process.Create`)创建进程：该进程由 `WmiPrvSE` 创建，不在当前进程的 Job 里，宿主的 `taskkill /T` 不会带走它；并给它一个 `Win32_ProcessStartup.ShowWindow = SW_HIDE`，所以**不会在桌面上留下黑窗口**（见下节）。拿不到 WMI 时退回 `Start-Process -WindowStyle Hidden`，再不行才退成可见窗口并给出警告。pid 落在 `logs/server/server-<端口>.pid`，日志在 `logs/server/server-<端口>.{out,err}.log`。
 
   > **为什么走 `.cmd` 而不是 `.ps1`**：本机 PowerShell 的执行策略是 `Restricted`，直接跑 `.ps1` 会被拒（`cannot be loaded because running scripts is disabled`）。`.cmd` 包装里的 `-ExecutionPolicy Bypass` 只影响这个子进程，不改机器策略。
   >
-  > **写 `.ps1` 记得带 UTF-8 BOM**：Windows PowerShell 5.1 会按 ANSI（本机是 GBK）读没有 BOM 的 `.ps1`，中文注释直接变乱码并引发 `Unexpected token` / `missing the terminator` 这类语法错（刚踩过，仓库里 `browse.ps1` / `smoke.ps1` 都带 BOM）。反过来 `.cmd` 必须保持纯 ASCII。
+  > **写 `.ps1` 记得带 UTF-8 BOM**：Windows PowerShell 5.1 会按 ANSI（本机是 GBK）读没有 BOM 的 `.ps1`，中文注释直接变乱码并引发 `Unexpected token` / `missing the terminator` 这类语法错（刚踩过，仓库里 `browse.ps1` / `smoke.ps1` 都带 BOM）。反过来 `.cmd` 必须保持纯 ASCII。这两条现在有测试盯着：`PowerShellScriptHygieneTest`（含非 ASCII 的 `.ps1` 必须有 BOM、`.cmd` 必须纯 ASCII；`resources/scripts/*.ps1` 是例外——它的 BOM 由 `WindowsOcr` 在运行时补，资源里带 BOM 反而会变成双 BOM）。
+
+### 启动后那个黑窗口是什么，能不能不要
+
+启动后端（`java -jar`、`mvn spring-boot:run`、或者双击某个 `.cmd`）时桌面上会多一个黑窗口。**它不是报错，是控制台窗口**：
+
+- `cmd.exe` / `mvn.cmd` / `java.exe` 都是**控制台子系统**（console subsystem）程序。Windows 启动控制台程序时**必然**给它分配一个控制台窗口，而**窗口寿命 = 进程寿命** —— 服务跑多久，它就停多久，所以看起来像个赖着不走的残留窗口。
+- 我们的启动器把 stdout/stderr 都重定向进日志文件了，所以那个窗口里**什么都不显示**（纯黑），更容易让人以为它卡住了。
+- 常见来源：① 双击发行版 jar（等于 `java -jar`）；② 手敲 `mvn spring-boot:run`；③ 双击 `start-server.cmd`（脚本自己的窗口 + 它拉起的后台窗口，前者随脚本退出消失，后者会一直留着）。
+
+不想看到窗口，按推荐顺序挑一种：
+
+| 做法 | 效果 |
+| --- | --- |
+| 用 `scripts\run\start-server.cmd` | 用 `Win32_ProcessStartup.ShowWindow = SW_HIDE` 创建进程：**窗口仍然存在但一开始就不可见**（实测子进程自报 `IsWindowVisible=False`，日志照样写文件）。想看那个窗口就加 `-ShowConsole` |
+| 发行版 jar 改用 `javaw -jar` | java 的 GUI 子系统版本，**根本不创建控制台**；代价是 System.out 没人接，得靠重定向或 logback 写文件 |
+| 「任务计划程序」建任务（勾"不管用户是否登录都运行"）或包成 Windows 服务（WinSW / nssm） | 完全无窗口，还能开机自启，适合长期部署 |
+| 只是想看实时日志 | 不用开窗口：`Get-Content -Wait logs\server\server-<端口>.out.log` |
+
+> **别直接叉掉那个窗口**：关窗口 = 杀进程 = 服务停，浏览器跟着退出，**session cookie 型的登录态（12306、政务站点）一并失效**，人得重新登录一次。要停服务用 `stop-server.cmd`（先 `shutdown` 关任务与浏览器，再结束进程树）。
 - **重启服务是有代价的**：关掉最后一个任务时浏览器就退出了，而 **session cookie 型的登录态**（12306、政务站点等）会随之失效，人工得重新登录一次；持久 cookie 不受影响。所以「顺手重启一下」之前先想清楚有没有正在进行的登录环节。
 - 已经留下了孤儿：先结束残留的浏览器进程，再重启服务。
 - 服务侧也有兜底：Windows 上会自动清掉 profile 里的 `parent.lock` 与 `.startup-incomplete` 这两种残留标记（`parent.lock` 删得掉就说明没有活着的持有者），并且第一次启动失败后会自动重建驱动重试一次 —— 实测这个重试通常就能起来（表现为第一次等 60 秒、第二次 2 秒）。
