@@ -58,6 +58,14 @@ public class BrowserInstance {
    */
   public final AtomicInteger captureSeq = new AtomicInteger();
 
+  /**
+   * 手动截图(screenshot / get_element_screenshot)的序号
+   *
+   * <p>与 {@link #captureSeq} 分开计数:自动截图是 {@code &lt;seq&gt;.png},手动截图是
+   * {@code shot-&lt;n&gt;.png},两套编号互不影响,免得手动截的那几张把自动截图的序号顶乱。
+   */
+  public final AtomicInteger shotSeq = new AtomicInteger();
+
   /** 最近一次 get_browser_state 的文本,供 diff_dom_text 比较(每次快照后覆盖) */
   public volatile String lastDomText;
 
@@ -75,6 +83,17 @@ public class BrowserInstance {
   /** 网络请求记录(最多保留 200 条) */
   public final List<Kv> requests = Collections.synchronizedList(new ArrayList<Kv>());
   public final Map<Request, Kv> requestIndex = Collections.synchronizedMap(new IdentityHashMap<Request, Kv>());
+
+  /**
+   * 此刻还有几个在途请求
+   *
+   * <p>记录挂在页签上,所以这个计数也是「这个任务当前页签」的。{@code wait_for_idle} 用它判断网络是否
+   * 已经停了——比等固定秒数可靠得多。
+   */
+  public final AtomicInteger inflight = new AtomicInteger();
+
+  /** 请求记录是从什么时候开始记的(毫秒时间戳):get_requests 用它解释「为什么这里没有你要的请求」 */
+  public volatile long recorderAttachedAt;
 
   /** 最近收到的响应(最多 100 条,带时间戳),get_response_body 与 wait_for_response 回看用 */
   public final Deque<RecordedResponse> recentResponses = new ArrayDeque<>();

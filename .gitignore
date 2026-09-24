@@ -164,6 +164,9 @@ secrets.txt
 # 运行期产物:每个任务的截图与可交互结构化文本(相对服务进程的工作目录)
 /data/
 /playwright-server/data/
+# POST /playwright/upload 的暂存文件:是客户端临时送上来的文件,不该进版本库
+/upload/
+/playwright-server/upload/
 # 发行版产物
 /dist/
 # 打包时的 Chromium 下载缓存与内嵌目录

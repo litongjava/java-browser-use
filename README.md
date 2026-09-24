@@ -104,7 +104,7 @@ Content-Type: application/json
 | 字段 | 说明 |
 | --- | --- |
 | `id` | 任务 ID。`start` 时可自己指定，不传就自动生成；其余方法必填 |
-| `method` | 方法名，共 93 个 |
+| `method` | 方法名，共 113 个（`list_methods` 或 `GET /playwright/methods` 能随时查全量清单） |
 | `params` | 该方法自己的参数 |
 
 响应统一是：
@@ -113,13 +113,39 @@ Content-Type: application/json
 { "data": {}, "code": 1, "ok": true, "error": null, "msg": null }
 ```
 
-`code=1` / `ok=true` 成功，失败原因在 `msg`（中文）。**参数问题不会返回 HTTP 500**：缺参数是 `click_element_by_index 失败：缺少参数 index`，方法不存在是 `不支持的方法：xxx`。
+`code=1` / `ok=true` 成功，失败原因在 `msg`（中文）。**参数问题不会返回 HTTP 500**：缺参数是 `click_element_by_index 失败：缺少参数 index`；方法名写错会顺带给近似建议（`不支持的方法：list_tabs，你是不是想用 get_tabs / new_tab？`），照着重发一次就行。失败时 `data` 里另有 `errorCode`，以及可重试的 `retryable` / `retryAfterMs`（例如站点侧限流是 `RATE_LIMITED`，建议等 35 秒再来）。
 
-另外两个端点：`GET /playwright/health`（健康检查）、`GET /data/**`（读截图与结构化文本）。
+另外几个端点：
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /playwright/health` | 健康检查 |
+| `GET /playwright/tasks` | 当前活着的任务与共享浏览器（URL、标题、页签数、在途请求、profile 目录） |
+| `GET /playwright/methods` | 命令清单 |
+| `GET /playwright/config` | 服务端**生效**配置（引擎、profile 目录、降级开关、日志与脚本目录） |
+| `GET /data/**` | 读截图与结构化文本 |
+| `POST /playwright/upload` | **文件暂存**：客户端-服务器模式下，把本地文件送到服务端，再让 `upload_file` 用它 |
+| `GET /playwright/upload` | 列出暂存目录里的文件 |
+| `DELETE /playwright/upload?name=<文件名>` | 删除一个暂存文件 |
+
+> 现在也可以完全不走 `/playwright/upload`：`upload_file` 支持 `contentBase64` 或 `url`，服务端自己落盘再交给页面，省掉一次往返。`path` 仍然可用（相对路径按服务端暂存目录解析）。
+
+`POST /playwright/upload` 支持三种请求体（任选）：
+
+```bash
+curl -F "file=@图样.jpg" http://localhost:10049/playwright/upload
+curl --data-binary @图样.jpg "http://localhost:10049/playwright/upload?filename=图样.jpg"
+curl -H "Content-Type: application/json" -d '{"filename":"图样.jpg","contentBase64":"/9j/4AAQ..."}' \
+     http://localhost:10049/playwright/upload
+```
+
+返回 `data.filename` / `data.path` / `data.relativePath` / `data.size` / `data.sha256`，其中 `path`（服务端绝对路径）与 `relativePath` 都可以直接填给 `upload_file` 的 `path`。文件名会被清洗（只留基本名、去掉路径分隔符与控制字符、保留中文），并且只能落在暂存目录里；默认上限 64MB，配置项见 `browser.properties`。
 
 完整的方法清单、参数、返回字段、坑与限制都在技能文档里：
 
-> **[`SKILL.md`](SKILL.md)**（装进 DSH 时对应 `.dsh/skills/deepseek-browser-use/SKILL.md`）
+> **[`skills/SKILL.md`](skills/SKILL.md)**（装进 DSH 时对应 `.dsh/skills/deepseek-browser-use/SKILL.md`）
+>
+> **[`skills/cnipa-trademark-register/SKILL.md`](skills/cnipa-trademark-register/SKILL.md)**（中国商标网注册申请的实操手册，数据已脱敏）
 
 那份文档是给智能体读的，也是给人读的参考手册，**以它为准**。
 
@@ -256,6 +282,28 @@ Chromium 会走到空白页或 HTTP 400；同一流程在 Firefox 139 下能正�
 改了之后若还有任务在跑，`start` 会报错而不是把别人的页签弄没；空闲时下一次 `start` 会自动重建。
 **换引擎 = 换一套 profile 格式，所以要重新登录一次**。
 
+`start` 的回执里还会明确给出「我要的」与「实际用的」：
+
+```json
+{ "data": { "id": 1001,
+    "requestedBrowser": "firefox", "effectiveBrowser": "firefox", "engineHonored": true,
+    "browser": { "type": "firefox", "engine": "firefox", "profileDir": "...", "headless": false } } }
+```
+
+**`engineHonored:false` 表示这个服务实例没有按 `browser` 参数切浏览器**（老版本发布包只认 `headless`，会静默忽略 `browser`，回执照样 `ok:true`），此时 `data.engineWarning` 会说明原因。要不要用 `get_config` 看服务端认的 `engine`/`configuredType` 也行。
+
+### profile 目录：默认按端口分开
+
+托管 profile 默认在 `~/.config/browseruse/profiles/` 下。**默认按服务端口派生目录名**（`shared-<端口>`，例如 `shared-10049`），这样同一台机器上跑多个服务实例时各自一份 profile，不会互相抢锁、也不会出现「第二个实例启动卡到超时」：
+
+| 配置 | 效果 |
+| --- | --- |
+| 不配（默认） | `shared-<端口>`，实例之间互不干扰 |
+| `browser.profileDirPerPort=false` | 回到所有实例共用 `shared` 的老行为 |
+| `browser.profileDir=<路径>` | 显式指定，优先级最高（要用同一份已登录的会话就指到同一个目录） |
+
+当前解析到哪个目录用 `get_config` 或 `list_tasks` 看。**注意：换端口等于换一套登录态**，想复用旧会话就显式配 `browser.profileDir`。
+
 ### 调用追踪日志：每次请求与响应都留档
 
 每一次调用的请求体与响应体都会落到 `<启动目录>/logs/trace/<日期>/` 下，便于排查与追踪：
@@ -269,9 +317,23 @@ Chromium 会走到空白页或 HTTP 400；同一流程在 Firefox 139 下能正�
 配置项：`browser.trace.enabled`（默认开）、`browser.trace.dir`、`browser.trace.maxRecordChars`。
 写盘失败只留警告，不会影响浏览器命令；日志**不做脱敏、不会自动清理**，里面有敏感值时请自行清理。
 
-客户端这一侧还有一个把请求也留档的小脚本 `scripts/trace/browse.ps1`：它按序号把发出去的请求
-（`NNN.req.json`）与收回来的响应（`NNN.res.json`）成对存进 `logs/agent/<会话>/`，并维护一份
-`steps.log`。好处是**请求在发送前就落盘**，连服务没起来、请求根本没发出去这种情况也能看出来。
+客户端这一侧还有两个把请求也留档的小脚本：PowerShell 的 `scripts/trace/browse.ps1` 与 Python 的
+`scripts/client/dsb.py`。它们都按序号把发出去的请求（`NNN.req.json`）与收回来的响应（`NNN.res.json`）
+成对存进 `logs/agent/<会话>/`，并维护一份 `steps.log`。好处是**请求在发送前就落盘**，连服务没起来、
+请求根本没发出去这种情况也能看出来。
+
+| | `scripts/trace/browse.ps1` | `scripts/client/dsb.py` |
+| --- | --- | --- |
+| 运行环境 | Windows PowerShell | 任意平台的 Python 3（只用标准库） |
+| 形态 | 传 `-PayloadFile` 发一次请求 | 子命令式 CLI（`start`/`run`/`batch`/`state`/`upload`/`selftest`…）+ 可 import 的库 |
+| 退出码 | 0 业务结果、1 传输失败 | 0 成功 / 1 传输错 / 2 业务失败 / 3 用法错（分得更细，便于写脚本） |
+| 适合 | 已有的 PowerShell 排查习惯、一次性排障 | 跨平台、写进 Python 流程、批量与异步任务 |
+
+`dsb.py` 的完整用法见 `scripts/client/README.md`，装完先跑一次端到端自检：
+
+```bash
+python scripts/client/dsb.py --port 10049 selftest --browser firefox
+```
 
 ### driver 与自愈
 
@@ -324,6 +386,43 @@ current tab is: 1               		[12]<a name='tj_login'>登录/>
     { "get_browser_state": {} }
   ] } }
 ```
+
+每一步都可以再带一个 `expect` 断言，用来抓住「接口说成功、页面其实没变」：
+
+```json
+{ "id": 1001, "method": "commands",
+  "params": { "stopOnError": false, "stopOnExpectFailure": true, "commands": [
+    { "click_element_by_selector": { "selector": ".ant-modal-confirm .ant-btn-primary", "mode": "mouse" },
+      "expect": { "js": "document.querySelectorAll('.ant-modal-confirm').length", "equals": 0 } }
+  ] } }
+```
+
+断言没过时批次整体失败，但 `data.failed` 仍是 0、`data.expectFailed` 是 1，`msg` 指出是哪一步的断言没过 —— **命令本身执行成功了，是页面状态没变成期望的样子**。
+
+批次跑得久（几十秒以上）就加 `"async": true`：接口立刻返回 `data.jobId`，批次在后台跑，用 `get_job` 取结果、`cancel_job` 取消（取消会在下一步之前生效）。客户端超时不再等于「任务失败」——超时之后批次其实还在服务端继续跑。
+
+### 站点配方（recipes）
+
+把「某个站点上必须这么点」的经验固化成服务端的 JSON 命令序列，`run_recipe` 显式点名执行（**不做任何隐式推断**）：
+
+```json
+{ "id": 1001, "method": "run_recipe", "params": { "name": "close-all-modals", "vars": {} } }
+```
+
+配方放在 `<启动目录>/recipes/`（`browser.recipes.dir` 可改），格式与写配方的纪律见 [`playwright-server/recipes/README.md`](playwright-server/recipes/README.md)。仓库自带 `close-all-modals`、`query-and-read-table`、`cnipa-list-drafts` 三个。
+
+### 观测与自省
+
+| 想知道什么 | 用什么 |
+| --- | --- |
+| 有哪些方法 | `list_methods` / `GET /playwright/methods` |
+| 现在有哪些任务、浏览器活着没 | `list_tasks` / `GET /playwright/tasks` |
+| 服务端生效配置（引擎、profile 目录、降级开关） | `get_config` / `GET /playwright/config` |
+| 页面上的 DOM 弹窗是谁、按钮在哪 | `get_modals`（标题、按钮文本、× 与各按钮的坐标） |
+| 关掉弹窗 | `close_modal`（真实鼠标点，并校验数量真的减少了） |
+| 等异步内容稳定 / 等元素数量达标 | `wait_for_stable` / `wait_for_count` |
+| 磁盘越用越多 | `cleanup`（**默认只预演**，`dryRun:false` 才真删） |
+| 浏览器没关干净 | `shutdown`（关掉全部任务与共享浏览器，服务进程不退出） |
 
 ---
 
@@ -433,27 +532,44 @@ deepseek-browser-use/
 │   │   └── dom/                            buildDomTree 与结构化文本
 │   └── src/main/resources/
 │       ├── app.properties                 端口
-│       ├── browser.properties             内嵌 Chromium 修订号 + 浏览器/profile 配置
+│       ├── browser.properties             内嵌 Chromium 修订号 + 浏览器/profile/日志/上传配置
 │       └── dom/dom_tree/                  DOM 转结构化文本的 JS
 ├── scripts/package/build-release.mjs      发行版打包脚本
-├── SKILL.md                               给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
+├── scripts/trace/browse.ps1               客户端侧调用留档脚本(与服务端同一套脱敏规则)
+├── scripts/client/dsb.py                  Python 客户端(CLI + 可 import,只用标准库)
+├── scripts/client/README.md                Python 客户端的用法与退出码约定
+├── recipes/*.json                          显式 opt-in 的站点配方(run_recipe 用)
+├── skills/SKILL.md                        给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
+├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register)
 └── dist/                                  发行版产物(构建后生成)
 ```
 
 运行期产物：
 
 ```
-<启动目录>/data/<任务ID>/<序号>.png   截图
-<启动目录>/data/<任务ID>/<序号>.txt   同一时刻的页签 + 可交互结构化文本
+<启动目录>/data/<任务ID>/<序号>.png      自动截图
+<启动目录>/data/<任务ID>/<序号>.txt      同一时刻的页签 + 可交互结构化文本
+<启动目录>/data/<任务ID>/shot-N.png      screenshot / get_element_screenshot 手动截图
+<启动目录>/logs/trace/<日期>/            每次调用的完整请求与响应(默认脱敏)+ uploads.log
+<启动目录>/upload/                       POST /playwright/upload 的暂存文件
 ```
 
 ---
 
 ## 七、安全提示
 
-- 服务**没有鉴权**，`execute_js` 能执行任意脚本，`/data/**` 能读到所有截图与页面文本。
+- 服务**没有鉴权**，`execute_js` 能执行任意脚本，`/data/**` 能读到所有截图与页面文本，`POST /playwright/upload` 能往服务端磁盘写文件（只能写进暂存目录、文件名会被清洗，但文件内容不限；`browser.upload.enabled=false` 可关掉这个接口）。
 - 默认只监听本机。**对外暴露前必须自己加访问控制**，并且不要把 `/data/**` 直接放到公网。
-- `data/` 里的文件不会自动清理，长期跑要自己定期清理。
+- `data/`、`logs/trace/` 与 `upload/` 里的文件**都不会自动清理**，长期跑要自己定期清理。
+- 追踪日志**默认脱敏**（手机号、18 位身份证号/统一社会信用代码、邮箱、16～19 位长数字 → `***`，可用 `browser.trace.redact` 追加公司名/商标名等自定义规则），但这是**尽力而为**：姓名、门牌号这类按模式认不出来的个人信息不会被掩掉，交付或共享日志前自己过一眼。需要原文时把 `browser.trace.redact.enabled` 设为 `false`。
+
+### 停服务前先关任务（否则会留下孤儿浏览器）
+
+浏览器是**独立进程**：强杀服务（或它的 mvn 进程）不会关掉它启动的浏览器，残留的浏览器会一直占着 profile 目录，下一次 `start` 可能卡到启动超时（默认 60 秒，`browser.launch.timeoutMs`）。
+
+- **规范做法**：先 `close` 掉任务再停服务 —— 关掉最后一个任务时浏览器会跟着退出。
+- 已经留下了孤儿：先结束残留的浏览器进程，再重启服务。
+- 服务侧也有兜底：Windows 上会自动清掉 profile 里的 `parent.lock` 与 `.startup-incomplete` 这两种残留标记（`parent.lock` 删得掉就说明没有活着的持有者），并且第一次启动失败后会自动重建驱动重试一次 —— 实测这个重试通常就能起来（表现为第一次等 60 秒、第二次 2 秒）。
 
 ### 关于 Chromium 沙箱
 

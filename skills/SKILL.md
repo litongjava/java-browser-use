@@ -22,7 +22,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 > - 定位与操作所需的全部信息都在文本里：`data.browser_state`（页签）+ `data.text`（每行的 `[index]` 就是元素索引）。**读图不会多给一个索引，只会多烧 token。**
 > - 判断「点击到底生效没有」不要靠看图：用点击回执里的 `data.changed`，或用 `diff_dom_text` 比文本差异，都比读图省得多。
 > - **只有文本根本表达不了的时候才看图**：验证码 / 二维码 / 扫码登录、图表与曲线、纯图片按钮或图标、以及文本与操作结果明显矛盾、必须肉眼确认的场合。这时优先用 `get_element_screenshot` **只截那一个元素**，而不是把整页大图读进来。
-> - 确实需要整页图时再用 `screenshot`（不传 `path` 会返回 `base64`），并且一次任务里尽量只读一张。
+> - 确实需要整页图时再用 `screenshot`（**默认落盘、只回路径**；要内联 base64 得显式传 `inline: true`），并且一次任务里尽量只读一张。
 
 ## 一、请求与响应
 
@@ -73,6 +73,37 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
   -d '{"id":1001,"method":"close"}'
 ```
 
+### 也可以不手拼 JSON：用现成客户端
+
+手工拼 `-d '...'` 在参数带中文、引号、换行时很容易出错（PowerShell 尤其爱吃掉引号）。仓库里有两个客户端，
+都用**子命令/参数文件**的方式传参，并且都会把「请求 + 响应」留档到 `logs/agent/<会话>/`（默认脱敏）：
+
+| 客户端 | 适合 | 例子 |
+| --- | --- | --- |
+| `scripts/client/dsb.py`（Python 3，只用标准库，跨平台，也可当库 import） | 写进脚本、批量、异步、跨平台 | `python scripts/client/dsb.py --port 10049 start --browser firefox` |
+| `scripts/trace/browse.ps1` | 已有的 PowerShell 排查习惯 | `browse.ps1 -PayloadFile req.json -Session t1` |
+
+`dsb.py` 的要点（完整用法见 `scripts/client/README.md`）：
+
+```shell
+# 通用选项放子命令前后都行；退出码 0 成功 / 1 传输错 / 2 业务失败 / 3 用法错
+python scripts/client/dsb.py --port 10049 health
+python scripts/client/dsb.py --port 10049 --id 1001 start --browser firefox --headless
+python scripts/client/dsb.py --port 10049 --id 1001 run go_to_url -p url=https://example.com
+python scripts/client/dsb.py --port 10049 --id 1001 state --full          # 标题/URL/元素/结构化文本
+python scripts/client/dsb.py --port 10049 --id 1001 js @脚本.js --var who=dsb   # 支持 {{变量}} 注入
+python scripts/client/dsb.py --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
+python scripts/client/dsb.py --port 10049 --id 1001 recipes --run close-all-modals
+python scripts/client/dsb.py --port 10049 upload 图样.jpg                 # 送文件到服务端暂存区
+python scripts/client/dsb.py --port 10049 last                            # 重放最近一次响应
+```
+
+不确定服务端现在是什么状态（引擎、profile 目录、命令数、配方数）时，先跑一次自检：
+
+```shell
+python scripts/client/dsb.py --port 10049 selftest --browser firefox
+```
+
 ### 响应格式
 
 ```json
@@ -106,6 +137,23 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
 动作错误的 `data.errorCode` 区分 ELEMENT_READ_ONLY、ELEMENT_DISABLED、ELEMENT_HIDDEN、ELEMENT_OBSCURED、ELEMENT_NOT_EDITABLE、STALE_ELEMENT、ACTION_TIMEOUT 和 ACTION_FAILED。错误原因来自完整调用日志；没有充分证据的超时只报 ACTION_TIMEOUT。
 
 点击回执会短暂等待异步变化（观察循环上限约 500ms，具体浏览器调用耗时另计）。`data.changeStatus` 为 observed 或 not_observed，`data.observationComplete` 指示探针是否成功，`data.observationWindowMs` 为观察窗口配置。`changed=false` 不表示点击失败，`changed=true` 也不表示查询、缴款等业务成功；应使用目标元素、文本或网络响应确认，禁止仅据此重复提交。
+
+#### 动作的三种执行方式（`mode`）与降级
+
+点击类命令（`click_element_by_index`、`click_element_by_selector`、`click_element_by_text`、`click_element_by_role`、`check_element_by_index`、`uncheck_element_by_index`、`double_click_element_by_index`、`hover_and_click`）和输入类命令（`input_text`、`input_text_by_selector`、`input_text_by_label`）都接受 `mode`，另可传 `timeoutMs` 按次覆盖超时。
+
+| `mode` | 行为 |
+| --- | --- |
+| 不传 / `auto` | 先按原生方式做，超时或不可操作时**自动改用 JS 派发事件**，成功则回执里写明 `data.mode=js` 与 `data.fallbackReason` |
+| `native` | 只用原生方式；失败就是失败，不换方式 |
+| `js` | 直接在页面里派发事件（点击派发 mousedown/mouseup/click），**跳过可操作性检查** |
+| 输入类的 `fill` / `type` | 只用真实输入（`fill` 覆盖式、`type` 逐键） |
+
+为什么需要降级：有些站点（实测 ant-design 的 Vue SPA，例如商标网上申请系统）在 Playwright 的可操作性检查下会等满超时返回 `[ACTION_TIMEOUT] 等待元素可操作超时`，而元素明明在那里、点上去也有反应——常见于被浮层遮挡、有过渡动画、或在 `pointer-events` 上做了手脚的元素。这时唯一稳的办法就是在页面里直接派发事件。
+
+- **降级不会被伪装成原生成功**：回执 `data.mode` 说明这次实际用了哪种方式，`data.fallbackReason` 给出原生失败的原因。看到 `mode=js` 就要知道「这次没走真实交互」，关键步骤（提交、缴费）建议再确认一次页面状态。
+- **JS 设值不等于进了框架模型**：`input_text` 走 JS 设值时会回 `data.committed=false` 与 `data.note`。DOM 上能看到值、但 Vue/React 的 model 里可能是空的——预览页或提交校验会因此报「不能为空」。这类字段要用 `input_text_by_selector`（可见字段默认走真实输入，`committed=true`）重新填一遍。
+- 超时默认 5 秒，可用 `browser.action.timeoutMs` 调大；`browser.action.jsFallback=false` 可整体关掉自动降级。
 
 ### 网络证据关联
 
@@ -260,7 +308,7 @@ current tab is: 1
 - 要按 `id`/`class`/`href` 定位，用 `click_element_by_selector`、`input_text_by_selector`，或用 `execute_js` 取（例如 `document.querySelectorAll('a')[0].href`）。**只想看这些属性就先用 `get_interactive_map`**：它按当前快照的 xpath 一次回查全部元素，直接给出 `index → tag/id/className/href/name/text` 的映射，省掉一堆 `execute_js`。
 - `index` 直接用于：`click_element_by_index`、`input_text`、`upload_file`、`get_dropdown_options`、`select_dropdown_option`、`double_click_element_by_index`、`hover_element_by_index`、`focus_element_by_index`、`check_element_by_index`、`uncheck_element_by_index`、`type_text`、`drag_element_by_index`、`get_element_text`、`get_element_html`、`get_element_value`、`get_element_attribute`、`get_element_box`、`is_visible`、`is_enabled`、`is_checked`、`clear_text`、`hover_and_click`、`get_element_screenshot`、`screenshot`。
 - **没有快照时的差别**：`click_element_by_index`、`input_text`、`upload_file`、`get_dropdown_options`、`select_dropdown_option` 会退化成 CSS 选择器顺序索引；读取/状态类方法则直接报错 `索引越界: N,当前没有页面快照,请先调用 get_browser_state 获取元素索引`。
-- 索引越界返回 `xxx 索引越界: N`；每次元素操作等待上限为 **5 秒**，部分按索引点击有恢复重试，总耗时可能更长。只读输入立即报错；超时本身不证明快照过期，需看 `data.errorCode`。
+- 索引越界返回 `xxx 索引越界: N`；每次元素操作等待上限默认 **5 秒**（`browser.action.timeoutMs` 可调），部分按索引点击有恢复重试，总耗时可能更长。只读输入立即报错；超时本身不证明快照过期，需看 `data.errorCode`。
 - **索引失效会自动补救两级**：先等 300 毫秒用同一个 xpath 重试（挡住动画/异步渲染的抖动），再重取一次临时快照，按「同 tag + 同文本且全页唯一」把元素找回来。都失败才返回对应错误，**不会乱点别的元素**。补救用的临时快照不会覆盖当前快照，所以索引不会悄悄漂移。
 - 快照是**快照**：点击、跳转、异步渲染之后索引会重算，必须重新调用 `get_browser_state`；沿用旧索引可能得到越界或操作超时。
 
@@ -297,7 +345,10 @@ current tab is: 1
 - 排查顺序建议：先看 `steps.log` 定位出问题的那一步 → 再用同名序号的 `.json` 看完整报文 → 最后按里面的 `data/<id>/<seq>.txt` 与 `.png` 看当时页面。三者序号可以互相印证。
 - 写盘失败（磁盘满、目录没权限）只留一条警告，**不会让浏览器命令失败**，所以不能把它当成「命令成功」的证据；反过来，命令失败也不代表日志写失败。
 - 开关与服务端配置：`browser.trace.enabled`（默认开）、`browser.trace.dir`（默认 `<启动目录>/logs/trace`）、`browser.trace.maxRecordChars`（单条完整报文上限，默认 800 万字符）。
-- 日志不会自动清理，也不做脱敏：**页面上的内容、以及你发过去的参数都会原样存下来**，里面有密码等敏感值时记得自己清理 `logs/trace/`。
+- **默认脱敏**（`browser.trace.redact.enabled`，默认开）：手机号、18 位身份证号/统一社会信用代码、邮箱、16～19 位长数字在落盘前会被替换成 `***`，掩码可用 `browser.trace.redact.mask` 改。`browser.trace.redact` 可追加自定义正则（逗号分隔），例如把公司名、商标名也掩掉。
+- 脱敏是**尽力而为**：按模式匹配，不认识的个人信息（姓名、门牌号、账号）不会被掩掉，日志也**不会自动清理**。交付或共享 `logs/trace/` 前自己过一眼。
+- `POST /playwright/upload` 的落盘记录另写在同一天的 `uploads.log`（文件名、大小、SHA-256、落盘路径），只记元数据、不记文件内容。
+- `start` 的返回里带 `data.browser.trace`（日志目录、是否开启、是否脱敏）与 `data.browser.upload`（暂存目录、开关、单文件上限），客户端-服务器模式下照着它就知道该去哪清理。
 
 ## 五、智能体的交互循环
 
@@ -306,13 +357,14 @@ current tab is: 1
 3. `get_browser_state` 取回 `data.browser_state`（页签）与 `data.text`（每行的 `[index]` 就是可交互元素索引）。
 4. 用索引方法执行动作：`click_element_by_index`、`input_text`、`check_element_by_index`、`select_dropdown_option`……
 5. **页面只要发生变化（点击、跳转、异步渲染、弹窗）就回到第 3 步重新取一次**；没变化才可以继续用上一轮索引。判断「刚才那一下到底有没有变化」用 `diff_dom_text`，比重新读整页省 token。
-6. 需要判断「有没有加载出来」时用 `wait_for_element` / `wait_for_text` / `wait_for_url` / `wait_for_load`，不要用固定 `wait`。
-7. **默认不看图**：`data.screenshot` 只是截图地址，非必要不要读进上下文（见开头的省 token 铁律）。判断页面变化用 `data.changed` 或 `diff_dom_text`；只有验证码、二维码、图表、纯图片元素这类「文本表达不了」的场景才按需取图，优先 `get_element_screenshot`（只截那一个元素），要整页图才用 `screenshot`（不传 `path` 会返回 `base64`）。
+6. 需要判断「有没有加载出来」时用 `wait_for_element` / `wait_for_text` / `wait_for_url` / `wait_for_load`，不要用固定 `wait`；不确定要等多久、只知道「等它忙完」时用 `wait_for_idle`。
+7. **默认不看图**：`data.screenshot` 只是截图地址，非必要不要读进上下文（见开头的省 token 铁律）。判断页面变化用 `data.changed` 或 `diff_dom_text`；只有验证码、二维码、图表、纯图片元素这类「文本表达不了」的场景才按需取图，优先 `get_element_screenshot`（只截那一个元素），要整页图才用 `screenshot`。两个命令**默认都落盘只回路径**，确实要内联 base64 才传 `inline: true`。
 8. 需要读接口返回的 JSON 时用 `wait_for_response`（等新响应）或 `get_response_body`（回看最近的响应），不要只靠 `get_requests` 的状态码猜。
 9. 想一次拿到页面当前状态（url/标题/页签/弹窗/是否还在加载）用 `get_page_snapshot`，不要连发五六次调用。
-10. 遇到登录、验证码、短信码、扫码、滑块验证、点击验证等无法自行处理的环节，必须主动请求人类帮助，暂停依赖该环节的操作并保留浏览器现场；确认人工处理完成后再继续，见第九节。
-11. **能用批量就用批量**：第 3～7 步可以合并成一次 `commands` 请求（动作 + 读取混排，末尾放 `get_browser_state`），一次推理拿到全部结果，别一个动作往返一次。见第七节。
-12. 任务完成输出结论，最后 `close`；等待人类协助时任务尚未完成，不要关闭浏览器。
+10. **填完一屏表单后先用 `get_form_state` 对一遍**：一次读回每个控件的标签/当前值/是否可见/是否禁用/校验错误，比逐个 `get_element_value` 省调用，也更容易发现「值填了但没进模型」的字段。
+11. 遇到登录、验证码、短信码、扫码、滑块验证、点击验证等无法自行处理的环节，必须主动请求人类帮助，暂停依赖该环节的操作并保留浏览器现场；确认人工处理完成后再继续，见第九节。
+12. **能用批量就用批量**：第 3～7 步可以合并成一次 `commands` 请求（动作 + 读取混排，末尾放 `get_browser_state`），一次推理拿到全部结果，别一个动作往返一次。见第七节。
+13. 任务完成输出结论，最后 `close`；等待人类协助时任务尚未完成，不要关闭浏览器。
 
 ## 六、方法清单
 
@@ -335,6 +387,15 @@ current tab is: 1
 | `get_page_snapshot` | `id`, `includeConsole`(bool), `includeRequests`(bool), `requestFilter` | 一次拿到页面状态：`data.url`、`data.title`、`data.tabs`、`data.dialog`、`data.loading`；`includeConsole=true` 再带 `data.logs`/`data.errors`，`includeRequests=true` 再带 `data.requests`（可用 `requestFilter` 按 URL 子串过滤）。替代六次单独调用，**不含 DOM 快照文本** |
 | `diff_dom_text` | `id`, `highlight`, `viewportExpansion` | 重新执行一次 buildDomTree，与上一次快照按行做差集：`data.changed`、`data.added`、`data.removed`（各最多 200 行）、`data.first`。判断「页面到底动没动」比重读整页省 token。**不产生新的截图/文本文件** |
 | `get_interactive_map` | `id` | 按当前快照的 xpath 回查全部元素，返回 `data.elements`：`index`、`tag`、`xpath`、`id`、`className`、`href`、`name`、`text`。补上快照里没有的 `id`/`class`/`href`；需要先有快照 |
+| `get_form_state` | `id`, `selector`(可选，默认整页), `includeHidden`(bool，默认 false), `max`(可选，默认 200) | 一次读回整张表单：`data.fields`（每项含 `label`/`id`/`name`/`type`/`value`/`checked`/`disabled`/`readOnly`/`required`/`visible`/`invalid`/`error`/`placeholder`）、`data.count`、`data.errorCount`、`data.errors`（`label`+`error` 清单）。**密码字段的值一律回 `[redacted]`** |
+
+`get_form_state` 是用来「填完一屏后对一遍」的：
+
+- 一次调用代替十几个 `get_element_value`/`is_visible`/`get_element_attribute`，尤其适合提交前的自检。
+- `data.errors` 直接给「哪个字段、错在哪」，比去猜 `.ant-form-item-explain-error` 之类的站点类名稳。
+- `invalid` 来自 CSS 伪类与 `aria-invalid`，`error` 取的是该字段所在的表单行里的错误文本。
+- **注意「值在 DOM 里但不在框架模型里」的坑**：`value` 读的是实时 DOM 属性，值写进去了就会显示出来；如果预览/提交仍然说「不能为空」，说明写值的方式没进框架的 model（见前面 `mode` 一节），要用 `input_text_by_selector` 重填，而不是继续加值。
+- 隐藏控件（`type=hidden`、`display:none`）默认不返回，`includeHidden: true` 才带上——真实站点上的 file input 常常就是这类。
 | `go_back` | `id` | 返回 `data.status`、`data.url`；无历史时 `msg=无法后退：没有可用历史记录` |
 | `go_forward` | `id` | 同上；`about:blank` 这类没有 HTTP 响应的页面 `status` 为 0 |
 | `reload` | `id` | 返回 `data.status` |
@@ -346,16 +407,16 @@ current tab is: 1
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `click_element_by_index` | `id`, `index` | 单击；返回点击回执（见下） |
-| `double_click_element_by_index` | `id`, `index` | 双击；返回点击回执 |
+| `click_element_by_index` | `id`, `index`, `mode`(可选), `timeoutMs`(可选) | 单击；返回点击回执（见下） |
+| `double_click_element_by_index` | `id`, `index`, `mode`(可选) | 双击；返回点击回执 |
 | `hover_element_by_index` | `id`, `index` | 悬停 |
 | `focus_element_by_index` | `id`, `index` | 聚焦 |
-| `check_element_by_index` | `id`, `index` | 勾选复选框/单选框 |
-| `uncheck_element_by_index` | `id`, `index` | 取消勾选 |
+| `check_element_by_index` | `id`, `index`, `mode`(可选) | 勾选复选框/单选框 |
+| `uncheck_element_by_index` | `id`, `index`, `mode`(可选) | 取消勾选 |
 | `type_text` | `id`, `index`, `text` | 逐字输入，**不清空**原有内容 |
-| `input_text` | `id`, `index`, `text` | 覆盖式填充（等价 `fill`，会清空）；`text` 必填，**清空请用 `clear_text`** |
+| `input_text` | `id`, `index`, `text`, `mode`(可选) | 覆盖式填充（等价 `fill`，会清空）；`text` 必填，**清空请用 `clear_text`** |
 | `drag_element_by_index` | `id`, `index`, `targetIndex` | 把第 index 个元素拖到第 targetIndex 个元素 |
-| `upload_file` | `id`, `index`, `path` | `path` 是**服务器本地绝对路径**，不是 URL |
+| `upload_file` | `id`, `path`, `index` 或 `selector`(二选一), `timeoutMs`(可选) | `path` 是**服务器本地路径**：绝对路径直接用，相对路径按服务端暂存目录解析（见下面的「上传文件」） |
 | `send_keys` | `id`, `keys` | 键盘按键：`Enter`、`Tab`、`Control+A`、`ArrowDown` |
 | `key_down` | `id`, `keys` | 按住不放（配合 `key_up`） |
 | `key_up` | `id`, `keys` | 松开按键 |
@@ -378,6 +439,39 @@ current tab is: 1
 
 `ok=true` 只代表动作没抛异常，**不代表点中了东西**：实测点悬浮菜单时文本命中的是纯文本容器，方法返回成功但页面毫无变化。`data.changed` 仅表示观察到变化，不证明业务操作成功；为 false 时应等待目标条件。
 
+#### 上传文件（`upload_file` 与 `POST /playwright/upload`）
+
+`upload_file` 的 `path` 是**服务端**能打开的路径，不是 URL。`index` 与 `selector` 传一个即可，**优先用 `selector`**：真实站点上的 file input 基本都是隐藏的（`display:none` 或 `visibility:hidden`），既没有操作索引，也要先想办法把它显出来才能用索引定位——用选择器就不需要这一套。
+
+```bash
+# 把 file input 的选择器喂给它（不需要元素可见，也不需要索引）
+{"id":"1001","method":"upload_file","params":{"selector":"#form_item_imageAttJson","path":"图样.jpg"}}
+```
+
+**客户端-服务器模式**（智能体在客户端、浏览器在服务端）下，客户端本地文件服务端读不到，先把文件 POST 到暂存接口，再用回执里的路径：
+
+```bash
+# 1. 上传（三种写法等价，任选）
+curl -F "file=@图样.jpg"            http://<服务端>:10049/playwright/upload
+curl --data-binary @图样.jpg "http://<服务端>:10049/playwright/upload?filename=图样.jpg"
+curl -H "Content-Type: application/json" \
+     -d '{"filename":"图样.jpg","contentBase64":"/9j/4AAQ..."}' http://<服务端>:10049/playwright/upload
+
+# 回执：{"ok":true,"data":{"filename":"图样.jpg","path":"<服务端暂存目录>/图样.jpg",
+#                        "relativePath":"图样.jpg","size":18363,"sha256":"...","existed":false}}
+
+# 2. 把 path（或 relativePath）回填给 upload_file
+{"id":"1001","method":"upload_file","params":{"selector":"#form_item_imageAttJson","path":"图样.jpg"}}
+
+# 辅助接口：GET /playwright/upload 列出暂存文件；DELETE /playwright/upload?name=图样.jpg 删掉一个
+```
+
+- 文件字段名默认 `file`，可用 `?field=xxx` 改；multipart 之外的两种写法见上。文件名会被清洗（只留基本名、去掉路径分隔符与控制字符、保留中文），并且**只能落在暂存目录里**，`../` 这类路径会被拒绝。
+- 回执字段：`data.filename`、`data.path`、`data.relativePath`、`data.size`、`data.sha256`（客户端可据此核对是否传对了文件）、`data.target`（`index=3` 或 `selector=...`）。
+- 单文件上限默认 64MB（`browser.upload.maxBytes`），同名默认覆盖（`browser.upload.overwrite=false` 则自动改名 `a-1.jpg`）。暂存目录默认 `<启动目录>/upload`，`start` 的返回里能看到实际路径。
+- 文件不存在时错误信息会直接告诉你去 `POST /playwright/upload`，不要再去猜路径。
+- 上传动作也会写进追踪日志的 `uploads.log`（只记元数据，不记内容）。
+
 ### 读取元素信息与状态（按索引）
 
 | 方法 | 参数 | 返回 |
@@ -396,13 +490,13 @@ current tab is: 1
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `click_element_by_selector` | `id`, `selector` | CSS 选择器取第一个匹配并点击；**点完如果弹出新页签会自动切过去并带到最前**；返回点击回执 |
-| `input_text_by_selector` | `id`, `selector`, `text` | 覆盖式填充 |
-| `click_element_by_text` | `id`, `text` | 按可见文本定位。**先向上找最近的可点击祖先**（`a`/`button`/`[role=button]`/`[onclick]`），找不到才点文本节点本身；返回真正命中的 `data.tag`/`data.outerHtml` 与点击回执 |
-| `click_element_by_role` | `id`, `role`, `name` | 无障碍角色，`role` 如 `button`、`link`、`textbox`、`checkbox`；返回命中的 `data.tag`/`data.outerHtml` 与点击回执 |
-| `input_text_by_label` | `id`, `label`, `text` | 按表单标签 / `aria-label` 定位输入框 |
+| `click_element_by_selector` | `id`, `selector`, `mode`(可选), `timeoutMs`(可选) | CSS 选择器取第一个匹配并点击；**点完如果弹出新页签会自动切过去并带到最前**；返回点击回执 |
+| `input_text_by_selector` | `id`, `selector`, `text`, `mode`(可选) | 覆盖式填充。**可见字段默认走真实输入**（进框架模型），这是「值填了但预览/校验说为空」时的正解 |
+| `click_element_by_text` | `id`, `text`, `mode`(可选) | 按可见文本定位。**先向上找最近的可点击祖先**（`a`/`button`/`[role=button]`/`[onclick]`），找不到才点文本节点本身；返回真正命中的 `data.tag`/`data.outerHtml` 与点击回执 |
+| `click_element_by_role` | `id`, `role`, `name`(可选), `mode`(可选) | 无障碍角色，`role` 如 `button`、`link`、`textbox`、`checkbox`；返回命中的 `data.tag`/`data.outerHtml` 与点击回执 |
+| `input_text_by_label` | `id`, `label`, `text`, `mode`(可选) | 按表单标签 / `aria-label` 定位输入框 |
 | `clear_text` | `id`, `index`(可选), `selector`(可选) | 清空输入框，返回 `data.value`（清空后的值）。`input_text` 的 `text` 必填，所以清空走这里；`index` 与 `selector` 传一个即可 |
-| `hover_and_click` | `id`, `index`(可选), `selector`(可选), `hoverDelayMs`(可选) | 悬停后**立刻**点同一个元素，`hoverDelayMs` 默认 300 毫秒。悬浮菜单专用：分两步调用中间隔着一次推理往返，菜单早收起来了。返回命中信息与点击回执 |
+| `hover_and_click` | `id`, `index`(可选), `selector`(可选), `hoverDelayMs`(可选), `mode`(可选) | 悬停后**立刻**点同一个元素，`hoverDelayMs` 默认 300 毫秒。悬浮菜单专用：分两步调用中间隔着一次推理往返，菜单早收起来了。返回命中信息与点击回执 |
 
 ### 标签页
 
@@ -431,6 +525,15 @@ current tab is: 1
 | `wait_for_url` | `id`, `url`, `timeoutSeconds` | 等 URL 匹配（支持 `**/path` 这类通配），返回 `data.url` |
 | `wait_for_load` | `id`, `state`, `timeoutSeconds` | `state` 取 `load` / `domcontentloaded` / `networkidle` |
 | `wait_for_function` | `id`, `expression`, `timeoutSeconds` | 等 JS 表达式为真，如 `() => document.readyState === "complete"` |
+| `wait_for_idle` | `id`, `quietMs`(可选，默认 500), `timeoutSeconds`(可选，默认 30), `selector`(可选), `text`(可选) | 等页面「忙完」：连续 `quietMs` 毫秒既没有 DOM 变更、也没有在途请求。**不知道要等多久时用它**，比固定 `wait` 稳、比手写 `wait_for_function` 省事 |
+| `wait_for_stable` | `id`, `selector`(可选，默认整个 body), `quietMs`(可选，默认 800), `timeoutSeconds`(可选) | 等**内容**稳定：正文 / 表单值 / 表格内容连续 `quietMs` 毫秒不再变化，返回 `data.stable`、`data.changes`、`data.length`、`data.fingerprint` 与**稳定后的文本 `data.text`** |
+| `wait_for_count` | `id`, `selector`, `min`/`max`/`equals`(至少给一个), `timeoutSeconds`(可选) | 等命中数量达标。等弹窗/遮罩**全部消失**用 `max: 0`，等结果行**出现**用 `min: 1`。返回 `data.matched`、`data.count`、`data.waitedMs` |
+
+`wait_for_idle` 的返回：`data.idle`（成功时 true）、`data.waitedMs`、`data.mutations`（观察到的 DOM 变更次数）、`data.inflight`（结束时仍在途的请求数）。超时失败时同样带这几个计数，便于判断是「接口一直不回来」还是「页面有定时器一直在改 DOM」。传了 `selector` / `text` 时会同时要求该条件成立。
+
+**`wait_for_idle` 看「忙不忙」，`wait_for_stable` 看「内容变没变」**，两者不能互相替代：查询/搜索结果是异步刷新的，页面可能一直在动（动画、轮询计时器）但真正要读的内容已经定下来了，这时用 `wait_for_stable`；点一下等它保存完、不知道要等多久，用 `wait_for_idle`。
+
+> **查完立刻读结果是错的**：实测点「查询」后马上读表格，读到的是**上一次**的搜索结果，表现成「明明有这一行却找不到」。正确顺序是 `click` → `wait_for_stable`（或 `wait_for_count`）→ 再读。`wait_for_stable` 已经把稳定后的文本一并返回，省掉一次 `get_element_text`。
 
 ### 鼠标
 
@@ -440,13 +543,30 @@ current tab is: 1
 | `mouse_down` | `id`, `button` | `left` / `right` / `middle` |
 | `mouse_up` | `id`, `button` | 松开 |
 | `mouse_wheel` | `id`, `deltaY` | 滚轮，正数向下 |
+| `mouse_click` | `id`, `x`, `y`, `button`(可选), `clickCount`(可选) | **真实鼠标点击一个坐标**（一条顶原来的 `mouse_move`+`mouse_down`+`mouse_up` 三条） |
+| `mouse_click_by_selector` | `id`, `selector`, `button`(可选), `clickCount`(可选), `timeoutMs`(可选) | 真实鼠标点击某个元素**中心**（自己算坐标，不用先 `get_element_box`） |
+
+**真实鼠标事件是唯一能让某些控件生效的方式**：实测 ant-design 的 `Modal.confirm`「确定/取消」、对话框右上角的 ×，用 JS 派发 `click`（甚至元素原生 `el.click()`）**完全无效**——点了没反应、弹窗不关，而接口照样回成功。这类控件必须走真实鼠标事件。
+
+三个点击方法（`click_element_by_index`、`click_element_by_selector`、`click_element_by_text` 等）都支持 `mode`：
+
+| `mode` | 行为 |
+| --- | --- |
+| `auto`（默认） | 原生点击 → 失败则改**真实鼠标** → 再失败改 JS 派发；目标**被遮挡**时跳过鼠标档（鼠标点的是坐标，会落在遮挡物上）直接走 JS 派发 |
+| `native` | 只做原生点击（有完整的可操作性检查） |
+| `mouse` | 只做真实鼠标点击（不做可操作性检查，元素一直在动时也能点到） |
+| `js` | 只做 JS 派发（不要求元素可见、不被遮挡影响） |
+
+回执里 `data.mode` 是**实际用上的**那一种，`data.fallbackReason` 是降级原因（没降级就没有），`data.effective` 表示这次点击有没有真的改变页面。**只看 `ok:true` 会误判**：JS 派发的点击在框架里可能被忽略，所以要连 `data.effective` 一起看。
+
+`data.coveredBy` 表示目标中心点上实际命中的是别的元素（常见：用户服务协议层、弹窗遮罩、叠起来的确认框），这时先 `close_modal` 关掉遮挡物再点，而不是反复点。
 
 ### 截图与 PDF
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `screenshot` | `id`, `path`(可选), `fullPage`(bool), `index`(可选), `selector`(可选), `clipX`/`clipY`/`clipWidth`/`clipHeight`(可选) | 传 `path` 存服务器文件并返回 `data.path`/`data.size`；不传返回 `data.base64`，可直接给视觉模型。传 `index` 或 `selector` 时**只截该元素**；否则截整页，`clipX/clipY/clipWidth/clipHeight` 四个都传才按区域裁剪 |
-| `get_element_screenshot` | `id`, `index`(可选), `selector`(可选), `path`(可选) | 只截一个元素，返回 `data.path`+`data.size` 或 `data.base64`、`data.target`。`index` 与 `selector` 传一个即可 |
+| `screenshot` | `id`, `path`(可选), `fullPage`(bool), `index`(可选), `selector`(可选), `clipX`/`clipY`/`clipWidth`/`clipHeight`(可选), `inline`(bool，默认 false) | **默认落盘**：不传 `path` 时写到 `data/<id>/shot-N.png`，返回 `data.path`/`data.url`/`data.size` 与 `data.base64Omitted=true`；要内联 base64（直接喂视觉模型）才传 `inline: true`。传 `index` 或 `selector` 时**只截该元素**；否则截整页，`clipX/clipY/clipWidth/clipHeight` 四个都传才按区域裁剪 |
+| `get_element_screenshot` | `id`, `index`(可选), `selector`(可选), `path`(可选), `inline`(bool，默认 false) | 只截一个元素，返回 `data.path`+`data.url`+`data.size`、`data.target`；`inline: true` 时另给 `data.base64`。`index` 与 `selector` 传一个即可 |
 | `pdf` | `id`, `path`(可选) | 存 PDF，返回 `data.path`；不传 `path` 落到 `~/Downloads/broswer/` |
 
 > 日常「看页面长什么样」**先别看图**：`data.screenshot` 是每个改变页面的方法自动留下的截图地址，但把图读进上下文很贵，非必要不要读（见开头的省 token 铁律），读 `data.text` 就够了。`get_element_screenshot` 是验证码、二维码、图表这类「必须看图」的元素的标准做法：走 Playwright 自己的元素截图，**不受 canvas 跨域污染限制**（用 `execute_js` + canvas 手抠图，跨域图片会直接失败），而且只截一个元素、比整页图省得多。
@@ -475,15 +595,26 @@ current tab is: 1
 
 ### 弹窗与控制台
 
+这里有两类**完全不同**的弹窗，别混：
+
+| 类型 | 是什么 | 用哪个方法 |
+| --- | --- | --- |
+| 浏览器原生对话框 | `window.alert` / `confirm` / `prompt`，会阻塞页面 | `get_dialog` / `clear_dialog` / `set_dialog_behavior` |
+| 页面里的 DOM 弹窗 | ant-design 的 `Modal`/`Modal.confirm`、用户服务协议层、抽屉 | `get_modals` / `close_modal` |
+
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `get_dialog` | `id`, `consume`(bool) | 返回 `data.dialog`（`type/message/defaultValue/seq/timestamp`）或 null。**记录不会自动清除**，可能是很早以前的弹窗；`consume=true` 读后即清 |
-| `clear_dialog` | `id` | 清空弹窗记录，返回 `data.cleared` |
+| `get_dialog` | `id`, `consume`(bool) | 返回 `data.dialog`（`type/message/defaultValue/seq/timestamp`）或 null。**记录不会自动清除**，可能是很早以前的弹窗；`consume=true` 读后即清。`get_js_dialog` 是它的同义名 |
+| `clear_dialog` | `id` | 清空弹窗记录，返回 `data.cleared`。`clear_js_dialog` 是它的同义名 |
 | `set_dialog_behavior` | `id`, `dismiss`(bool) | 弹窗**默认自动确认**；`dismiss=true` 改成自动取消 |
+| `get_modals` | `id` | 列出当前可见的 DOM 弹窗：`data.count`、`data.modals[]`（`kind`/`title`/`text`/`buttons`/`buttonPoints`/`hasClose`/`closePoint`/`rect`/`zIndex`）、`data.top`（最后弹出来的那个） |
+| `close_modal` | `id`, `which`(可选，默认 `top`), `title`(可选), `button`(可选) | 关掉 DOM 弹窗。**一律用真实鼠标点**，并且点完**校验数量是否真的减少**，返回 `data.closed`、`data.countBefore`、`data.countAfter`、`data.clicked` |
 | `get_console_logs` | `id` | 返回 `data.logs` 与 `data.errors`，各最多 200 条 |
 | `clear_console_logs` | `id` | 清空 |
 
 **`get_dialog` 是「最近一次弹窗」而不是「当前这一步的结果」**：实测提交验证码失败过一次之后，后面查询明明成功了，`get_dialog` 仍然返回上一轮的「验证码输入错误」，很容易误判成这次也失败了。判断弹窗是不是新的看 `data.dialog.seq`/`timestamp`；稳妥做法是**每次提交动作前先 `get_dialog` 加 `consume: true` 清一次**，动作后再读。
+
+**DOM 弹窗用 `get_modals` / `close_modal`，不要自己写 JS 点它**：`close_modal` 的 `which` 取 `top`（默认）/ `first` / `all`，`title` 按标题或文本子串匹配（给了就以它为准），`button` 指定点哪个按钮（不给则优先右上角 ×，其次「取消/关闭/知道了/我接受」这类非提交按钮）。反复点一个关不掉的弹窗会把确认框**一层层叠起来**（实测叠到 16 个），之后所有「取第一个可见弹窗」的逻辑都在操作最老的那个——所以要看 `data.closed`：为 `false` 说明点了但数量没减少，这时用 `get_modals` 拿 `closePoint`/`buttonPoints`，再 `mouse_click` 那个坐标。
 
 ### 网络
 
@@ -491,7 +622,7 @@ current tab is: 1
 | --- | --- | --- |
 | `route` | `id`, `urlPattern`, `action`, `body`, `status`, `contentType` | `action` 取 `abort`（拦截）或 `mock`（返回自定义响应）；`urlPattern` 用 Playwright 通配，如 `**/api/ping` |
 | `unroute` | `id`, `urlPattern`(可选) | 不传则移除全部路由 |
-| `get_requests` | `id`, `filter`(可选) | 返回 `data.requests`（`method/url/resourceType/status`，**带请求体的请求另有 `postData`，最多 4000 字符**），最多 200 条，`filter` 按 URL 子串过滤。**只有元数据，没有响应体** |
+| `get_requests` | `id`, `filter`(可选), `resourceType`(可选), `limit`(可选), `since`(可选) | 返回 `data.requests`（`method/url/resourceType/status`，**带请求体的请求另有 `postData`，最多 4000 字符**），最多 200 条。`filter` 按 URL 子串过滤，`resourceType` 按 `xhr`/`fetch`/`document`/`script` 等过滤，`limit` 限制条数，`since` 只返回该毫秒时间戳之后的。返回里另有 `data.count`/`data.total`/`data.recordedSince`/`data.inflight`/`data.note`。**只有元数据，没有响应体** |
 | `wait_for_response` | `id`, `urlPattern`, `timeoutSeconds`(可选), `maxChars`(可选), `lookBackSeconds`(可选) | 等 `urlPattern` 匹配的响应并返回它的响应体：`data.url`、`data.status`、`data.body`（默认最多 20000 字符）、`data.bodyLength`、`data.ageMs`、`data.fromLookBack`。匹配规则见下面的「URL 匹配」 |
 | `get_response_body` | `id`, `filter`(可选), `index`(可选), `maxChars`(可选), `requestId`(可选) | 回看**已经发生过**的响应体（保留最近 100 个响应）。`filter` 按 URL 子串过滤，不传取最近一个；`index` 在多个匹配里选第几个（默认最后一个）。可用 `requestId` 精确关联重复 URL 的某次请求。响应体已被释放时返回 `data.bodyError`，且 `data.bodyAvailable=false` |
 
@@ -519,6 +650,8 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 
 已经发过的请求想看返回内容就用 `get_response_body`。
 
+**`get_requests` 返回空不等于「没有请求」**：记录是从页签挂上监听那一刻开始记的，页面在这之前（或另一个页签里）发生的请求不会出现在这里。所以空结果时服务会一并返回 `data.note` 说明这一点、`data.recordedSince` 告诉你从什么时候开始记、`data.inflight` 告诉你此刻还有几个在途。判断顺序：先看 `recordedSince` 是不是晚于你要找的那次请求 → 再用 `filter`/`resourceType`/`since` 缩小范围 → 仍然没有就改用 `get_response_body`（它保留最近 100 个响应，跨页签）。
+
 ### 人机协同（验证码 / 短信码 / 人工登录）
 
 | 方法 | 参数 | 说明 |
@@ -534,8 +667,25 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
 | `extract_structured_data` | `id`, `query`, `extractLinks`(bool) | 返回 `data.text`（正文，最多 20000 字符，读取时会临时隐藏高亮层）与 `data.links` |
-| `execute_js` | `id`, `body` | 返回 `data.result`，见第八节 |
-| `commands` | `id`, `params.stopOnError`, `params.commands` | 批量指令，是 `method` 的一个取值，见第七节 |
+| `execute_js` | `id`, `body` 或 `bodyFile`, `vars`(可选) | 返回 `data.result`，见第八节 |
+| `commands` | `id`, `params.stopOnError`, `params.commands`, `params.async`(可选) | 批量指令，是 `method` 的一个取值，见第七节 |
+
+### 服务自省（不知道有什么能力时先问它）
+
+| 方法 | 参数 | 说明 |
+| --- | --- | --- |
+| `list_methods` | `filter`(可选) | 返回 `data.methods`（全部方法名）与 `data.count`。**方法名拿不准就先查**，别靠猜——猜错只会拿到一句「不支持的方法」 |
+| `get_config` | `id`(可选) | 服务端**生效**配置：`engine`/`configuredType`、`profileDir`（解析后的真实目录）、`action`（超时与两个降级开关）、`jsDir`、`trace`、`upload`、`tasks`、`commands`。传 `id` 时另给该任务的 `browser`。**「为什么这次不是我要的浏览器」「脚本放哪」这类问题先看它** |
+| `list_tasks` | 无 | 当前活着的任务：`data.tasks[]`（`id`/`url`/`title`/`tabCount`/`captureSeq`/`inflight`/`profileDir`）与 `data.browser`（类型、profile 目录、是否走 CDP） |
+| `list_recipes` | 无 | 服务端有哪些站点配方，返回 `data.recipes[]`（`name`/`description`/`params`/`stepCount`）与 `data.dir` |
+| `run_recipe` | `id`, `name`, `vars`(可选), `stopOnError`(可选) | 跑一个站点配方，见第十二节 |
+| `get_job` | `jobId`, `includeResult`(可选，默认 true) | 查异步批次的结果：`data.status`（`running`/`done`/`failed`/`cancelled`）、`data.steps`、`data.data` |
+| `cancel_job` | `jobId` | 取消异步批次。**取消是协作式的**：批次会在下一步之前停下来，当前这一步不会被打断 |
+| `list_jobs` | `limit`(可选，默认 20) | 最近的异步任务（只保留 50 个，服务重启即丢） |
+| `cleanup` | `scope`(可选，默认 `all`), `olderThanHours`(可选，默认 24), `keepLatest`(可选), `dryRun`(可选，**默认 true**) | 清理落盘产物（截图、结构化文本、追踪日志）。**默认只预演不删**，要真删必须显式传 `dryRun: false`。`scope` 取 `all`/`data`/`trace`/`upload`；`all` 不会动 `upload`（暂存文件可能正在被任务使用） |
+| `shutdown` | 无 | 关掉所有任务与共享浏览器（服务进程不退出）。比直接杀进程干净：不留占着 profile 目录的孤儿浏览器 |
+
+这些能力也有 GET 版本，脚本与浏览器可以直接打开：`GET /playwright/methods`、`GET /playwright/config`、`GET /playwright/tasks`（与 `list_methods`/`get_config`/`list_tasks` 同一份数据）。
 
 ## 七、批量指令（PTC：一次请求跑完一整个计划）
 
@@ -554,7 +704,10 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `params.stopOnError` | `true` | `true`＝遇到第一个失败就停止；`false`＝继续跑完并把每一步结果都返回，**批量里推荐 `false`** |
-| `params.commands` | 必填 | 命令数组，每项**只能有一个键**，键是方法名、值是参数对象 |
+| `params.commands` | 必填 | 命令数组，每项**只能有一个键**（外加可选的 `expect`），键是方法名、值是参数对象 |
+| `params.async` | `false` | `true`＝立刻返回 `data.jobId`，批次在后台跑，用 `get_job` 取结果、`cancel_job` 取消。**长批次（几十秒以上）用它**，否则客户端容易超时——而超时**不代表批次停了**，它还在服务端继续跑 |
+| `params.stopOnExpectFailure` | `false` | `true`＝某一步的 `expect` 断言没过就停下 |
+| `params.maxDurationMs` | 无 | 整批的总时长上限，超了就停在当前这一步，`data.stopReason` 说明原因 |
 
 返回值里**每一步的结果都在**：
 
@@ -600,6 +753,32 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 - 需要循环、条件判断这类逻辑，就在批次里用 `execute_js` 一步做完，不要拆成几十条命令。
 - 未知命令返回 `第 N 条命令 xxx 失败：不支持的方法：xxx`。
 
+### 用 `expect` 断言「动作真的生效了」
+
+每一步都可以带一个 `expect`，在**命令执行之后**求值。这是本工具最值钱的一个习惯：**回执说 `ok:true` 不代表页面真的变了** —— JS 派发的点击在某些框架控件上完全无效，接口照样回成功。加了断言，「动作发了、状态没变」会被当场标出来。
+
+```shell
+curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
+  "id": 1001, "method": "commands",
+  "params": {"stopOnError": false, "stopOnExpectFailure": true, "commands": [
+    {"click_element_by_selector": {"selector": ".ant-modal-confirm .ant-btn-primary", "mode": "mouse"},
+     "expect": {"js": "document.querySelectorAll(\".ant-modal-confirm\").length", "equals": 0}},
+    {"wait_for_count": {"selector": ".ant-modal-confirm", "max": 0, "timeoutSeconds": 5}}
+  ]}}'
+```
+
+| `expect` 字段 | 说明 |
+| --- | --- |
+| `js` | 必填，要断言的 JS 表达式（写成 `() => …` 函数也行） |
+| `equals` / `notEquals` | 相等 / 不相等（数字按数字比） |
+| `min` / `max` | 数值区间 |
+| `contains` | 实际值里包含某段文本 |
+| `truthy` | 真值判断；**只写 `js` 不写匹配方式时按真值判断** |
+
+- 每一步的结果里多一个 `expectResult`：`{passed, actual, js, matcher, expected}`。
+- 断言没过时：批次整体 `code:0`，`data.expectFailed` 计数，`msg` 指出是哪一步的断言没过；**命令本身不算失败**（`data.failed` 仍是 0），`data.note` 会说明「命令都执行成功，是断言没过」。
+- 断言脚本自己报错（写错选择器等）也记成 `passed:false`，并把错误放在 `expectResult.error`。
+
 ## 八、执行 JavaScript
 
 ```json
@@ -618,6 +797,17 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 - 脚本报错时返回 `code:0`，`msg` 形如 `execute_js 失败：执行 JavaScript 失败：TypeError: Cannot read properties of null (reading 'click')`（只有异常首行，没有堆栈）。
 - `body` 长度上限 100000 字符；脚本**没有超时**。
 - 与 `get_browser_state` 的分工：**读页面优先用 `get_browser_state`**（结构化、带索引、token 可控）；`execute_js` 用于取快照里没有的东西（`id`/`class`/`href`、滚动位置、localStorage 原始值）或做特殊交互。
+
+### 用 `bodyFile` + `vars` 传长脚本（客户端-服务器模式下必看）
+
+脚本里带中文、引号、换行时，在客户端拼 JSON 很容易出错（PowerShell 尤其容易吃掉引号）。两种做法：
+
+| 做法 | 写法 | 适用 |
+| --- | --- | --- |
+| 服务端脚本文件 | `"bodyFile": "read-table.js"` | 脚本较长、要反复用：文件放在服务端的脚本目录（见 `get_config` 的 `jsDir`，默认 `<启动目录>/scripts/js`），只能用这个目录里的文件名 |
+| 变量注入 | `"body": "() => document.querySelector('{{sel}}').innerText", "vars": {"sel": "#表格"}` | 脚本短但要传参数 |
+
+`vars` 的替换走 **JSON 编码**：字符串自动带引号并转义，中文、引号、换行都不用转义；数字、布尔、数组、对象直接塞进脚本。两种占位符都支持，且**带引号的写法会连引号一起替换**，所以 `querySelector("{{sel}}")` 与 `var n = {{n}};` 都是对的。
 
 常见用法：
 
@@ -724,12 +914,12 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 ## 十一、坑与限制
 
 1. **只有一个端点，只支持 POST + JSON 请求体**：`{"id":...,"method":...,"params":{...}}`。参数不放查询串、不放表单，也不需要 URL 编码。
-2. **参数问题不再返回 HTTP 500**：缺参数得到 `xxx 失败：缺少参数 name`，方法不存在得到 `不支持的方法：xxx`，实例不存在得到 `没有找到对应的浏览器实例：<id>`。运行期错误也是 `code:0`，例如 `go_to_url 失败：net::ERR_CONNECTION_REFUSED at ...`、`send_keys 失败：Unknown key: "NotAKey"`。
+2. **参数问题不再返回 HTTP 500**：缺参数得到 `xxx 失败：缺少参数 name`，实例不存在得到 `没有找到对应的浏览器实例：<id>`。**方法名写错会顺带给近似建议**：`不支持的方法：list_tabs，你是不是想用 get_tabs / new_tab / get_tabs？`（按编辑距离与分词近似挑候选），照着改一次就能过，不用再猜。运行期错误也是 `code:0`，例如 `go_to_url 失败：net::ERR_CONNECTION_REFUSED at ...`、`send_keys 失败：Unknown key: "NotAKey"`。
 3. **页面变化后索引全部重算**：点击、跳转、异步渲染之后必须重新 `get_browser_state`；沿用旧索引会得到 `索引越界` 或 5 秒超时后提示重新取快照。
 4. **快照里没有 `id`/`class`/`href`**：按 id/class 定位用 `click_element_by_selector`，取 href 用 `execute_js`，批量看属性用 `get_interactive_map`。
 5. **纯文本容器（`div`/`span`/`li`）没有索引**：这类元素用 `click_element_by_selector` 或 `execute_js` 调 `.click()`；但带 `onclick`/`cursor:pointer` 的 `div`/`span` 会有索引，别一概而论。
 6. `wait` 的 `seconds` 必填；要等页面就绪请用 `wait_for_load` / `wait_for_element`。
-7. `upload_file` 的 `path` 是服务器本地绝对路径；文件不存在会失败。
+7. `upload_file` 的 `path` 是**服务器**能打开的路径（绝对路径直接用，相对路径按服务端暂存目录解析），不是 URL；文件不存在时错误信息会告诉你去 `POST /playwright/upload` 把文件送上来。传 `selector` 可以操作隐藏的 file input（比 `index` 更好用，见第四节的「上传文件」）。
 8. `scroll_to_text` 找不到文本会等满 30 秒，别用它探测元素是否存在，用 `wait_for_element`。
 9. **`execute_js` 没有超时**：脚本里不要写死循环或长时间轮询，否则请求一直挂着；页面上弹模态框时弹窗会被自动确认，也可以用 `set_dialog_behavior` 改成自动取消。
 10. `execute_js` 的 `body` 上限 100000 字符；返回 DOM 元素只会得到 `ref: <Node>`。
@@ -738,14 +928,25 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 13. 一个任务只对应一个当前 Page，**不要并发对同一个 `id` 发请求**；并发任务请各自 `start` 一个任务（共用浏览器，各有各的页签）。
 14. `set_credentials` 会重建整个浏览器（所有任务共用），只能在「当前只有一个任务」时用，走 CDP 那条路时（用户自己的 Chrome profile 或 `browser=edge`）不可用；`headless=false` 会弹出真实窗口，只适合本机调试。
 15. 服务无鉴权且 `execute_js` 能执行任意脚本，对外部署前必须加访问控制。
-16. **不可见元素既不进快照，也不能用选择器操作**：实测百度首页的真实搜索框 `INPUT#kw`（`offsetParent === null`，被新的 AI 输入框取代而隐藏）不在 `data.text` 里，只剩提交按钮；`input_text_by_selector` 作用在它上面会等满 5 秒后返回 `input_text_by_selector 失败：[ELEMENT_HIDDEN] 元素当前不可见: 选择器 #kw`。这种元素只能用 `execute_js` 直接设值并派发事件：
+16. **不可见元素既不进快照，也不能用「原生方式」操作**：实测百度首页的真实搜索框 `INPUT#kw`（`offsetParent === null`，被新的 AI 输入框取代而隐藏）不在 `data.text` 里，只剩提交按钮；`input_text_by_selector` 按默认方式作用在它上面会等满超时后返回 `input_text_by_selector 失败：[ELEMENT_HIDDEN] 元素当前不可见: 选择器 #kw`。这时有三条路，**优先第一条**：
+
+    1. 传 `mode: "js"`（跳过可操作性检查，直接在页面里设值并派发 `input`/`change`），回执会给出 `data.committed`：
+
+       ```json
+       {"id":1001,"method":"input_text_by_selector",
+        "params":{"selector":"#kw","text":"Mac Mini M4","mode":"js"}}
+       ```
+
+       注意：JS 设值**不保证进框架的 model**（`committed=false`），关键字段仍要用可见的等价输入框重填一遍。
+    2. 用 `execute_js` 自己设值并派发事件（要完全控制事件细节时）：
+    3. 先把元素显示出来（去掉 `display:none` / 改 `visibility`）再按常规方式操作——**只在确实没有别的办法时用**，改动页面样式可能让站点行为与真实用户不一致。
 
     ```js
     (function(){var e=document.querySelector("#kw");e.focus();e.value="Mac Mini M4";
       e.dispatchEvent(new Event("input",{bubbles:true}));return e.value;})()
     ```
 
-    判断元素是否可见：快照里有它就是可见的；怀疑隐藏时用 `execute_js` 看 `e.offsetParent !== null`。
+    判断元素是否可见：快照里有它就是可见的；怀疑隐藏时用 `execute_js` 看 `e.offsetParent !== null`，或直接用 `get_form_state` 加 `includeHidden: true` 看 `visible` 字段。
 17. **批量接口的约定**：每项只能有一个键；`stopOnError` 默认 `true`（遇到第一个失败就停），批量里推荐显式传 `false`；布尔参数不传按 `false` 处理（`scroll` 要写 `"down":true`）；`commands` 不能嵌套；覆盖范围是除 `commands` 外的全部方法；数组最多 200 条。
 18. **验证 `route` mock 时别等页面自己的回调**：实测页面加载时自己发起的 `fetch` 被 mock 后，渲染进程里的 `.then` 可能迟迟不执行（没有真实网络 IO 去唤醒它），而用 `execute_js` 主动发一次同样的请求就能立刻拿到 mock 数据。要验证拦截效果就用 `execute_js` 主动发请求，或看 `get_requests` 里的状态码。
 19. **一个批次里前面的失败会影响后面**：批次是顺序执行的，索引类命令依赖同一次快照，前面的点击跳转会改变 DOM；PTC 的稳妥做法是「动作段 + 末尾 `get_browser_state`」，用下一次推理基于新快照决定后续，而不是在一个批次里塞几十步。
@@ -758,4 +959,64 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 26. **截图序号是任务级的，不是调用级的**：`seq` 只增不减，`close` 再 `start` 同一个 id 也会接着往上加（文件不删就继续累加）。想要干净的一轮就从空的 `data/<id>/` 目录开始。
 27. **`data/<id>/` 里的文件不会自动清理**，长期跑要自己定期清理；服务只监听本机，`/data/**` 也没有鉴权，别把它暴露到公网。
 28. **非必要不要读 `get_browser_state`（以及任何自动截图）返回的图片**：`data.screenshot` / `data.screenshot_path` 只是地址，把图读进上下文非常贵，而定位和操作要的信息全在 `data.browser_state` + `data.text` 里。默认只读文本字段；确认页面变化用 `data.changed` / `diff_dom_text`；只有验证码、二维码、图表、纯图片元素这类文本表达不了的场景才取图，并且优先 `get_element_screenshot` 只截那一个元素。详见开头的省 token 铁律。
-29. **登录页白屏时可以尝试 Firefox 139**：先记录最终 URL、HTTP 状态和控制台错误，区分 `/login` 返回 HTTP 400 的空白页与跳转到 `about:blank`，不要直接归因于沙盒或 DevTools。2026-09-22 国家知识产权局登录页实测中，**Playwright 1.53.0 + Firefox 139.0** 两次正常显示登录表单；**Playwright 1.63.0 + Firefox 155.0** 两次出现 HTTP 412 → 400 后白屏。遇到类似现象，可用前一组合、全新会话从官网入口重试，并观察至少一分钟；这只是排障候选，不保证适用于所有网站，也不代表已成功登录。Firefox 应通过 `playwright.firefox()` 启动，不能把 Firefox 路径填进 Chrome 配置；当前 HTTP `start` 没有 Firefox 切换参数，可使用[独立诊断脚本](scripts/diagnostics/README.md)。详见[问题记录与复测证据](scripts/diagnostics/RESULTS-2026-09-22.md)。
+29. **登录页白屏时可以换引擎试试 Firefox**：先记录最终 URL、HTTP 状态和控制台错误，区分 `/login` 返回 HTTP 400 的空白页与跳转到 `about:blank`，不要直接归因于沙盒或 DevTools。2026-09-22 国家知识产权局登录页实测中，**Playwright 1.53.0 + Firefox 139.0** 两次正常显示登录表单；**Playwright 1.63.0 + Firefox 155.0** 两次出现 HTTP 412 → 400 后白屏；Chromium 系（本机 Chrome、内置 Chromium、Edge）在该站点一律白屏。遇到类似现象，换引擎 + 全新会话从官网入口重试，并观察至少一分钟。
+
+    **怎么换引擎**：`start` 时传 `browser`，取值 `auto`（默认，本机 Chrome，没装退回内置 Chromium）/ `chromium` / `chrome` / `edge` / `firefox`：
+
+    ```bash
+    {"id":"1001","method":"start","params":{"browser":"firefox","headless":false}}
+    ```
+
+    也可以给服务配默认值 `browser.engine=firefox`（等价 `browser.type=firefox`），命令行覆盖示例：`mvn spring-boot:run -Dspring-boot.run.jvmArguments="-Dbrowser.engine=firefox"`。要点：
+
+    - Firefox 用的是 **Playwright 自带的那份**（打过补丁、走 juggler 协议），本机安装的普通 Firefox 接不上，所以**不要**配 `browser.firefox.path` 指到本机 Firefox。
+    - **profile 与 Chromium 那份是分开的**：换引擎等于换一套登录态，Chrome 里登录过的站点在 Firefox 下要重新登一次（反之亦然）。
+    - `pdf` 命令只支持 Chromium，Firefox 下会返回明确失败原因；`set_credentials`、`--profile-directory` 这类 Chromium 概念在 Firefox 下同样不适用。
+    - 换引擎会重建浏览器，所以只能在「当前没有其它任务」时换（把在跑的任务 `close` 掉再 `start`，不用重启服务）。
+    - 这仍然是**排障候选**，不保证适用于所有网站，也不代表已成功登录。详见[问题记录与复测证据](scripts/diagnostics/RESULTS-2026-09-22.md)。
+
+30. **`data.mode=js` 意味着「这次没走真实交互」**：被遮挡、带动画、或 `pointer-events` 有问题的元素上，原生点击会等满超时，服务会自动降级成 JS 派发事件（回执里 `data.mode=js` + `data.fallbackReason`），点击本身通常是有效的。但 JS 设值**不保证进框架的 model**：`input_text` 走 JS 时会回 `data.committed=false`，DOM 上明明有值、预览或提交校验却说「不能为空」就是这种情况——用 `input_text_by_selector` 重填一遍（可见字段默认走真实输入）。**关键步骤（提交、缴费）看到 `mode=js` 要额外确认页面状态**，不要只看 `ok=true`。
+
+31. **`POST /playwright/upload` 与 `/data/**` 一样没有鉴权**：能访问端口的人就能往服务端磁盘写文件（只能写进暂存目录、文件名会被清洗，但文件内容不限）。服务只监听本机时问题不大，**对外部署前必须一起加访问控制**；`browser.upload.enabled=false` 可以整体关掉这个接口。追踪日志默认脱敏（手机号、证件号、邮箱、长数字）但只是尽力而为，日志与暂存文件也都不会自动清理。
+
+32. **强杀服务会留下孤儿浏览器，下一次 `start` 可能卡在启动超时**：浏览器是**独立进程**，杀掉服务（或它的 mvn 进程）**不会**关掉它启动的浏览器。残留的浏览器占着 profile 目录，下一次启动时它既不连上管道也不退出，`start` 就一直等到启动超时（默认 60 秒，见 `browser.launch.timeoutMs`），而错误信息里只有一句 `Timeout ... exceeded`。
+
+    - 服务在 Windows 上会**自动清掉残留痕迹**（profile 里的 `parent.lock` 与 `.startup-incomplete`：前者删得掉就证明没有活着的持有者，后者是「上次启动没走完」的标记），并且**第一次失败后会自动重建驱动再试一次** —— 实测这个重试往往就能成功（表现为第一次等 60 秒、第二次 2 秒起来）。
+    - 手工处理顺序：先结束残留浏览器进程（`Get-Process firefox | Stop-Process -Force`），再重启服务。
+    - **规范做法是「先 `close` 任务，再停服务」**：关掉最后一个任务时浏览器会一起退出，就不会留下孤儿。关掉全部任务与共享浏览器也可以直接用 `shutdown`（服务进程不退出，HTTP 还能应答）。
+    - 有头模式（`headless:false`）下这个现象更容易出现：有头启动比有头慢，且窗口/桌面状态会影响启动。排查时可以先确认「无头能不能起来」（`headless:true`），能起来就说明是环境问题而不是引擎问题。
+    - **profile 目录默认按端口分开**（`shared-<端口>`）：同一台机器上跑多个服务实例时，各自用各自的 profile，不会互相抢锁。要用同一份 profile（例如复用已登录的会话）就显式配 `browser.profileDir`。当前解析到哪个目录用 `get_config` 看。
+    - **强杀服务前先确认没有活着的任务**：`list_tasks` 能直接看到活着的任务与共享浏览器，不用翻日志猜。
+
+33. **`browser` 参数在老版本发布包上会被静默忽略**：老版本只认 `headless`，传了 `browser:"firefox"` 照样用内置 Chromium 打开页面，回执还是 `ok:true`——实测在一个需要 Firefox 的站点上白排查了很久。现在 `start` 的回执里明确给出 `requestedBrowser`、`effectiveBrowser`、`engineHonored`，不匹配时还会带 `engineWarning`。**看到 `engineHonored:false` 就说明这个服务实例没有按参数切浏览器**，要升级服务端；也可以用 `get_config` 确认服务端认的 `engine`/`configuredType`。
+
+34. **截图与日志不会自动清理**：一次完整的站点操作能攒下上百个追踪文件与几十张截图。定期用 `cleanup` 清理（**默认只预演**，`dryRun:false` 才真删），或用 `browser.capture.enabled=false` 关掉「每次页面变化都自动截图」（显式调 `screenshot` 不受影响）。
+
+## 十二、站点配方（`run_recipe`）
+
+配方是把「某个站点上必须这么点」的经验固化成服务端的 JSON 命令序列：文件放在配方目录（默认 `<启动目录>/recipes`，可用 `browser.recipes.dir` 改），文件名就是配方名，内容形如：
+
+```json
+{
+  "name": "close-antd-modal",
+  "description": "关掉 ant-design 的确认框：JS 派发无效，必须真实鼠标点",
+  "params": {"title": "要关的弹窗标题，可选"},
+  "commands": [
+    {"get_modals": {}},
+    {"close_modal": {"title": "{{title}}", "button": "取消"}}
+  ]
+}
+```
+
+调用：
+
+```bash
+{"id":1001,"method":"run_recipe","params":{"name":"close-antd-modal","vars":{"title":"确认提交"},"stopOnError":true}}
+```
+
+- `list_recipes` 看有哪些配方；`get_config` 的 `jsDir`/`recipesDir` 告诉你目录在哪。
+- `vars` 用 `{{变量}}` 注入，走 JSON 编码（中文、引号、换行都不用转义）。
+- 配方里的每一步都走同一套命令分发，所以**单步手跑与整段跑行为完全一致**，排障时可以把配方里的命令一条条贴出来单独执行。
+- 回执里带 `data.recipe` 与 `data.recipeDescription`，其余字段与 `commands` 批量完全一致（`count`/`succeeded`/`failed`/`results`）。
+- **配方不会自动生效**：必须显式点名 `run_recipe` 才执行，不做任何「看到这个域名就自动套用」的隐式推断。引擎选择同理，始终由调用方在 `start` 时决定。
+

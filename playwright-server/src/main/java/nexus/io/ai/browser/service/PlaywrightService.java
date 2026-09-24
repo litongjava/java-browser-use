@@ -29,6 +29,8 @@ import nexus.io.ai.browser.consts.BrowserUserAgent;
 import nexus.io.ai.browser.dom.model.DOMElementNode;
 import nexus.io.ai.browser.dom.model.DOMState;
 import nexus.io.ai.browser.dom.service.DomService;
+import nexus.io.ai.browser.handler.CommandTraceLog;
+import nexus.io.ai.browser.upload.UploadStore;
 import com.microsoft.playwright.Browser;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType;
@@ -120,8 +122,43 @@ public class PlaywrightService {
   /** 按索引操作元素时的等待上限(毫秒):元素已失效时尽快失败,不要挂满 30 秒 */
   private static final double INDEX_ACTION_TIMEOUT_MS = 5_000;
 
+  /** get_browser_state 内联元素清单的默认上限(条):够覆盖绝大多数页面,又不至于把回执撑爆 */
+  private static final int DEFAULT_MAX_INLINE_ELEMENTS = 200;
+
+  /** 自动截图开关:关掉后动作照常执行,只是不再每次落图 */
+  public static final String KEY_CAPTURE_ENABLED = "browser.capture.enabled";
+
+  /** 动作类命令的超时(毫秒),可用配置项覆盖 */
+  public static final String KEY_ACTION_TIMEOUT = "browser.action.timeoutMs";
+
+  /** 原生点击超时后是否自动改用 JS 派发事件,默认开 */
+  public static final String KEY_JS_FALLBACK = "browser.action.jsFallback";
+
+  /**
+   * 原生点击失败后是否自动改用「真实鼠标点击」(取元素盒子中心派发浏览器真实事件),默认开
+   *
+   * <p>
+   * 它排在 JS 派发**之前**:实测 ant-design 的 {@code Modal.confirm} 确定按钮、对话框右上角 ×
+   * 对 JS 派发完全无响应(点了没反应、弹窗不关,反复点还会把确认框一层层叠起来),只有真实鼠标事件才认。
+   */
+  public static final String KEY_MOUSE_FALLBACK = "browser.action.mouseFallback";
+
+  /** execute_js 的脚本目录(bodyFile 只允许读这个目录下的文件) */
+  public static final String KEY_JS_DIR = "browser.js.dir";
+
+  /** JS 设值模式返回给调用方的提醒:它只改 DOM,不保证进入框架(React/Vue)的模型 */
+  private static final String JS_MODE_NOTE = "js 模式只改了 DOM 的值并派发了 input/change 事件,"
+      + "不保证进入框架(React/Vue)的模型:提交或预览时可能仍然是空的。"
+      + "能看见的元素请用 mode=native(默认的 auto 也会优先用真实输入)";
+
   /** 等待类接口的默认超时(毫秒) */
   private static final double DEFAULT_WAIT_TIMEOUT_MS = 30_000;
+
+  /** 启动浏览器的超时(毫秒),可用配置项覆盖;Playwright 自己默认 180 秒,这里收到 60 秒以便尽快报错 */
+  public static final String KEY_LAUNCH_TIMEOUT = "browser.launch.timeoutMs";
+
+  /** 启动超时默认值(毫秒):正常启动只要几秒,60 秒足够覆盖冷启动与杀毒软件扫描 */
+  private static final double DEFAULT_LAUNCH_TIMEOUT_MS = 60_000;
 
   /**
    * 是否开启 Chromium 沙箱
@@ -709,7 +746,128 @@ public class PlaywrightService {
     if (browser.profileNote != null) {
       info.set("note", browser.profileNote);
     }
+    // 这次任务的调用追踪日志落在哪、暂存上传目录在哪:客户端-服务器模式下用户要知道去哪清理敏感数据
+    info.set("trace", Kv.by("dir", CommandTraceLog.currentDir().toString())
+        .set("enabled", Boolean.parseBoolean(String.valueOf(
+            ChromeBrowser.config(CommandTraceLog.KEY_ENABLED) == null ? "true"
+                : ChromeBrowser.config(CommandTraceLog.KEY_ENABLED))))
+        .set("redact", CommandTraceLog.redactEnabled()));
+    info.set("upload", Kv.by("dir", UploadStore.dir().toString()).set("enabled", UploadStore.enabled())
+        .set("maxBytes", UploadStore.maxBytes()));
     return info;
+  }
+
+  /**
+   * 当前活着的任务一览
+   *
+   * <p>
+   * 以前「现在有哪些任务、各自停在哪一页、浏览器是不是还活着」只能靠翻日志猜。这个接口把
+   * 进程内的实况直接列出来:每个任务一行(URL、标题、页签数、截图序号、在途请求),外加共享浏览器的
+   * 类型与 profile 目录 —— 排查「孤儿浏览器占着 profile」「任务是不是没关干净」时先看它。
+   */
+  public RespBodyVo listTasks() {
+    List<Kv> tasks = new ArrayList<>();
+    for (BrowserInstance inst : INSTANCES.values()) {
+      tasks.add(taskInfo(inst));
+    }
+    Kv data = Kv.by("count", tasks.size()).set("tasks", tasks);
+    SharedBrowser browser = sharedBrowser;
+    if (browser != null) {
+      data.set("browser", Kv.by("type", browser.resolvedType.id()).set("engine", browser.engine.id())
+          .set("profileDir", browser.profileDir.toAbsolutePath().toString()).set("headless", browser.headless)
+          .set("mode", browser.browser != null ? "cdp" : "managed"));
+    } else {
+      data.set("browser", null);
+    }
+    return RespBodyVo.ok(data);
+  }
+
+  private static Kv taskInfo(BrowserInstance inst) {
+    Kv info = Kv.by("id", inst.id)
+        .set("profileDir", inst.profileDir == null ? null : inst.profileDir.toAbsolutePath().toString())
+        .set("tabCount", pagesOf(inst).size()).set("captureSeq", inst.captureSeq.get())
+        .set("inflight", inst.inflight.get()).set("recorderAttachedAt", inst.recorderAttachedAt);
+    try {
+      info.set("url", inst.page.url()).set("title", safeTitle(inst.page));
+    } catch (PlaywrightException e) {
+      info.set("pageError", briefMessage(e.getMessage()));
+    }
+    return info;
+  }
+
+  /**
+   * 服务端运行时配置一览
+   *
+   * <p>
+   * 「为什么这次不是我要的浏览器」「脚本目录在哪」「降级开关开着没」「日志落在哪」这类问题,
+   * 以前只能靠翻配置文件加猜。这个接口把生效值一次列全:引擎/类型、解析后的 profile 目录、
+   * 动作超时、两个降级开关、脚本目录、追踪与上传目录、以及当前任务数。
+   *
+   * @param browserId 可选:传了就顺带带上这个任务实际用的浏览器信息(与 start 回执里的 data.browser 同源)
+   */
+  public RespBodyVo getConfig(Long browserId) {
+    Kv data = new Kv();
+    data.set("workDir", Paths.get("").toAbsolutePath().normalize().toString());
+    data.set("jsDir", scriptDir().toString());
+    // 引擎与类型:engine 只分 chromium/firefox 两档,type 才是 auto/chromium/chrome/edge/firefox
+    data.set("engine", BrowserEngine.current().id());
+    data.set("configuredType", BrowserChoice.configured().id());
+    data.set("typeChoices", BrowserChoice.CHOICES);
+    data.set("profileDir", Kv.by("resolved", ChromeBrowser.managedProfileDir().toString())
+        .set("perPort", ChromeBrowser.perPortProfileDir())
+        .set("configured", ChromeBrowser.config(ChromeBrowser.KEY_PROFILE_DIR))
+        .set("note", "没显式配 browser.profileDir 且 perPort 开着时,目录按服务端口派生(shared-<端口>),"
+            + "多个服务实例同时跑不会抢同一份 profile 锁"));
+    data.set("action", Kv.by("timeoutMs", actionTimeoutMs()).set("jsFallback", jsFallbackEnabled())
+        .set("mouseFallback", mouseFallbackEnabled()));
+    data.set("launchTimeoutMs", launchTimeoutMs());
+    data.set("trace", Kv.by("dir", CommandTraceLog.currentDir().toString())
+        .set("enabled", Boolean.parseBoolean(String.valueOf(ChromeBrowser.config(CommandTraceLog.KEY_ENABLED) == null
+            ? "true" : ChromeBrowser.config(CommandTraceLog.KEY_ENABLED))))
+        .set("redact", CommandTraceLog.redactEnabled()));
+    data.set("upload", Kv.by("dir", UploadStore.dir().toString()).set("enabled", UploadStore.enabled())
+        .set("maxBytes", UploadStore.maxBytes()));
+    data.set("tasks", INSTANCES.size());
+    data.set("commands", CommandTableNamesHolder.names());
+    data.set("java", System.getProperty("java.version"));
+    Package playwrightPackage = Playwright.class.getPackage();
+    data.set("playwright", playwrightPackage == null ? null : playwrightPackage.getImplementationVersion());
+    if (browserId != null) {
+      data.set("browser", browserInfo(browserId));
+    }
+    return RespBodyVo.ok(data);
+  }
+
+  /** 命令名清单(避免 service 直接依赖 CommandTable 造成的循环引用歧义) */
+  private static final class CommandTableNamesHolder {
+    private static java.util.Set<String> names() {
+      return nexus.io.ai.browser.actions.registry.CommandTable.names();
+    }
+
+    private CommandTableNamesHolder() {
+    }
+  }
+
+  /**
+   * 主动关停:把所有任务与共享浏览器关掉
+   *
+   * <p>
+   * 与直接杀进程的区别:这里会先关任务页签、再关共享浏览器、最后关 Playwright driver,浏览器进程
+   * 能正常退出,不会留下占着 profile 目录的孤儿;也不会留下 {@code .startup-incomplete} 标记。
+   * 服务进程本身不退出(HTTP 还能应答),要退出进程请用操作系统的停机方式。
+   */
+  public RespBodyVo shutdown() {
+    List<Long> closed = new ArrayList<>();
+    for (Long id : new ArrayList<>(INSTANCES.keySet())) {
+      try {
+        close(id);
+        closed.add(id);
+      } catch (RuntimeException e) {
+        log.warn("关停任务 {} 失败:{}", id, briefMessage(e.getMessage()));
+      }
+    }
+    closeSharedBrowser();
+    return RespBodyVo.ok(Kv.by("closedTasks", closed).set("remainingTasks", INSTANCES.size()));
   }
 
   /**
@@ -723,6 +881,7 @@ public class PlaywrightService {
   private static LaunchPersistentContextOptions buildOptions(boolean headless, Path executable, boolean userProfile,
       BrowserChoice type) {
     LaunchPersistentContextOptions opts = new BrowserType.LaunchPersistentContextOptions().setHeadless(headless);
+    opts.setTimeout(launchTimeoutMs());
 
     opts.setIgnoreDefaultArgs(Lists.of("--enable-automation"));
 
@@ -801,6 +960,7 @@ public class PlaywrightService {
    */
   private static LaunchPersistentContextOptions buildFirefoxOptions(boolean headless, Path executable) {
     LaunchPersistentContextOptions opts = new BrowserType.LaunchPersistentContextOptions().setHeadless(headless);
+    opts.setTimeout(launchTimeoutMs());
 
     Dimension window = windowSize();
     opts.setArgs(BrowserEngine.firefoxExtraArgs());
@@ -886,13 +1046,103 @@ public class PlaywrightService {
    */
   private static BrowserContext launchContext(Path profileDir, LaunchPersistentContextOptions opts,
       BrowserEngine engine) {
+    releaseStaleProfileLock(profileDir);
     try {
       return playwrightType(engine).launchPersistentContext(profileDir, opts);
     } catch (RuntimeException first) {
       log.warn("启动浏览器失败,重建共享 Playwright 后重试一次:{}", first.getMessage());
       discardPlaywright();
-      return playwrightType(engine).launchPersistentContext(profileDir, opts);
+      releaseStaleProfileLock(profileDir);
+      try {
+        return playwrightType(engine).launchPersistentContext(profileDir, opts);
+      } catch (RuntimeException second) {
+        throw new IllegalStateException(launchFailureMessage(profileDir, engine, second), second);
+      }
     }
+  }
+
+  /**
+   * 清掉上一次「服务被强杀」留下的 profile 痕迹
+   *
+   * <p>
+   * 实测坑:直接 kill 掉服务进程**不会**关掉它启动的浏览器(浏览器是独立进程,driver 死了它就变成孤儿),
+   * 孤儿浏览器会一直占着 profile 目录。下次服务启动时,Firefox 的表现是<b>既不连管道也不退出</b>,
+   * {@code start} 一直卡到启动超时 —— 排查时完全看不出是「上次没退干净」。
+   *
+   * <p>
+   * 要清的是两个文件:
+   * <ul>
+   * <li>{@code parent.lock}:Firefox / Chromium 的「这个 profile 正在被使用」标记;</li>
+   * <li>{@code .startup-incomplete}:Firefox 在启动开始时写下、启动完成时删掉。上一次启动没走完
+   * (进程被强杀)它就留在那里,下一次启动会走「上次崩过」那条路,同样卡住。</li>
+   * </ul>
+   *
+   * <p>
+   * 判断「有没有活着的实例」只在 Windows 上做:Windows 不允许删除带字节范围锁的文件,所以
+   * <b>parent.lock 删得掉就证明没有活着的持有者</b>(删不掉说明真有一个实例在用,那就什么都不动)。
+   * POSIX 没有这个保证(删除成功也不代表没人在用),贸然删锁会让两个实例共用一个 profile 而损坏数据,
+   * 所以非 Windows 一律不动。
+   */
+  private static void releaseStaleProfileLock(Path profileDir) {
+    if (profileDir == null || !System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win")) {
+      return;
+    }
+    Path lock = profileDir.resolve("parent.lock");
+    Path startupMarker = profileDir.resolve(".startup-incomplete");
+    if (Files.exists(lock)) {
+      try {
+        Files.delete(lock);
+        log.info("清掉残留的 profile 锁(上一次服务被强杀后遗留):{}", lock);
+      } catch (IOException e) {
+        // 删不掉 = 真有一个活着的浏览器实例在用它,保持原样
+        log.debug("profile 锁还在被占用,保留:{}", lock);
+        return;
+      }
+    }
+    if (Files.exists(startupMarker)) {
+      try {
+        Files.delete(startupMarker);
+        log.info("清掉上一次没走完启动留下的标记(不清它,Firefox 下次启动会卡住):{}", startupMarker);
+      } catch (IOException e) {
+        log.debug("启动标记删不掉,保留:{}", startupMarker);
+      }
+    }
+  }
+
+  /**
+   * 启动浏览器的超时(毫秒)
+   *
+   * <p>
+   * Playwright 默认给 180 秒,而正常启动只要几秒。实测「profile 被残留进程占住」时它会**一直卡到超时**,
+   * 180 秒的等待让排查变成「等三分钟才看到一句话」,所以默认收到 60 秒;慢机器上可以用
+   * {@code browser.launch.timeoutMs} 调大。
+   */
+  private static double launchTimeoutMs() {
+    String configured = ChromeBrowser.config(KEY_LAUNCH_TIMEOUT);
+    if (configured != null) {
+      try {
+        double parsed = Double.parseDouble(configured.trim());
+        if (parsed > 0) {
+          return parsed;
+        }
+      } catch (NumberFormatException e) {
+        log.warn("{} 不是合法数字,按默认值处理:{}", KEY_LAUNCH_TIMEOUT, configured);
+      }
+    }
+    return DEFAULT_LAUNCH_TIMEOUT_MS;
+  }
+
+  /** 启动失败时把「最可能的原因」写进错误里,免得只看到一句 Timeout 180000ms exceeded */  private static String launchFailureMessage(Path profileDir, BrowserEngine engine, RuntimeException cause) {
+    String message = cause.getMessage() == null ? cause.toString() : cause.getMessage();
+    StringBuilder text = new StringBuilder("启动浏览器失败(").append(engine.id()).append(",profile=")
+        .append(profileDir).append("):").append(message.replaceAll("\\s+", " ").trim());
+    if (message.contains("Timeout")) {
+      text.append("。常见原因:上一次服务是被强制结束的,它启动的浏览器进程还活着并占着这个 profile 目录")
+          .append("(profile 里的 parent.lock)。先结束残留的浏览器进程")
+          .append(engine.isFirefox() ? "(firefox.exe)" : "(chrome.exe / msedge.exe)")
+          .append(",或换一个 browser.profileDir 再重试。");
+    }
+    return text.toString();
   }
 
   /** 引擎 → Playwright 的浏览器类型({@code playwright().chromium()} / {@code playwright().firefox()}) */
@@ -1095,24 +1345,63 @@ public class PlaywrightService {
    * {@code get_requests}。
    */
   private void attachRequestRecorder(BrowserInstance inst, Page page) {
-    page.onRequest(request -> {
+    inst.recorderAttachedAt = System.currentTimeMillis();
+    page.onRequest(request -> safely("onRequest", () -> {
       Kv entry = requestInfo(request);
       addBoundedRequest(inst.requests, entry);
-      inst.requestIndex.put(request, entry);
-    });
-    page.onResponse(response -> {
-      Kv entry = inst.requestIndex.remove(response.request());
+      if (request != null) {
+        inst.requestIndex.put(request, entry);
+        inst.inflight.incrementAndGet();
+      }
+    }));
+    page.onResponse(response -> safely("onResponse", () -> {
+      Request request = response == null ? null : response.request();
+      Kv entry = request == null ? null : inst.requestIndex.remove(request);
       if (entry != null) {
         entry.set("status", response.status()).set("respondedAt", System.currentTimeMillis());
+        // 只对「自己记过的请求」减计数,保证与 onRequest 的加计数一一对应,不会减成负数
+        inst.inflight.decrementAndGet();
       }
-      rememberResponse(inst, response, entry == null ? requestInfo(response.request()) : entry);
-    });
-    page.onRequestFailed(request -> {
+      if (response != null) {
+        rememberResponse(inst, response, entry == null ? requestInfo(request) : entry);
+      }
+    }));
+    page.onRequestFailed(request -> safely("onRequestFailed", () -> {
+      if (request == null) {
+        return;
+      }
       Kv entry = inst.requestIndex.remove(request);
-      if (entry != null)
+      if (entry != null) {
         entry.set("failure", request.failure()).set("finishedAt", System.currentTimeMillis());
-    });
+        inst.inflight.decrementAndGet();
+      }
+    }));
   }
+
+  /**
+   * 观测类钩子的安全边界:异常只记日志,绝不外抛
+   *
+   * <p>
+   * 监听器里抛出的异常会被 Playwright 带到**后续 API 调用**上重新抛出,表现成「脚本明明已经跑完了,
+   * 命令却报失败、返回值还丢了」(实测踩过:一条 20 秒的 execute_js 结果全丢,白重跑一遍流程)。
+   * 记录/观测永远不该决定命令成败,所以这里一律兜住。
+   */
+  private static void safely(String hook, Runnable body) {
+    try {
+      body.run();
+    } catch (Throwable t) {
+      String message = briefMessage(String.valueOf(t.getMessage()));
+      String key = hook + "|" + message;
+      if (WARNED.size() < 200 && WARNED.add(key)) {
+        log.warn("网络记录钩子 {} 异常,已忽略(不影响命令结果):{}", hook, message);
+      } else {
+        log.debug("网络记录钩子 {} 异常,已忽略:{}", hook, message);
+      }
+    }
+  }
+
+  /** 同一类钩子异常只告警一次,避免每来一个请求刷一行日志 */
+  private static final Set<String> WARNED = ConcurrentHashMap.newKeySet();
 
   /**
    * 把任务已经注册过的路由规则补挂到新页签上
@@ -1144,8 +1433,18 @@ public class PlaywrightService {
 
   private static Kv requestInfo(Request request) {
     Kv entry = Kv.by("requestId", String.valueOf(SnowflakeIdUtils.id())).set("requestedAt", System.currentTimeMillis())
-        .set("method", request.method()).set("url", request.url()).set("resourceType", request.resourceType())
         .set("status", null);
+    if (request == null) {
+      // 请求对象可能已被回收(响应回调里 response.request() 返回 null 就是这种情况),
+      // 这里必须空指针安全:以前直接 request.method() 会抛出去,把整条命令判成失败
+      return entry.set("method", null).set("url", null).set("resourceType", null).set("requestUnavailable", true);
+    }
+    try {
+      entry.set("method", request.method()).set("url", request.url()).set("resourceType", request.resourceType());
+    } catch (PlaywrightException e) {
+      entry.set("requestInfoError", briefMessage(e.getMessage()));
+      return entry;
+    }
     String body = safePostData(request);
     if (body != null)
       entry.set("postData", truncate(body, MAX_RECORDED_BODY_CHARS)).set("postDataLength", body.length())
@@ -1229,6 +1528,20 @@ public class PlaywrightService {
    * @param viewportExpansion 视口外扩像素,默认 0
    */
   public RespBodyVo getBrowserState(Long browserId, Boolean highlight, Integer viewportExpansion) {
+    return getBrowserState(browserId, highlight, viewportExpansion, null, null);
+  }
+
+  /**
+   * 同上,额外控制「可交互元素清单」的返回
+   *
+   * @param includeElements 是否在回执里内联 {@code data.elements}(索引 + 标签 + 文本 + 是否可见 +
+   *                        盒子),默认 true。索引型命令要用的 index 就在这里,内联之后不必再单独调一次
+   *                        {@code get_interactive_map}
+   * @param maxElements     内联条数上限,默认 200(超出时回执带 {@code elementsTruncated=true},
+   *                        完整清单仍可用 {@code get_interactive_map} 取)
+   */
+  public RespBodyVo getBrowserState(Long browserId, Boolean highlight, Integer viewportExpansion,
+      Boolean includeElements, Integer maxElements) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -1258,6 +1571,18 @@ public class PlaywrightService {
     kv.set("page_height", state.getPageHeight());
     // 供 diff_dom_text 比较"这一次快照和上一次差在哪"
     inst.lastDomText = text;
+
+    // 索引清单:text 是给人读的树,index 才是按索引命令要用的东西,直接内联免得再跑一趟
+    if (includeElements == null || includeElements) {
+      int cap = maxElements == null || maxElements <= 0 ? DEFAULT_MAX_INLINE_ELEMENTS : maxElements;
+      List<Kv> all = interactiveElements(inst);
+      List<Kv> inline = all.size() > cap ? new ArrayList<>(all.subList(0, cap)) : all;
+      // elementsTruncated 无论是否截断都要给:调用方靠它判断「清单是不是全的」,缺字段会让人以为没截断
+      kv.set("elements", inline).set("elementCount", all.size()).set("elementsTruncated", all.size() > cap);
+      if (all.size() > cap) {
+        kv.set("elementsHint", "元素清单已截断到 " + cap + " 条,完整清单用 get_interactive_map");
+      }
+    }
 
     // 截图 + 同名的可交互结构化文本
     Kv capture = capture(inst);
@@ -1363,6 +1688,12 @@ public class PlaywrightService {
     Kv kv = Kv.by("seq", seq);
     Path dir = dataDir(inst.id);
     Path png = dir.resolve(seq + ".png");
+    // 截图策略:每次页面变化都自动截一张,长时间跑下来 data/ 会涨得很快。关掉之后动作照常执行,
+    // 只是不再落图(需要时仍可显式调 screenshot 命令,那条不受这个开关影响)
+    if (!captureEnabled()) {
+      kv.set("screenshot_skipped", "browser.capture.enabled=false");
+      return kv;
+    }
     try {
       Files.createDirectories(dir);
       settle(inst);
@@ -1377,6 +1708,125 @@ public class PlaywrightService {
       log.warn("任务 {} 第 {} 张截图写文件失败:{}", inst.id, seq, e.getMessage());
     }
     return kv;
+  }
+
+  /** 自动截图开关({@code browser.capture.enabled},默认开) */
+  public static boolean captureEnabled() {
+    String configured = ChromeBrowser.config(KEY_CAPTURE_ENABLED);
+    return configured == null || Boolean.parseBoolean(configured.trim());
+  }
+
+  /**
+   * 清理落盘产物:按保留时长/数量删掉截图、结构化文本、追踪日志与暂存文件
+   *
+   * <p>
+   * <b>为什么要有它</b>:一次商标申请的操作就能攒下上百个追踪文件与几十张截图,长期跑下来磁盘只会
+   * 单向增长。这里给出一个**显式**的清理入口(不做后台定时清理:删文件这种事不该在调用方不知情的
+   * 情况下发生),支持两种口径:{@code olderThanHours}(默认 24 小时)与 {@code keepLatest}(每个任务
+   * 目录至少保留最近几张)。
+   *
+   * @param scope {@code all}(默认)/ {@code data} / {@code trace} / {@code upload}
+   * @param dryRun  默认 {@code true}:只统计不删。要真删必须显式传 {@code dryRun:false}
+   * @return 删了多少文件、释放了多少字节,以及被跳过的原因
+   */
+  public RespBodyVo cleanup(String scope, Integer olderThanHours, Integer keepLatest, Boolean dryRun) {
+    String target = scope == null || scope.isBlank() ? "all" : scope.trim().toLowerCase(java.util.Locale.ROOT);
+    long cutoff = System.currentTimeMillis()
+        - (olderThanHours == null ? 24L : Math.max(0, olderThanHours)) * 3600_000L;
+    int keep = keepLatest == null ? 0 : Math.max(0, keepLatest);
+    // 删文件是不可逆的:默认只预演,要真删必须显式关掉
+    boolean preview = dryRun == null || dryRun;
+    Kv report = new Kv();
+    long[] totals = new long[] {0, 0};
+    List<String> notes = new ArrayList<>();
+    if ("all".equals(target) || "data".equals(target)) {
+      Path data = Paths.get(DATA_DIR).toAbsolutePath().normalize();
+      report.set("data", sweep(data, cutoff, keep, preview, totals, notes));
+    }
+    if ("all".equals(target) || "trace".equals(target)) {
+      report.set("trace", sweep(CommandTraceLog.currentDir(), cutoff, keep, preview, totals, notes));
+    }
+    if ("all".equals(target) || "upload".equals(target)) {
+      // 暂存文件是「等会儿要交给页面」的,按时间清会把正在用的文件删掉,所以只在显式点名 upload 时才动
+      if ("upload".equals(target)) {
+        report.set("upload", sweep(UploadStore.dir(), cutoff, keep, preview, totals, notes));
+      } else {
+        notes.add("upload 目录没动:暂存文件可能正在被某个任务使用,要清请显式指定 scope:\"upload\"");
+      }
+    }
+    report.set("scope", target).set("olderThanHours", olderThanHours == null ? 24 : olderThanHours)
+        .set("keepLatest", keep).set("dryRun", preview).set("deletedFiles", totals[0])
+        .set("freedBytes", totals[1]);
+    if (!notes.isEmpty()) {
+      report.set("notes", notes);
+    }
+    return RespBodyVo.ok(report);
+  }
+
+  /** 扫一个目录(递归),删掉超时且不在「最近 keep 个」里的文件 */
+  private static Kv sweep(Path root, long cutoff, int keep, boolean dryRun, long[] totals, List<String> notes) {
+    Kv result = new Kv().set("dir", root.toString());
+    if (root == null || !Files.isDirectory(root)) {
+      result.set("skipped", "目录不存在");
+      return result;
+    }
+    List<Path> files = new ArrayList<>();
+    try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+      walk.filter(Files::isRegularFile).forEach(files::add);
+    } catch (IOException e) {
+      result.set("error", briefMessage(e.getMessage()));
+      return result;
+    }
+    // 每个目录内按修改时间从新到旧排序,前 keep 个一律保留
+    Map<Path, List<Path>> byDir = new java.util.LinkedHashMap<>();
+    for (Path file : files) {
+      byDir.computeIfAbsent(file.getParent(), key -> new ArrayList<>()).add(file);
+    }
+    int deleted = 0;
+    long bytes = 0;
+    for (Map.Entry<Path, List<Path>> entry : byDir.entrySet()) {
+      List<Path> group = entry.getValue();
+      group.sort(java.util.Comparator.comparingLong((Path path) -> modifiedAt(path)).reversed());
+      for (int i = 0; i < group.size(); i++) {
+        Path file = group.get(i);
+        if (i < keep || modifiedAt(file) >= cutoff) {
+          continue;
+        }
+        long size = sizeOf(file);
+        if (dryRun) {
+          deleted++;
+          bytes += size;
+          continue;
+        }
+        try {
+          Files.deleteIfExists(file);
+          deleted++;
+          bytes += size;
+        } catch (IOException e) {
+          notes.add("删不掉:" + file + "(" + briefMessage(e.getMessage()) + ")");
+        }
+      }
+    }
+    totals[0] += deleted;
+    totals[1] += bytes;
+    result.set("deletedFiles", deleted).set("freedBytes", bytes).set("scannedFiles", files.size());
+    return result;
+  }
+
+  private static long modifiedAt(Path path) {
+    try {
+      return Files.getLastModifiedTime(path).toMillis();
+    } catch (IOException e) {
+      return 0;
+    }
+  }
+
+  private static long sizeOf(Path path) {
+    try {
+      return Files.size(path);
+    } catch (IOException e) {
+      return 0;
+    }
   }
 
   /** 截图前等页面稳定:页面已经加载完时立即返回,没加载完最多等 CAPTURE_SETTLE_TIMEOUT_MS */
@@ -1500,11 +1950,29 @@ public class PlaywrightService {
 
   private RespBodyVo clickLike(Long browserId, int index, String action, Consumer<Locator> consumer,
       boolean withReceipt) {
+    return clickLike(browserId, index, action, consumer, withReceipt, null);
+  }
+
+  /**
+   * 按索引点击类动作的统一入口
+   *
+   * <p>
+   * {@code mode} 非空时走「原生 → JS 派发」的降级链(见 {@link #clickWithMode}),并把这次实际用的方式
+   * 写进回执的 {@code data.mode};不传 mode 时保持原来的行为(只有原生点击)。
+   */
+  private RespBodyVo clickLike(Long browserId, int index, String action, Consumer<Locator> consumer,
+      boolean withReceipt, String mode) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
-    return indexAction(inst, index, action, null, consumer, withReceipt);
+    if (mode == null) {
+      return indexAction(inst, index, action, null, consumer, withReceipt);
+    }
+    ActionOutcome outcome = new ActionOutcome();
+    return indexAction(inst, index, action, null,
+        (locator) -> clickWithMode(locator, mode, outcome, () -> consumer.accept(locator)), withReceipt,
+        outcome.extra);
   }
 
   /** 按索引读取一个值,返回 data.<key> */
@@ -1570,11 +2038,408 @@ public class PlaywrightService {
 
   private static void fillEditable(Locator locator, String value) {
     requireEditable(locator);
-    locator.fill(value, new Locator.FillOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+    locator.fill(value, new Locator.FillOptions().setTimeout(actionTimeoutMs()));
+  }
+
+  /**
+   * 动作类命令的超时(毫秒)
+   *
+   * <p>默认 5 秒,按索引操作元素时「元素已失效就尽快失败」；但有的站点(实测 ant-design 的
+   * SPA)可操作性检查本身就要好几秒,5 秒会把本来能成的点击判死。用
+   * {@code browser.action.timeoutMs} 调大,或按次传 {@code timeoutMs}。
+   */
+  private static double actionTimeoutMs() {
+    String configured = ChromeBrowser.config(KEY_ACTION_TIMEOUT);
+    if (configured == null) {
+      return INDEX_ACTION_TIMEOUT_MS;
+    }
+    try {
+      double parsed = Double.parseDouble(configured.trim());
+      return parsed > 0 ? parsed : INDEX_ACTION_TIMEOUT_MS;
+    } catch (NumberFormatException e) {
+      return INDEX_ACTION_TIMEOUT_MS;
+    }
+  }
+
+  /** 按次覆盖的超时:没传就用全局配置 */
+  private static double actionTimeoutMs(Integer timeoutMs) {
+    return timeoutMs == null || timeoutMs <= 0 ? actionTimeoutMs() : timeoutMs;
+  }
+
+  /** 原生点击超时后是否自动降级为 JS 派发事件 */
+  private static boolean jsFallbackEnabled() {
+    String configured = ChromeBrowser.config(KEY_JS_FALLBACK);
+    return configured == null || Boolean.parseBoolean(configured);
+  }
+
+  /** 原生点击失败后是否自动改用真实鼠标点击(排在 JS 派发之前) */
+  private static boolean mouseFallbackEnabled() {
+    String configured = ChromeBrowser.config(KEY_MOUSE_FALLBACK);
+    return configured == null || Boolean.parseBoolean(configured);
   }
 
   private static Locator.ClickOptions clickOptions() {
-    return new Locator.ClickOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS);
+    return new Locator.ClickOptions().setTimeout(actionTimeoutMs());
+  }
+
+  private static Locator.ClickOptions clickOptions(Integer timeoutMs) {
+    return new Locator.ClickOptions().setTimeout(actionTimeoutMs(timeoutMs));
+  }
+
+  // ==================== 点击方式:原生 / JS 派发 / 自动降级 ====================
+
+  /**
+   * 用 JS 派发完整鼠标事件序列点击
+   *
+   * <p>
+   * 有的站点(ant-design 的 Vue SPA 最典型)上 Playwright 的可操作性检查会一直不满足:元素明明在
+   * 那里、点上去也该有反应,接口却等满超时返回「等待元素可操作超时」。这时唯一稳的办法就是在页面里
+   * 直接派发事件——这也是这类站点上人手排障时最先试的一招。这里把它做成命令的一等选项,免得每个
+   * 调用方都自己写一遍 {@code execute_js}。
+   *
+   * <p>
+   * 顺带处理两种特例:复选框/单选框在事件派发后若 {@code checked} 没变,显式改一次并补
+   * {@code input}/{@code change};元素先滚进视口,免得点到视口外的坐标。
+   */
+  private static final String JS_CLICK = """
+      (el) => {
+        if (!el) return 'no-element';
+        try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {}
+        const rect = el.getBoundingClientRect();
+        const at = {clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2};
+        const base = {bubbles: true, cancelable: true, view: window, ...at};
+        const wasChecked = el.checked;
+        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+          const Ctor = (type.startsWith('pointer') && window.PointerEvent) ? window.PointerEvent : MouseEvent;
+          el.dispatchEvent(new Ctor(type, base));
+        }
+        if ((el.type === 'checkbox' || el.type === 'radio') && el.checked === wasChecked) {
+          el.checked = !wasChecked;
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+        return el.tagName;
+      }
+      """;
+
+  /** JS 设值:走原生 setter 再派发 input/change,对「元素不可见但必须填」的字段是唯一办法 */
+  private static final String JS_SET_VALUE = """
+      (el, value) => {
+        if (!el) return 'no-element';
+        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+            : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (descriptor && descriptor.set) { descriptor.set.call(el, value); } else { el.value = value; }
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        return el.value;
+      }
+      """;
+
+  /**
+   * 一次动作实际用的方式
+   *
+   * <p>
+   * 回执要如实说明「这次是原生点击还是 JS 降级」,而回执是在动作**之后**才组装的:所以这里持有一个
+   * Kv,动作过程中往里写,回执组装时读到的就是最终值(直接传一个「当时算好的 Kv」会被 Java 的
+   * 立即求值坑到——拿到的是动作前的默认值)。
+   */
+  private static final class ActionOutcome {
+    final Kv extra = new Kv();
+    String mode = "native";
+    String fallbackReason;
+    String timeoutHint;
+
+    /** 把当前状态写进与回执共享的 Kv */
+    void record() {
+      extra.set("mode", mode);
+      if (fallbackReason != null) {
+        extra.set("fallbackReason", fallbackReason).set("fallbackFrom", "native");
+        if ("js".equals(mode)) {
+          extra.set("note", "原生点击没成功(通常是元素可操作性检查不满足),已降级为 JS 派发事件。"
+              + "注意:**JS 派发不保证生效**——实测部分站点(ant-design 的 Modal.confirm 确定按钮、"
+              + "对话框右上角关闭按钮)只认真实鼠标事件,遇到「点了没反应」请用 mode:\"mouse\" 重试");
+        } else {
+          extra.set("note", "原生点击没成功(可操作性检查不满足),已改用真实鼠标点击"
+              + "(跳过检查,但事件仍是浏览器真实事件);这类站点上这是正常现象,不是配置错了");
+        }
+      }
+      if (timeoutHint != null) {
+        extra.set("hint", timeoutHint);
+      }
+    }
+  }
+
+  /**
+   * 按方式执行一次点击类动作
+   *
+   * <p>
+   * {@code auto}(默认)的降级链是 **原生点击 → 真实鼠标 → JS 派发**,三档各有各的适用面:
+   *
+   * <ol>
+   * <li><b>原生</b>({@code locator.click})带可操作性检查:可见、稳定、不被遮挡、能接收事件,
+   * 检查不满足就等满超时;</li>
+   * <li><b>真实鼠标</b>({@code page.mouse.click} 打在元素盒子中心)跳过这些检查,但派发出的仍是
+   * **浏览器真实事件**——实测 ant-design 的 {@code Modal.confirm} 确定按钮、对话框右上角 ×
+   * 只认这一种,JS 派发完全无效(点了没反应、弹窗不关,反复点还会把确认框一层层叠起来);</li>
+   * <li><b>JS 派发</b>是最后手段,对「必须走框架/真实事件」的按钮**可能完全无效**,所以回执只声明
+   * 「已执行」,不再谎称「已成功」。</li>
+   * </ol>
+   *
+   * <p>
+   * 另外,点击**之前**先做一次命中测试:目标中心点上命中的若是别的元素(常见:用户服务协议层
+   * {@code .agreement-container}、弹窗遮罩),就写进回执的 {@code coveredBy}——这是「点了没反应」
+   * 最常见的原因,以前只能靠人肉发现。
+   *
+   * @param mode {@code auto}(默认:原生失败依次降级)、{@code native}(只用原生)、
+   *             {@code mouse}(只用真实鼠标)、{@code js}(只用 JS 派发)
+   */
+  private static void clickWithMode(Locator locator, String mode, ActionOutcome outcome, Runnable nativeAction) {
+    String resolved = normalizeMode(mode);
+    boolean covered = recordBlocker(locator, outcome);
+    if ("js".equals(resolved)) {
+      jsClick(locator);
+      outcome.mode = "js";
+      outcome.record();
+      return;
+    }
+    if ("mouse".equals(resolved)) {
+      if (!mouseClick(locator)) {
+        throw new PlaywrightException("mouse 模式失败:拿不到元素盒子(元素可能不可见或已从页面移除)");
+      }
+      outcome.mode = "mouse";
+      outcome.record();
+      return;
+    }
+    try {
+      nativeAction.run();
+      outcome.mode = "native";
+    } catch (PlaywrightException nativeFailure) {
+      if (!"auto".equals(resolved)) {
+        throw nativeFailure;
+      }
+      outcome.fallbackReason = briefMessage(nativeFailure.getMessage());
+      if (covered) {
+        // 目标被盖住时**刻意不用真实鼠标**:鼠标点的是那个坐标,落在遮挡物上,会把遮挡物按下去
+        // (实测最坑的一种「点错了」)。JS 派发虽然可能被框架忽略,但事件至少是给目标的。
+        outcome.extra.set("mouseSkipped", "target-covered");
+        if (jsFallbackEnabled()) {
+          jsClick(locator);
+          outcome.mode = "js";
+        } else {
+          throw nativeFailure;
+        }
+      } else if (mouseFallbackEnabled() && mouseClick(locator)) {
+        outcome.mode = "mouse";
+      } else if (jsFallbackEnabled()) {
+        jsClick(locator);
+        outcome.mode = "js";
+      } else {
+        throw nativeFailure;
+      }
+    }
+    outcome.record();
+  }
+
+  /**
+   * 真实鼠标点击:元素滚进视口后,取盒子中心派发浏览器真实事件
+   *
+   * <p>
+   * 与 {@code locator.click} 的区别是**不做可操作性检查**(不判断遮挡/稳定/可接收事件),
+   * 与 {@code JS_CLICK} 的区别是**事件是真的**。跳过检查 + 真实事件这个组合,正好覆盖
+   * 「元素在、能点、但 Playwright 认为它不可操作」和「框架只认真实事件」两类场景。
+   *
+   * @return 是否成功派发(拿不到盒子就返回 false,交给下一档)
+   */
+  private static boolean mouseClick(Locator locator) {
+    try {
+      Locator target = locator.first();
+      try {
+        target.scrollIntoViewIfNeeded(new Locator.ScrollIntoViewIfNeededOptions().setTimeout(2_000));
+      } catch (PlaywrightException ignored) {
+        // 滚不动也继续:盒子可能本来就在视口里
+      }
+      BoundingBox box = target.boundingBox();
+      if (box == null || box.width <= 0 || box.height <= 0) {
+        return false;
+      }
+      target.page().mouse().click(box.x + box.width / 2, box.y + box.height / 2);
+      return true;
+    } catch (PlaywrightException e) {
+      return false;
+    }
+  }
+
+  /** 目标中心点上实际命中的是谁——被覆盖层挡住是「点了没反应」的头号原因 */
+  private static final String JS_HIT_TEST = """
+      (self, point) => {
+        const describe = (el) => el ? {
+          tag: el.tagName,
+          id: el.id || null,
+          className: typeof el.className === 'string' ? el.className.slice(0, 120) : null,
+          text: (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 60)
+        } : null;
+        const hit = document.elementFromPoint(point[0], point[1]);
+        if (!hit) return { covered: false, reason: 'no-element-at-point' };
+        const isSelf = hit === self || self.contains(hit) || hit.contains(self);
+        return { covered: !isSelf, hit: describe(hit), target: describe(self) };
+      }
+      """;
+
+  /** 命中测试:目标被别的元素盖住时把「谁盖的」写进回执 */
+  private static boolean recordBlocker(Locator locator, ActionOutcome outcome) {
+    Kv probe = hitTest(locator);
+    if (probe == null || !Boolean.TRUE.equals(probe.getBoolean("covered"))) {
+      return false;
+    }
+    outcome.extra.set("coveredBy", probe.get("hit")).set("coveredHint",
+        "目标中心点上实际命中的是别的元素(常见:用户服务协议层、弹窗遮罩、叠起来的确认框),"
+            + "这类点击很容易被吃掉:先关掉遮挡物再点(close_modal);确实要点被遮住的元素时用 mode:\"js\"");
+    return true;
+  }
+
+  /** @return 命中信息;元素不可见/拿不到盒子/脚本报错时返回 null(诊断失败不该影响动作) */
+  private static Kv hitTest(Locator locator) {
+    try {
+      Locator target = locator.first();
+      BoundingBox box = target.boundingBox();
+      if (box == null || box.width <= 0 || box.height <= 0) {
+        return null;
+      }
+      Object raw = target.evaluate(JS_HIT_TEST, List.of(box.x + box.width / 2, box.y + box.height / 2));
+      if (!(raw instanceof Map)) {
+        return null;
+      }
+      Kv probe = new Kv();
+      probe.putAll((Map<?, ?>) raw);
+      return probe;
+    } catch (PlaywrightException e) {
+      return null;
+    }
+  }
+
+  /** 点击失败时附一句「被谁挡住了」,失败信息里直接给出原因 */
+  private static String blockerSuffix(Locator locator) {
+    Kv probe = hitTest(locator);
+    if (probe == null || !Boolean.TRUE.equals(probe.getBoolean("covered"))) {
+      return "";
+    }
+    Object hit = probe.get("hit");
+    String description = hit instanceof Map ? String.valueOf(((Map<?, ?>) hit).get("text")) + " <"
+        + String.valueOf(((Map<?, ?>) hit).get("tag")) + " class=" + String.valueOf(((Map<?, ?>) hit).get("className"))
+        + ">" : String.valueOf(hit);
+    return "；目标中心点上实际命中的是别的元素:" + description + "(被遮挡,先关掉遮挡物或改用 mode:\"mouse\")";
+  }
+
+  private static void jsClick(Locator locator) {
+    locator.first().evaluate(JS_CLICK);
+  }
+
+  /** auto / native / mouse / js / dispatch / force 的归一化 */
+  private static String normalizeMode(String mode) {
+    if (mode == null || mode.isBlank()) {
+      return "auto";
+    }
+    String value = mode.trim().toLowerCase(java.util.Locale.ROOT);
+    if ("dispatch".equals(value) || "force".equals(value) || "js".equals(value) || "event".equals(value)) {
+      return "js";
+    }
+    if ("mouse".equals(value) || "real".equals(value) || "coordinate".equals(value) || "coords".equals(value)) {
+      return "mouse";
+    }
+    if ("native".equals(value) || "playwright".equals(value)) {
+      return "native";
+    }
+    return "auto";
+  }
+
+  /** 输入方式归一化:auto / native(fill) / type / js */
+  private static String normalizeInputMode(String mode) {
+    if (mode == null || mode.isBlank()) {
+      return "auto";
+    }
+    String value = mode.trim().toLowerCase(java.util.Locale.ROOT);
+    if ("js".equals(value) || "setvalue".equals(value) || "set_value".equals(value)) {
+      return "js";
+    }
+    if ("type".equals(value) || "press".equals(value)) {
+      return "type";
+    }
+    if ("native".equals(value) || "fill".equals(value)) {
+      return "native";
+    }
+    return "auto";
+  }
+
+  /**
+   * 填一个输入框
+   *
+   * <p>
+   * {@code auto}(默认)会先看元素可不可见:<b>能看见就用 Playwright 的真实输入</b>(会派发正常事件、
+   * 进框架模型),看不见(分步表单里非当前步的字段、{@code display:none} 的 textarea)才退回 JS 设值,
+   * 并在回执里明确写 {@code mode=js} 与 {@code committed=false}——这类值提交时可能是空的。
+   */
+  private static void fillWithMode(Locator locator, String value, String mode, ActionOutcome outcome) {
+    String resolved = normalizeInputMode(mode);
+    if ("js".equals(resolved)) {
+      jsSetValue(locator, value);
+      outcome.mode = "js";
+      outcome.timeoutHint = JS_MODE_NOTE;
+      outcome.record();
+      return;
+    }
+    if ("type".equals(resolved)) {
+      requireEditable(locator);
+      locator.pressSequentially(value, new Locator.PressSequentiallyOptions().setTimeout(actionTimeoutMs()));
+      outcome.mode = "type";
+      outcome.record();
+      return;
+    }
+    if ("native".equals(resolved)) {
+      fillEditable(locator, value);
+      outcome.mode = "fill";
+      outcome.record();
+      return;
+    }
+    if (isUsableForInput(locator)) {
+      fillEditable(locator, value);
+      outcome.mode = "fill";
+    } else {
+      jsSetValue(locator, value);
+      outcome.mode = "js";
+      outcome.timeoutHint = JS_MODE_NOTE;
+    }
+    outcome.record();
+  }
+
+  private static void jsSetValue(Locator locator, String value) {
+    locator.first().evaluate(JS_SET_VALUE, value);
+  }
+
+  /** 元素是否「看得见、能真实输入」:隐藏或 0×0 的元素走 fill 会得到 ELEMENT_HIDDEN */
+  private static boolean isUsableForInput(Locator locator) {
+    try {
+      if (locator.count() == 0) {
+        return false;
+      }
+      Locator first = locator.first();
+      if (!first.isVisible()) {
+        return false;
+      }
+      BoundingBox box = first.boundingBox();
+      return box != null && box.width > 0 && box.height > 0;
+    } catch (PlaywrightException e) {
+      return false;
+    }
+  }
+
+  /** 输入类动作的公开实现:回执里带上 mode/committed */
+  private static RespBodyVo inputResult(ActionOutcome outcome) {
+    Kv data = Kv.by("mode", outcome.mode).set("committed", !"js".equals(outcome.mode));
+    if ("js".equals(outcome.mode)) {
+      data.set("note", JS_MODE_NOTE);
+    }
+    return RespBodyVo.ok(data);
   }
 
   // ==================== 点击回执与索引失效重试 ====================
@@ -1654,11 +2519,33 @@ public class PlaywrightService {
 
   /** 动作成功但页面毫无变化时,把 changed=false 和提示一起返回 */
   private static RespBodyVo okWithReceipt(Kv before, BrowserInstance inst, String action) {
+    return okWithReceipt(before, inst, action, null);
+  }
+
+  /** extra 非空时并进回执(点击方式 mode、命中元素信息这类) */
+  private static RespBodyVo okWithReceipt(Kv before, BrowserInstance inst, String action, Kv extra) {
     Kv report = receipt(before, inst);
-    if (!Boolean.TRUE.equals(report.getBoolean("changed"))) {
+    if (extra != null) {
+      report.set(extra);
+    }
+    boolean changed = Boolean.TRUE.equals(report.getBoolean("changed"));
+    // effective 是给智能体用的机器可读结论:动作发出去了,但观察窗口内页面没动 = 不保证生效
+    report.set("effective", changed);
+    if (!changed && !report.containsKey("hint")) {
       report.set("hint", action + " 已执行，但观察窗口内尚未发现变化；不代表点击失败，请等待目标条件或读取新状态");
     }
+    if (!changed && report.containsKey("coveredBy")) {
+      report.set("hint", action + " 已执行但页面没变化，且目标中心点上命中的是别的元素——很可能被遮挡物吃掉了(见 coveredBy)");
+    }
     return RespBodyVo.ok(report);
+  }
+
+  /**
+   * 按索引动作,带索引失效重试(见下面的七参重载)
+   */
+  private RespBodyVo indexAction(BrowserInstance inst, int index, String action, String fallbackSelector,
+      Consumer<Locator> consumer, boolean withReceipt) {
+    return indexAction(inst, index, action, fallbackSelector, consumer, withReceipt, null);
   }
 
   /**
@@ -1671,9 +2558,12 @@ public class PlaywrightService {
    *
    * <p>
    * 补救用的临时快照不覆盖 inst.domState,避免索引悄悄漂移。
+   *
+   * @param extra 并进成功回执的附加信息(例如这次点击的 {@code mode});闭包可以在动作过程中往里写,
+   *              回执是在动作之后组装的
    */
   private RespBodyVo indexAction(BrowserInstance inst, int index, String action, String fallbackSelector,
-      Consumer<Locator> consumer, boolean withReceipt) {
+      Consumer<Locator> consumer, boolean withReceipt, Kv extra) {
     Locator locator = resolveIndex(inst, index, fallbackSelector);
     if (locator == null) {
       return RespBodyVo.fail(action + " 索引越界: " + index + indexHint(inst));
@@ -1682,14 +2572,14 @@ public class PlaywrightService {
     PlaywrightException failure;
     try {
       consumer.accept(locator);
-      return withReceipt ? okWithReceipt(before, inst, action) : RespBodyVo.ok();
+      return withReceipt ? okWithReceipt(before, inst, action, extra) : RespBodyVo.ok(extra);
     } catch (PlaywrightException e) {
       failure = e;
     }
     sleepQuietly(300);
     try {
       consumer.accept(locator);
-      return withReceipt ? okWithReceipt(before, inst, action) : RespBodyVo.ok();
+      return withReceipt ? okWithReceipt(before, inst, action, extra) : RespBodyVo.ok(extra);
     } catch (PlaywrightException e) {
       failure = e;
     }
@@ -1697,7 +2587,7 @@ public class PlaywrightService {
     if (recovered != null) {
       try {
         consumer.accept(recovered);
-        return withReceipt ? okWithReceipt(before, inst, action) : RespBodyVo.ok();
+        return withReceipt ? okWithReceipt(before, inst, action, extra) : RespBodyVo.ok(extra);
       } catch (PlaywrightException e) {
         failure = e;
       }
@@ -1853,12 +2743,24 @@ public class PlaywrightService {
   }
 
   public RespBodyVo clickElementByIndex(Long browserId, int index) {
+    return clickElementByIndex(browserId, index, null, null);
+  }
+
+  /**
+   * 按索引点击
+   *
+   * @param mode      {@code auto}(默认)/{@code native}/{@code js},见 {@link #clickWithMode}
+   * @param timeoutMs 按次覆盖超时(毫秒),不传用 {@code browser.action.timeoutMs}
+   */
+  public RespBodyVo clickElementByIndex(Long browserId, int index, String mode, Integer timeoutMs) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
     }
+    ActionOutcome outcome = new ActionOutcome();
     return indexAction(inst, index, "click_element_by_index", CLICKABLE_SELECTOR,
-        (locator) -> locator.click(clickOptions()), true);
+        (locator) -> clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions(timeoutMs))), true,
+        outcome.extra);
   }
 
   /**
@@ -1887,6 +2789,15 @@ public class PlaywrightService {
   }
 
   public RespBodyVo inputTextByIndex(Long browserId, int index, String value) {
+    return inputTextByIndex(browserId, index, value, null);
+  }
+
+  /**
+   * 按索引填文本
+   *
+   * @param mode {@code auto}(默认:能看见就用真实输入,看不见退回 JS 设值)/{@code native}/{@code type}/{@code js}
+   */
+  public RespBodyVo inputTextByIndex(Long browserId, int index, String value, String mode) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
@@ -1895,29 +2806,196 @@ public class PlaywrightService {
     if (locator == null) {
       return RespBodyVo.fail("input_text 索引越界: " + index + indexHint(inst));
     }
+    ActionOutcome outcome = new ActionOutcome();
     try {
-      fillEditable(locator, value);
+      fillWithMode(locator, value, mode, outcome);
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(actionFailure("input_text", e));
     }
-    return RespBodyVo.ok();
+    return inputResult(outcome);
   }
 
   public RespBodyVo uploadFile(Long browserId, int index, String path) {
+    return uploadFile(browserId, index, null, path, null);
+  }
+
+  /**
+   * 把服务端本地文件交给页面的 {@code input[type=file]}
+   *
+   * <p>
+   * 三件事比原来好用了:
+   * <ul>
+   * <li><b>可以用选择器</b>:{@code display:none} 的 file input 根本进不了快照(没有索引),而
+   * {@code setInputFiles} 本来就不要求元素可见——传 {@code selector} 就能直接传文件,不必先
+   * 用 execute_js 把元素显示出来再重新取快照;</li>
+   * <li><b>相对路径按服务端 upload 目录解析</b>:客户端先把文件 POST 到 {@code /playwright/upload},再把回执里的
+   * {@code relativePath} 原样回填到这里即可(客户端-服务器模式下两边不是同一台机器);</li>
+   * <li><b>文件不存在时说清怎么办</b>,而不是抛一句 Playwright 的英文错误。</li>
+   * </ul>
+   */
+  public RespBodyVo uploadFile(Long browserId, Integer index, String selector, String path, Integer timeoutMs) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
     }
-    Locator locator = resolveIndex(inst, index, FILE_SELECTOR);
-    if (locator == null) {
-      return RespBodyVo.fail("upload_file 索引越界: " + index + indexHint(inst));
+    if ((selector == null || selector.isBlank()) && index == null) {
+      return RespBodyVo.fail("upload_file 需要 index 或 selector 之一");
+    }
+    Path file = UploadStore.resolve(path);
+    if (file == null) {
+      return RespBodyVo.fail("upload_file 路径非法：" + path);
+    }
+    if (!Files.isRegularFile(file)) {
+      return RespBodyVo.fail("upload_file 找不到文件：" + file
+          + "（path 必须是**服务端**能打开的路径；客户端-服务器模式下请先把文件 POST 到 /playwright/upload，"
+          + "再把回执里的 path 或 relativePath 传进来）");
+    }
+    Locator locator;
+    String target;
+    if (selector != null && !selector.isBlank()) {
+      locator = inst.page.locator(selector).first();
+      target = "selector=" + selector;
+    } else {
+      locator = locatorOf(inst, index);
+      target = "index=" + index;
+      if (locator == null) {
+        return RespBodyVo.fail("upload_file 索引越界: " + index + indexHint(inst));
+      }
     }
     try {
-      locator.setInputFiles(Paths.get(path), new Locator.SetInputFilesOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+      locator.setInputFiles(file, new Locator.SetInputFilesOptions().setTimeout(actionTimeoutMs(timeoutMs)));
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(actionFailure("upload_file", e));
+      return RespBodyVo.fail(locateFailure("upload_file", target, e));
     }
-    return RespBodyVo.ok();
+    return RespBodyVo.ok(Kv.by("filename", file.getFileName().toString()).set("path", file.toString())
+        .set("size", UploadStore.sizeOf(file)).set("target", target).set("mode", "native"));
+  }
+
+  /**
+   * 一步到位上传:直接把文件内容(base64 或 URL)交给页面,不必先 POST 到 {@code /playwright/upload}
+   *
+   * <p>
+   * <b>为什么加它</b>:客户端-服务器模式下,原本要「先 POST /playwright/upload 拿服务端路径,再调
+   * {@code upload_file}」两次往返;文件小(图样、证件照几十 KB)的时候,直接内联传更省事。
+   *
+   * <p>
+   * 两种来源二选一:
+   * <ul>
+   * <li>{@code contentBase64}:内容直接内联(base64 文本,允许带 {@code data:image/jpeg;base64,} 前缀);</li>
+   * <li>{@code url}:由**服务端**去下载(适合文件已经在某个可访问的地址上,不必先下载到客户端)。</li>
+   * </ul>
+   *
+   * <p>
+   * 内容会先按 {@code filename} 落进服务端暂存目录(与 {@code /playwright/upload} 同一个目录、同一套
+   * 文件名清洗与大小上限),所以回执里同样有 {@code path}/{@code relativePath},后续还能用
+   * {@code upload_file} 复用这份文件。
+   *
+   * @param filename      文件名(会被清洗);只给 contentType 时会自动补扩展名
+   * @param contentType   内容类型,可选(用于补扩展名与回执)
+   * @param contentBase64 base64 内容,与 url 二选一
+   * @param url           服务端下载地址,与 contentBase64 二选一
+   */
+  public RespBodyVo uploadFileInline(Long browserId, Integer index, String selector, String filename,
+      String contentType, String contentBase64, String url, Integer timeoutMs) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
+    }
+    if ((contentBase64 == null || contentBase64.isBlank()) && (url == null || url.isBlank())) {
+      return RespBodyVo.fail("upload_file 需要 path,或 contentBase64 / url 之一");
+    }
+    byte[] data;
+    String resolvedContentType = contentType;
+    try {
+      if (contentBase64 != null && !contentBase64.isBlank()) {
+        String payload = contentBase64.trim();
+        // 允许直接贴 data URI
+        int comma = payload.indexOf(',');
+        if (payload.startsWith("data:") && comma > 0) {
+          String header = payload.substring(5, comma);
+          int semicolon = header.indexOf(';');
+          if (resolvedContentType == null) {
+            resolvedContentType = semicolon > 0 ? header.substring(0, semicolon) : header;
+          }
+          payload = payload.substring(comma + 1);
+        }
+        data = Base64.getDecoder().decode(payload.replaceAll("\\s+", ""));
+      } else {
+        data = download(url, resolvedContentType);
+        if (resolvedContentType == null) {
+          resolvedContentType = contentTypeOf(url);
+        }
+      }
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("upload_file 失败：contentBase64 不是合法的 base64（" + e.getMessage() + "）");
+    } catch (IOException e) {
+      return RespBodyVo.fail("upload_file 失败：下载 " + url + " 出错（" + briefMessage(e.getMessage()) + "）");
+    }
+    Kv saved;
+    try {
+      saved = UploadStore.save(filename, resolvedContentType, data);
+    } catch (IOException e) {
+      return RespBodyVo.fail("upload_file 失败：写入服务端暂存目录出错（" + briefMessage(e.getMessage()) + "）");
+    }
+    RespBodyVo uploaded = uploadFile(browserId, index, selector, saved.getStr("path"), timeoutMs);
+    if (!uploaded.isOk()) {
+      return uploaded;
+    }
+    Kv data2 = uploaded.getData() instanceof Kv ? (Kv) uploaded.getData() : new Kv();
+    data2.set(saved);
+    data2.set("source", contentBase64 != null && !contentBase64.isBlank() ? "contentBase64" : "url");
+    uploaded.setData(data2);
+    return uploaded;
+  }
+
+  /** 服务端下载一个 URL 的内容(有大小上限与超时,避免把内存或磁盘撑爆) */
+  private static byte[] download(String url, String contentType) throws IOException {
+    long limit = UploadStore.maxBytes();
+    java.net.URI uri;
+    try {
+      uri = java.net.URI.create(url.trim());
+    } catch (IllegalArgumentException e) {
+      throw new IOException("URL 不合法");
+    }
+    java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
+        .connectTimeout(java.time.Duration.ofSeconds(15)).followRedirects(
+            java.net.http.HttpClient.Redirect.NORMAL)
+        .build();
+    java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder(uri)
+        .timeout(java.time.Duration.ofSeconds(60)).GET().build();
+    try {
+      java.net.http.HttpResponse<byte[]> response = client.send(request,
+          java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+      if (response.statusCode() / 100 != 2) {
+        throw new IOException("HTTP " + response.statusCode());
+      }
+      byte[] body = response.body();
+      if (limit > 0 && body.length > limit) {
+        throw new IOException("下载内容超过上限:" + body.length + " 字节 > " + limit + " 字节");
+      }
+      return body;
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("下载被中断");
+    }
+  }
+
+  /** 从 URL 猜内容类型(猜不到返回 null,交给 UploadStore 处理) */
+  private static String contentTypeOf(String url) {
+    String lower = url == null ? "" : url.toLowerCase(java.util.Locale.ROOT);
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+      return "image/jpeg";
+    }
+    if (lower.endsWith(".png")) {
+      return "image/png";
+    }
+    if (lower.endsWith(".webp")) {
+      return "image/webp";
+    }
+    if (lower.endsWith(".pdf")) {
+      return "application/pdf";
+    }
+    return null;
   }
 
   public RespBodyVo switchTab(Long browserId, int pageIndex) {
@@ -2187,19 +3265,136 @@ public class PlaywrightService {
    * @return 执行结果,数据位于 data.result
    */
   public RespBodyVo executeJs(Long browserId, String body) {
+    return executeJs(browserId, body, null, null);
+  }
+
+  /**
+   * 执行 JavaScript(bodyFile / vars 见下)
+   *
+   * <p>
+   * 除了 {@code body} 直接写脚本,还可以用 {@code bodyFile} 从**服务端脚本目录**读脚本,再用
+   * {@code vars} 注入变量——脚本里写 {@code {{name}}},服务端会替换成 JSON 编码后的值(字符串自动
+   * 带引号)。这样中文、引号、换行都不用在客户端拼字符串,客户端-服务器模式下尤其省事
+   * (以前为了让 PowerShell 把中文和引号原样送过来,只能把脚本一条条写成文件)。
+   *
+   * <p>
+   * 失败时除了 {@code msg}(第一行),还会在 {@code data.error} 里给出 {@code name/message/stack},
+   * 其中 stack 只保留页面自己的帧(去掉 Playwright 内部与本地路径),定位到脚本哪一行出的错。
+   *
+   * @param body     直接给的脚本,与 bodyFile 二选一(body 优先)
+   * @param bodyFile 脚本文件路径,相对「脚本目录」(默认 {@code <工作目录>/scripts/js},可用配置项
+   *                 {@code browser.js.dir} 改);不许跳出该目录
+   * @param vars     注入脚本的变量,脚本里用 {@code {{key}}} 引用
+   */
+  public RespBodyVo executeJs(Long browserId, String body, String bodyFile, JSONObject vars) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
     }
-    String script = normalizeScript(body);
+    String raw = body;
+    if ((raw == null || raw.isBlank()) && bodyFile != null && !bodyFile.isBlank()) {
+      String fromFile = readScriptFile(bodyFile);
+      if (fromFile == null) {
+        return RespBodyVo.fail("execute_js 失败：读不到脚本文件 " + bodyFile
+            + "（只允许读脚本目录下的文件,见 get_config 的 jsDir）");
+      }
+      raw = fromFile;
+    }
+    if (raw == null || raw.isBlank()) {
+      return RespBodyVo.fail("execute_js 需要 body 或 bodyFile");
+    }
+    String script = normalizeScript(applyVars(raw, vars));
     try {
       Object result = inst.page.evaluate(script);
-      return RespBodyVo.ok(Kv.by("result", result));
+      Kv data = Kv.by("result", result);
+      if (vars != null && !vars.isEmpty()) {
+        data.set("varsApplied", new ArrayList<>(vars.keySet()));
+      }
+      return RespBodyVo.ok(data);
     } catch (PlaywrightException e) {
       String message = briefMessage(e.getMessage());
       log.error("execute_js 执行失败,id:{},script:{},error:{}", browserId, script, message, e);
-      return RespBodyVo.fail("执行 JavaScript 失败：" + message);
+      RespBodyVo failure = RespBodyVo.fail("执行 JavaScript 失败：" + message);
+      failure.setData(Kv.by("error", scriptError(e)).set("scriptPreview", truncate(script, 400)));
+      return failure;
     }
+  }
+
+  /**
+   * 从 Playwright 的报错里拆出脚本自己的错误信息
+   *
+   * <p>
+   * Playwright 的异常文本里带着页面侧的 JS 栈,但混着它自己的帧和本机路径。这里只留
+   * {@code name/message} 与页面帧(形如 {@code at ... (https://站点/...js:1:234)})。
+   */
+  private static Kv scriptError(PlaywrightException e) {
+    String raw = e.getMessage() == null ? "" : e.getMessage();
+    String name = null;
+    String message = null;
+    java.util.regex.Matcher head = Pattern.compile("([A-Za-z]*Error):\\s*([^\\n]*)").matcher(raw);
+    if (head.find()) {
+      name = head.group(1);
+      message = head.group(2).trim();
+    }
+    List<String> frames = new ArrayList<>();
+    java.util.regex.Matcher frame = Pattern.compile("at [^\\n]*").matcher(raw);
+    while (frame.find() && frames.size() < 12) {
+      String line = frame.group().trim();
+      // 只保留页面自己的帧:带 URL 的;Playwright 内部帧(本地路径)丢掉
+      if (line.contains("://")) {
+        frames.add(truncate(line, 240));
+      }
+    }
+    Kv error = Kv.by("name", name).set("message", message == null ? briefMessage(raw) : message);
+    if (!frames.isEmpty()) {
+      error.set("stack", frames);
+    }
+    return error;
+  }
+
+  /** 脚本目录:默认 <工作目录>/scripts/js,可用 browser.js.dir 覆盖 */
+  private static Path scriptDir() {
+    String configured = ChromeBrowser.config(KEY_JS_DIR);
+    Path dir = configured == null || configured.isBlank() ? Paths.get("scripts", "js") : Paths.get(configured.trim());
+    return dir.toAbsolutePath().normalize();
+  }
+
+  /** 读脚本文件;只允许读脚本目录下的文件(防越权读任意文件) */
+  private static String readScriptFile(String bodyFile) {
+    try {
+      Path base = scriptDir();
+      Path target = base.resolve(bodyFile).normalize();
+      if (!target.startsWith(base) || !Files.isRegularFile(target)) {
+        return null;
+      }
+      return Files.readString(target, StandardCharsets.UTF_8);
+    } catch (IOException | RuntimeException e) {
+      return null;
+    }
+  }
+
+  /**
+   * 把 {@code {{key}}} 替换成 JSON 编码后的变量值
+   *
+   * <p>
+   * 用 JSON 编码(而不是裸拼)是有意的:字符串会自带引号并正确转义,中文/引号/换行都不用调用方操心;
+   * 数字、布尔、数组、对象也都能直接塞进脚本。
+   *
+   * <p>
+   * 两种写法:裸 {@code {{key}}}(如 {@code var n = {{n}};})与连引号的 {@code "{{key}}"}
+   * (如 {@code querySelector("{{sel}}")})。**连引号的那种要先替换**,否则会留下 {@code ""值""} 这种坏脚本。
+   */
+  static String applyVars(String body, JSONObject vars) {
+    if (body == null || vars == null || vars.isEmpty() || body.indexOf("{{") < 0) {
+      return body;
+    }
+    String result = body;
+    for (String key : vars.keySet()) {
+      Object value = vars.get(key);
+      String encoded = value == null ? "null" : JSON.toJSONString(value);
+      result = result.replace("\"{{" + key + "}}\"", encoded).replace("{{" + key + "}}", encoded);
+    }
+    return result;
   }
 
   /**
@@ -2296,28 +3491,47 @@ public class PlaywrightService {
   // ==================== 按索引操作元素 ====================
 
   public RespBodyVo doubleClickElementByIndex(Long browserId, int index) {
+    return doubleClickElementByIndex(browserId, index, null);
+  }
+
+  public RespBodyVo doubleClickElementByIndex(Long browserId, int index, String mode) {
     return clickLike(browserId, index, "double_click_element_by_index",
-        (locator) -> locator.dblclick(new Locator.DblclickOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)), true);
+        (locator) -> locator.dblclick(new Locator.DblclickOptions().setTimeout(actionTimeoutMs())), true, mode);
   }
 
   public RespBodyVo hoverElementByIndex(Long browserId, int index) {
     return clickLike(browserId, index, "hover_element_by_index",
-        (locator) -> locator.hover(new Locator.HoverOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)));
+        (locator) -> locator.hover(new Locator.HoverOptions().setTimeout(actionTimeoutMs())));
   }
 
   public RespBodyVo focusElementByIndex(Long browserId, int index) {
     return clickLike(browserId, index, "focus_element_by_index",
-        (locator) -> locator.focus(new Locator.FocusOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)));
+        (locator) -> locator.focus(new Locator.FocusOptions().setTimeout(actionTimeoutMs())));
   }
 
   public RespBodyVo checkElementByIndex(Long browserId, int index) {
+    return checkElementByIndex(browserId, index, null);
+  }
+
+  /**
+   * 勾选复选框
+   *
+   * <p>
+   * {@code mode=auto} 时原生 {@code check()} 超时会自动降级为 JS 派发事件(ant-design 的表格行勾选
+   * 就属于这类:点上去有反应,可操作性检查却一直不满足)。
+   */
+  public RespBodyVo checkElementByIndex(Long browserId, int index, String mode) {
     return clickLike(browserId, index, "check_element_by_index",
-        (locator) -> locator.check(new Locator.CheckOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)));
+        (locator) -> locator.check(new Locator.CheckOptions().setTimeout(actionTimeoutMs())), false, mode);
   }
 
   public RespBodyVo uncheckElementByIndex(Long browserId, int index) {
+    return uncheckElementByIndex(browserId, index, null);
+  }
+
+  public RespBodyVo uncheckElementByIndex(Long browserId, int index, String mode) {
     return clickLike(browserId, index, "uncheck_element_by_index",
-        (locator) -> locator.uncheck(new Locator.UncheckOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS)));
+        (locator) -> locator.uncheck(new Locator.UncheckOptions().setTimeout(actionTimeoutMs())), false, mode);
   }
 
   /** 不清空原内容,逐字输入 */
@@ -2332,7 +3546,7 @@ public class PlaywrightService {
     }
     try {
       requireEditable(locator);
-      locator.pressSequentially(text, new Locator.PressSequentiallyOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+      locator.pressSequentially(text, new Locator.PressSequentiallyOptions().setTimeout(actionTimeoutMs()));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(actionFailure("type_text", e));
     }
@@ -2463,23 +3677,50 @@ public class PlaywrightService {
    * 选中参数类型完全匹配的那个,另一个就成了永远不生效的死代码(改接口行为时尤其容易踩)。
    */
   public RespBodyVo clickElementBySelector(Long browserId, String selector) {
+    return clickElementBySelector(browserId, selector, null, null);
+  }
+
+  /**
+   * 按选择器点击
+   *
+   * @param mode      {@code auto}(默认:原生失败自动降级为 JS 派发)/{@code native}/{@code js}
+   * @param timeoutMs 按次覆盖超时(毫秒)
+   */
+  public RespBodyVo clickElementBySelector(Long browserId, String selector, String mode, Integer timeoutMs) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     int tabCountBefore = pagesOf(inst).size();
     Kv before = stateProbe(inst);
+    ActionOutcome outcome = new ActionOutcome();
     try {
-      inst.page.locator(selector).first().click(clickOptions());
+      clickWithMode(inst.page.locator(selector).first(), mode, outcome,
+          () -> inst.page.locator(selector).first().click(clickOptions(timeoutMs)));
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(locateFailure("click_element_by_selector", "选择器 " + selector, e));
+      return RespBodyVo.fail(
+          locateFailure("click_element_by_selector", "选择器 " + selector, e) + blockerSuffix(inst.page.locator(selector).first()));
     }
     adoptNewTab(inst, tabCountBefore);
-    return okWithReceipt(before, inst, "click_element_by_selector");
+    return okWithReceipt(before, inst, "click_element_by_selector", outcome.extra);
   }
 
   public RespBodyVo inputTextBySelector(Long browserId, String selector, String value) {
-    return actBySelector(browserId, "input_text_by_selector", selector, (locator) -> fillEditable(locator, value));
+    return inputTextBySelector(browserId, selector, value, null);
+  }
+
+  public RespBodyVo inputTextBySelector(Long browserId, String selector, String value, String mode) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    ActionOutcome outcome = new ActionOutcome();
+    try {
+      fillWithMode(inst.page.locator(selector).first(), value, mode, outcome);
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail(locateFailure("input_text_by_selector", "选择器 " + selector, e));
+    }
+    return inputResult(outcome);
   }
 
   /**
@@ -2492,6 +3733,10 @@ public class PlaywrightService {
    * 点文本节点本身;返回的 data 里带上真正点中的 `tag` 与 `outerHtml`,假成功一眼可见。
    */
   public RespBodyVo clickElementByText(Long browserId, String text) {
+    return clickElementByText(browserId, text, null);
+  }
+
+  public RespBodyVo clickElementByText(Long browserId, String text, String mode) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -2503,11 +3748,13 @@ public class PlaywrightService {
     }
     try {
       Kv info = describe(hit.locator, hit.marker);
+      ActionOutcome outcome = new ActionOutcome();
       try {
-        hit.locator.click(clickOptions());
+        clickWithMode(hit.locator, mode, outcome, () -> hit.locator.click(clickOptions()));
       } catch (PlaywrightException e) {
         return RespBodyVo.fail(locateFailure("click_element_by_text", "文本 " + text, e));
       }
+      info.set(outcome.extra);
       return okWithHit(before, inst, "click_element_by_text", info);
     } finally {
       // 定位用的临时属性必须等动作做完再摘:定位器是惰性求值的,提前摘掉就选不中元素了
@@ -2602,6 +3849,10 @@ public class PlaywrightService {
   }
 
   public RespBodyVo clickElementByRole(Long browserId, String role, String name) {
+    return clickElementByRole(browserId, role, name, null);
+  }
+
+  public RespBodyVo clickElementByRole(Long browserId, String role, String name, String mode) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -2610,17 +3861,32 @@ public class PlaywrightService {
     Locator locator = inst.page
         .getByRole(AriaRole.valueOf(role.toUpperCase()), new Page.GetByRoleOptions().setName(name)).first();
     Kv info = describe(locator);
+    ActionOutcome outcome = new ActionOutcome();
     try {
-      locator.click(clickOptions());
+      clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions()));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(locateFailure("click_element_by_role", "角色 " + role + "[name=" + name + "]", e));
     }
+    info.set(outcome.extra);
     return okWithHit(before, inst, "click_element_by_role", info);
   }
 
   public RespBodyVo inputTextByLabel(Long browserId, String label, String value) {
-    return actByLocator(browserId, "input_text_by_label", "标签 " + label, (inst) -> inst.page.getByLabel(label).first(),
-        (locator) -> fillEditable(locator, value));
+    return inputTextByLabel(browserId, label, value, null);
+  }
+
+  public RespBodyVo inputTextByLabel(Long browserId, String label, String value, String mode) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    ActionOutcome outcome = new ActionOutcome();
+    try {
+      fillWithMode(inst.page.getByLabel(label).first(), value, mode, outcome);
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail(locateFailure("input_text_by_label", "标签 " + label, e));
+    }
+    return inputResult(outcome);
   }
 
   /**
@@ -2632,6 +3898,10 @@ public class PlaywrightService {
    * 300 毫秒)。
    */
   public RespBodyVo hoverAndClick(Long browserId, Integer index, String selector, Integer hoverDelayMs) {
+    return hoverAndClick(browserId, index, selector, hoverDelayMs, null);
+  }
+
+  public RespBodyVo hoverAndClick(Long browserId, Integer index, String selector, Integer hoverDelayMs, String mode) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -2652,13 +3922,15 @@ public class PlaywrightService {
     }
     Kv before = stateProbe(inst);
     Kv info = describe(locator);
+    ActionOutcome outcome = new ActionOutcome();
     try {
-      locator.hover(new Locator.HoverOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
+      locator.hover(new Locator.HoverOptions().setTimeout(actionTimeoutMs()));
       sleepQuietly(hoverDelayMs == null ? 300 : hoverDelayMs);
-      locator.click(clickOptions());
+      clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions()));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(locateFailure("hover_and_click", target, e));
     }
+    info.set(outcome.extra);
     return okWithHit(before, inst, "hover_and_click", info);
   }
 
@@ -2801,6 +4073,378 @@ public class PlaywrightService {
     return RespBodyVo.ok();
   }
 
+  /** 页面「安静下来」的判据:DOM 变更计数与在途请求数都不再变化 */
+  private static final String MUTATION_PROBE = """
+      () => {
+        if (!window.__brIdle) {
+          window.__brIdle = {mutations: 0, since: Date.now()};
+          try {
+            new MutationObserver((records) => {
+              window.__brIdle.mutations += records.length;
+              window.__brIdle.since = Date.now();
+            }).observe(document.documentElement || document, {
+              childList: true, subtree: true, attributes: true, characterData: true
+            });
+          } catch (e) {
+            window.__brIdle.error = String(e);
+          }
+        }
+        return {mutations: window.__brIdle.mutations, since: window.__brIdle.since,
+                error: window.__brIdle.error || null};
+      }
+      """;
+
+  /**
+   * 等页面安静下来:DOM 不再变动 + 没有在途请求
+   *
+   * <p>
+   * <b>为什么需要它</b>:分步表单/SPA 上「点一下 → 等它自己保存/渲染完」是最常见的节奏,而固定
+   * {@code wait} 要么等不够(点击被吞、读到旧状态)要么等太久(每次白等几秒,几十步下来就是几分钟)。
+   * 这里给一个与站点无关的判据:连续 {@code quietMs} 毫秒内既没有 DOM 变更、也没有在途请求,就算安静。
+   *
+   * <p>
+   * 与 {@code wait_for_function} 的区别:那个要你自己写条件;这个不需要知道站点内部在干什么。
+   *
+   * @param quietMs   需要连续安静多久(毫秒),默认 500
+   * @param selector  额外条件:这个选择器出现才算数(可选)
+   * @param text      额外条件:页面上出现这段文本才算数(可选)
+   * @return {@code {idle:true, waitedMs, mutations, inflight, quietMs}};超时返回失败并带上当时的计数,
+   *         便于判断是「网络一直没停」还是「DOM 一直在变」
+   */
+  public RespBodyVo waitForIdle(Long browserId, Integer quietMs, Double timeoutSeconds, String selector, String text) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    long quiet = quietMs == null || quietMs < 0 ? 500 : quietMs;
+    long timeout = (long) timeoutMillis(timeoutSeconds);
+    long startedAt = System.currentTimeMillis();
+    long deadline = startedAt + timeout;
+    int mutations = -1;
+    long stableSince = startedAt;
+    int inflight = 0;
+    while (true) {
+      long now = System.currentTimeMillis();
+      int current = readMutationCount(inst);
+      inflight = inst.inflight.get();
+      boolean extra = (selector == null || selector.isBlank() || countOf(inst, selector) > 0)
+          && (text == null || text.isBlank() || bodyContains(inst, text));
+      if (current != mutations) {
+        mutations = current;
+        stableSince = now;
+      }
+      if (extra && inflight == 0 && now - stableSince >= quiet) {
+        return RespBodyVo.ok(Kv.by("idle", true).set("waitedMs", now - startedAt).set("mutations", mutations)
+            .set("inflight", 0).set("quietMs", quiet).set("timeoutSeconds", timeout / 1000.0)
+            .set("url", safeUrl(inst.page)));
+      }
+      if (now >= deadline) {
+        Kv data = Kv.by("idle", false).set("waitedMs", now - startedAt).set("mutations", mutations)
+            .set("inflight", inflight).set("quietMs", quiet).set("url", safeUrl(inst.page))
+            .set("selectorMatched", selector == null || selector.isBlank() || countOf(inst, selector) > 0)
+            .set("textMatched", text == null || text.isBlank() || bodyContains(inst, text));
+        RespBodyVo failure = RespBodyVo.fail("wait_for_idle 失败：" + (timeout / 1000.0) + " 秒内页面没有安静下来"
+            + "（在途请求 " + inflight + " 个，DOM 变更累计 " + mutations + " 次）");
+        failure.setData(data);
+        return failure;
+      }
+      inst.page.waitForTimeout(100);
+    }
+  }
+
+  /** 读页面里的 DOM 变更计数(第一次调用会装上 MutationObserver) */
+  private static int readMutationCount(BrowserInstance inst) {
+    try {
+      Object result = inst.page.evaluate(MUTATION_PROBE);
+      if (result instanceof Map) {
+        Object mutations = ((Map<?, ?>) result).get("mutations");
+        return mutations instanceof Number ? ((Number) mutations).intValue() : 0;
+      }
+    } catch (PlaywrightException e) {
+      log.debug("读取 DOM 变更计数失败:{}", briefMessage(e.getMessage()));
+    }
+    return 0;
+  }
+
+  private static int countOf(BrowserInstance inst, String selector) {
+    try {
+      return inst.page.locator(selector).count();
+    } catch (PlaywrightException e) {
+      return 0;
+    }
+  }
+
+  private static boolean bodyContains(BrowserInstance inst, String text) {
+    try {
+      return Boolean.TRUE.equals(inst.page.evaluate(
+          "(t) => (document.body ? document.body.innerText : '').includes(t)", text));
+    } catch (PlaywrightException e) {
+      return false;
+    }
+  }
+
+  // ==================== 等内容稳定 / 等数量达标 ====================
+
+  /** 内容指纹:正文 + 控件值 + 表格单元文本。与「DOM 变更计数」不同,它只看内容有没有变 */
+  private static final String CONTENT_FINGERPRINT = """
+      (scope) => {
+        const root = scope ? document.querySelector(scope) : document.body;
+        if (!root) return null;
+        const parts = [root.innerText || ''];
+        root.querySelectorAll('input,textarea,select').forEach(e => parts.push(String(e.value), String(e.checked)));
+        root.querySelectorAll('table tr').forEach(r => parts.push((r.innerText || '').replace(/\\s+/g, ' ')));
+        const source = parts.join('|');
+        let hash = 2166136261;
+        for (let i = 0; i < source.length; i++) hash = Math.imul(hash ^ source.charCodeAt(i), 16777619);
+        return {
+          length: source.length,
+          fingerprint: String(hash >>> 0),
+          // 稳定之后调用方多半就是要读这段内容:顺手带回去,省掉一次 get_element_text / execute_js
+          text: (root.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 2000)
+        };
+      }
+      """;
+
+  /**
+   * 等内容稳定:正文/表单值/表格内容在连续 quietMs 毫秒内不再变化
+   *
+   * <p>
+   * 与 {@code wait_for_idle} 的分工:idle 看的是「DOM 变更计数 + 在途请求」,适合「点一下、
+   * 等它保存完」;stable 看的是**内容**,适合「搜索/查询结果异步刷新」——这时页面可能一直在动
+   * (动画、计时器),但真正要读的内容会在某一刻定下来。
+   *
+   * <p>
+   * 实测踩过的坑:点「查询」后立刻读结果,读到的是**上一次**的搜索结果,表现成「明明有这一行却
+   * 找不到」。先 stable 再读就不会错位。
+   *
+   * @param selector 只盯这个容器(可选,默认整个 body)
+   * @param quietMs  需要连续稳定多久,默认 800
+   * @return {@code {stable:true, waitedMs, changes, length, fingerprint, text}};超时返回失败并带上
+   *         「已变化几次 / 距上次变化多久」,便于判断是内容一直在刷还是压根没加载
+   */
+  public RespBodyVo waitForStable(Long browserId, String selector, Integer quietMs, Double timeoutSeconds) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    long quiet = quietMs == null || quietMs < 0 ? 800 : quietMs;
+    long timeout = (long) timeoutMillis(timeoutSeconds);
+    long startedAt = System.currentTimeMillis();
+    long deadline = startedAt + timeout;
+    String last = null;
+    long stableSince = startedAt;
+    int changes = 0;
+    int length = 0;
+    while (true) {
+      long now = System.currentTimeMillis();
+      Kv probe = contentProbe(inst, selector);
+      if (probe == null) {
+        RespBodyVo failure = RespBodyVo.fail("wait_for_stable 失败：读不到内容指纹"
+            + (selector == null || selector.isBlank() ? "" : "（选择器 " + selector + " 没有命中元素）"));
+        failure.setData(Kv.by("stable", false).set("selector", selector).set("url", safeUrl(inst.page)));
+        return failure;
+      }
+      String fingerprint = probe.getStr("fingerprint");
+      length = asInt(probe.get("length"));
+      if (!Objects.equals(fingerprint, last)) {
+        last = fingerprint;
+        stableSince = now;
+        changes++;
+      }
+      if (now - stableSince >= quiet) {
+        return RespBodyVo.ok(Kv.by("stable", true).set("waitedMs", now - startedAt).set("quietMs", quiet)
+            .set("changes", changes).set("length", length).set("fingerprint", fingerprint)
+            .set("text", probe.get("text")).set("selector", selector).set("url", safeUrl(inst.page)));
+      }
+      if (now >= deadline) {
+        RespBodyVo failure = RespBodyVo.fail("wait_for_stable 失败：" + (timeout / 1000.0)
+            + " 秒内内容一直没稳定下来（已变化 " + changes + " 次，最近一次变化在 " + (now - stableSince) + " ms 前）");
+        failure.setData(Kv.by("stable", false).set("waitedMs", now - startedAt).set("changes", changes)
+            .set("quietMs", quiet).set("msSinceLastChange", now - stableSince).set("url", safeUrl(inst.page)));
+        return failure;
+      }
+      inst.page.waitForTimeout(150);
+    }
+  }
+
+  /** 读内容指纹;读不到(容器不存在/脚本报错)返回 null */
+  private static Kv contentProbe(BrowserInstance inst, String selector) {
+    try {
+      Object raw = inst.page.evaluate(CONTENT_FINGERPRINT, selector == null || selector.isBlank() ? null : selector);
+      if (!(raw instanceof Map)) {
+        return null;
+      }
+      Kv probe = new Kv();
+      probe.putAll((Map<?, ?>) raw);
+      return probe;
+    } catch (PlaywrightException e) {
+      return null;
+    }
+  }
+
+  /**
+   * 等某个选择器的命中数量达到条件
+   *
+   * <p>
+   * 两个最常用的用途:等弹窗/遮罩**全部消失**({@code max:0})、等结果行**出现**({@code min:1})。
+   * 以前这两件事都只能手写 {@code execute_js} 轮询,每写一次就多一段容易写错的循环。
+   *
+   * @param min/max/equals 三个条件可以只给一个,也可以一起给(都要满足)
+   * @return {@code {matched:true, count, waitedMs}};超时返回失败并带上当时的 count
+   */
+  public RespBodyVo waitForCount(Long browserId, String selector, Integer min, Integer max, Integer equals,
+      Double timeoutSeconds) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    if (min == null && max == null && equals == null) {
+      return RespBodyVo.fail("wait_for_count 需要 min / max / equals 里至少一个条件");
+    }
+    long timeout = (long) timeoutMillis(timeoutSeconds);
+    long startedAt = System.currentTimeMillis();
+    long deadline = startedAt + timeout;
+    int count = 0;
+    while (true) {
+      count = countOf(inst, selector);
+      if ((min == null || count >= min) && (max == null || count <= max) && (equals == null || count == equals)) {
+        return RespBodyVo.ok(Kv.by("matched", true).set("count", count).set("waitedMs",
+            System.currentTimeMillis() - startedAt).set("selector", selector).set("url", safeUrl(inst.page)));
+      }
+      long now = System.currentTimeMillis();
+      if (now >= deadline) {
+        RespBodyVo failure = RespBodyVo.fail("wait_for_count 失败：" + (timeout / 1000.0) + " 秒内 " + selector
+            + " 的命中数没达到条件（实际 " + count + describeCountCondition(min, max, equals) + "）");
+        failure.setData(Kv.by("matched", false).set("count", count).set("waitedMs", now - startedAt)
+            .set("selector", selector).set("url", safeUrl(inst.page)));
+        return failure;
+      }
+      inst.page.waitForTimeout(120);
+    }
+  }
+
+  private static String describeCountCondition(Integer min, Integer max, Integer equals) {
+    StringBuilder sb = new StringBuilder("（要求");
+    if (equals != null) {
+      sb.append("等于 ").append(equals);
+    }
+    if (min != null) {
+      sb.append(equals != null ? "、" : "").append("≥ ").append(min);
+    }
+    if (max != null) {
+      sb.append((equals != null || min != null) ? "、" : "").append("≤ ").append(max);
+    }
+    return sb.append("）").toString();
+  }
+
+  // ==================== 表单状态 ====================
+
+  /**
+   * 读表单状态:每个控件的标签、值、可见性、禁用/只读、校验态,外加一份错误清单
+   *
+   * <p>
+   * <b>为什么需要它</b>:填长表单时「这个值到底进没进框架的模型」是最难判断的事——用
+   * {@code execute_js} 改 DOM 的值,页面上看着填好了,站点自己的预览页/提交内容里却可能是空的。
+   * 有了这个命令,一次调用就能把整张表单读回来(包括每个字段的错误文案),不用每次手写一段 JS
+   * 去遍历 {@code .ant-form-item}。密码字段的值一律不返回,只返回 {@code [redacted]}。
+   *
+   * @param selector      作用范围,默认整页({@code document})
+   * @param includeHidden 是否包含不可见控件,默认 false
+   * @param max           最多返回多少个控件,默认 200
+   */
+  public RespBodyVo getFormState(Long browserId, String selector, Boolean includeHidden, Integer max) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    JSONObject args = new JSONObject();
+    args.put("selector", selector);
+    args.put("includeHidden", includeHidden != null && includeHidden);
+    args.put("max", max == null || max <= 0 ? 200 : max);
+    Object result;
+    try {
+      result = inst.page.evaluate(FORM_STATE, args);
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail("get_form_state 失败：" + briefMessage(e.getMessage()));
+    }
+    if (!(result instanceof Map)) {
+      return RespBodyVo.fail("get_form_state 失败：页面没有返回表单信息");
+    }
+    Kv data = new Kv();
+    data.putAll((Map) result);
+    data.set("url", safeUrl(inst.page));
+    data.set("scope", selector == null || selector.isBlank() ? "document" : selector);
+    return RespBodyVo.ok(data);
+  }
+
+  /**
+   * 表单状态探针
+   *
+   * <p>标签的取法按优先级来:显式 {@code label[for]} / {@code aria-label} / 最近的表单项容器里的
+   * {@code label} / 前一个兄弟节点 / {@code placeholder}——政务与后台系统的表单实现千差万别,只认一种
+   * 写法会漏掉大半字段。
+   */
+  private static final String FORM_STATE = """
+      (args) => {
+        const scope = args.selector ? document.querySelector(args.selector) : document;
+        if (!scope) return {error: 'scope-not-found', count: 0, fields: [], errors: []};
+        const labelOf = (el) => {
+          try {
+            if (el.labels && el.labels.length) return (el.labels[0].innerText || '').replace(/\\s+/g, ' ').trim();
+            const aria = el.getAttribute('aria-label');
+            if (aria) return aria.trim();
+            const item = el.closest('.ant-form-item, .form-item, .el-form-item, [class*="form-item"]');
+            if (item) {
+              const l = item.querySelector('label');
+              if (l && l.innerText) return l.innerText.replace(/[:：*\\s]+$/g, '').replace(/\\s+/g, ' ').trim();
+            }
+            const prev = el.previousElementSibling;
+            if (prev && prev.innerText) return prev.innerText.replace(/\\s+/g, ' ').trim().slice(0, 60);
+            return el.getAttribute('placeholder') || null;
+          } catch (e) { return null; }
+        };
+        const fields = [];
+        const controls = Array.from(scope.querySelectorAll('input,textarea,select'));
+        for (const el of controls) {
+          const type = (el.getAttribute('type') || el.tagName.toLowerCase()).toLowerCase();
+          if (type === 'hidden' && !args.includeHidden) continue;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          const visible = rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden'
+            && style.display !== 'none' && (el.offsetParent !== null || style.position === 'fixed');
+          if (!visible && !args.includeHidden) continue;
+          const item = el.closest('.ant-form-item, .form-item, .el-form-item, [class*="form-item"]');
+          let error = null;
+          let invalid = false;
+          if (item) {
+            const message = item.querySelector('.ant-form-item-explain-error, [class*="error-message"], .error');
+            if (message && message.innerText && message.innerText.trim()) error = message.innerText.trim();
+            invalid = /has-error|is-error|error/.test(String(item.className || ''));
+          }
+          fields.push({
+            label: labelOf(el),
+            id: el.id || null,
+            name: el.getAttribute('name') || null,
+            type: type,
+            value: type === 'password' ? '[redacted]' : (el.value === undefined ? null : el.value),
+            checked: typeof el.checked === 'boolean' ? el.checked : null,
+            disabled: !!el.disabled,
+            readOnly: !!el.readOnly,
+            required: !!el.required || el.getAttribute('aria-required') === 'true',
+            visible: visible,
+            invalid: invalid,
+            error: error,
+            placeholder: el.getAttribute('placeholder') || null
+          });
+          if (fields.length >= args.max) break;
+        }
+        const errors = fields.filter(f => f.error || f.invalid)
+          .map(f => ({label: f.label, id: f.id, error: f.error}));
+        return {count: fields.length, errorCount: errors.length, errors: errors, fields: fields,
+                truncated: fields.length >= args.max};
+      }
+      """;
+
   // ==================== 鼠标 ====================
 
   public RespBodyVo mouseMove(Long browserId, double x, double y) {
@@ -2839,6 +4483,81 @@ public class PlaywrightService {
     return RespBodyVo.ok();
   }
 
+  /**
+   * 按坐标真实鼠标点击(一条命令顶原来的 mouse_move + mouse_down + mouse_up 三条)
+   *
+   * <p>
+   * 坐标是**视口坐标**(左上角为原点),与 {@code get_modals} 回的 {@code closePoint}、
+   * {@code get_element_box} 回的盒子可以直接配合使用。
+   *
+   * <p>
+   * 什么时候需要它:JS 派发 click 无效的按钮(ant-design 的 {@code Modal.confirm} 确定按钮、
+   * 对话框右上角 ×)、被覆盖层挡住但确实要点到的元素、以及需要「真实事件序列」的场景
+   * (pointerdown/mousedown/pointerup/mouseup/click 全套由浏览器发出)。
+   */
+  public RespBodyVo mouseClick(Long browserId, double x, double y, String button, Integer clickCount) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    Kv before = stateProbe(inst);
+    try {
+      inst.page.mouse().click(x, y, new Mouse.ClickOptions().setButton(mouseButton(button))
+          .setClickCount(clickCount == null || clickCount <= 0 ? 1 : clickCount));
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail("mouse_click 失败：" + briefMessage(e.getMessage()));
+    }
+    return okWithReceipt(before, inst, "mouse_click", Kv.by("mode", "mouse").set("x", x).set("y", y));
+  }
+
+  /**
+   * 按选择器真实鼠标点击:元素滚进视口后点它的盒子中心
+   *
+   * <p>
+   * 与 {@code click_element_by_selector mode:"mouse"} 等价,单独留一个命令是为了「一眼看出这次
+   * 是真实鼠标点击」,不必记住 mode 的取值。
+   */
+  public RespBodyVo mouseClickBySelector(Long browserId, String selector, String button, Integer clickCount,
+      Integer timeoutMs) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    Locator locator = inst.page.locator(selector).first();
+    Kv before = stateProbe(inst);
+    ActionOutcome outcome = new ActionOutcome();
+    recordBlocker(locator, outcome);
+    if (!mouseClickAt(locator, button, clickCount)) {
+      return RespBodyVo.fail("mouse_click_by_selector 失败：拿不到元素盒子（选择器 " + selector
+          + " 没有命中可见元素）" + blockerSuffix(locator));
+    }
+    outcome.mode = "mouse";
+    outcome.record();
+    return okWithReceipt(before, inst, "mouse_click_by_selector", outcome.extra);
+  }
+
+  /** 真实鼠标点击某个元素(可指定键与次数);拿不到盒子返回 false */
+  private static boolean mouseClickAt(Locator locator, String button, Integer clickCount) {
+    try {
+      Locator target = locator.first();
+      try {
+        target.scrollIntoViewIfNeeded(new Locator.ScrollIntoViewIfNeededOptions().setTimeout(2_000));
+      } catch (PlaywrightException ignored) {
+        // 滚不动也继续试
+      }
+      BoundingBox box = target.boundingBox();
+      if (box == null || box.width <= 0 || box.height <= 0) {
+        return false;
+      }
+      target.page().mouse().click(box.x + box.width / 2, box.y + box.height / 2,
+          new Mouse.ClickOptions().setButton(mouseButton(button))
+              .setClickCount(clickCount == null || clickCount <= 0 ? 1 : clickCount));
+      return true;
+    } catch (PlaywrightException e) {
+      return false;
+    }
+  }
+
   // ==================== 截图与 PDF ====================
 
   /**
@@ -2846,52 +4565,97 @@ public class PlaywrightService {
    *
    * <p>
    * 传了 index 或 selector 时只截该元素;否则截整页,可以用 clipX/clipY/clipWidth/clipHeight
-   * 指定裁剪区域(四个都传才生效)。path 为空时返回 data.base64。
+   * 指定裁剪区域(四个都传才生效)。
+   *
+   * <p>
+   * <b>默认落盘,不回 base64</b>:没给 {@code path} 时服务自己写到 {@code data/&lt;id&gt;/shot-N.png},
+   * 只返回路径与可直接 GET 的 URL。理由是 base64 会把整张图塞进模型上下文——一次几十 KB,读几次就
+   * 把上下文淹了,而定位与操作要的信息全在结构化文本里。确实需要内联图片时显式传 {@code inline:true}。
    */
   public RespBodyVo screenshot(Long browserId, String path, Boolean fullPage, Integer index, String selector,
-      Double clipX, Double clipY, Double clipWidth, Double clipHeight) {
+      Double clipX, Double clipY, Double clipWidth, Double clipHeight, Boolean inline) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     if (index != null || (selector != null && !selector.isEmpty())) {
-      return elementScreenshot(inst, index, selector, path);
+      return elementScreenshot(inst, index, selector, path, inline);
+    }
+    boolean wantInline = inline != null && inline;
+    String target = path;
+    if ((target == null || target.isEmpty()) && !wantInline) {
+      target = defaultShotPath(inst);
     }
     Page.ScreenshotOptions options = new Page.ScreenshotOptions().setFullPage(fullPage != null && fullPage);
     if (clipX != null && clipY != null && clipWidth != null && clipHeight != null) {
       options.setClip(clipX, clipY, clipWidth, clipHeight);
     }
-    if (path != null && !path.isEmpty()) {
-      ensureParent(path);
-      options.setPath(Paths.get(path));
+    if (target != null && !target.isEmpty()) {
+      ensureParent(target);
+      options.setPath(Paths.get(target));
     }
     try {
       byte[] bytes = inst.page.screenshot(options);
-      if (path != null && !path.isEmpty()) {
-        return RespBodyVo.ok(Kv.by("path", path).set("size", bytes.length));
+      Kv data = Kv.by("size", bytes.length);
+      if (target != null && !target.isEmpty()) {
+        data.set("path", target);
+        data.set("url", shotUrl(inst, target));
       }
-      return RespBodyVo.ok(Kv.by("base64", Base64.getEncoder().encodeToString(bytes)).set("size", bytes.length));
+      if (wantInline) {
+        data.set("base64", Base64.getEncoder().encodeToString(bytes));
+        data.set("inline", true);
+      } else {
+        data.set("inline", false).set("base64Omitted", true).set("note",
+            "默认不返回 base64(会把整张图塞进上下文):要看图请 GET data.url,确实需要内联再传 inline=true");
+      }
+      return RespBodyVo.ok(data);
     } catch (PlaywrightException e) {
       return RespBodyVo.fail("screenshot 失败：" + briefMessage(e.getMessage()));
     }
   }
 
+  /** 服务端自己给截图起的名:data/<id>/shot-N.png,N 只增不减 */
+  private static String defaultShotPath(BrowserInstance inst) {
+    int n = inst.shotSeq.incrementAndGet();
+    return dataDir(inst.id).resolve("shot-" + n + ".png").toString();
+  }
+
+  /** 落盘路径在 data/<id>/ 下时给出可直接 GET 的 URL,否则只报路径 */
+  private static String shotUrl(BrowserInstance inst, String path) {
+    try {
+      Path file = Paths.get(path).toAbsolutePath().normalize();
+      Path dir = dataDir(inst.id).toAbsolutePath().normalize();
+      if (file.startsWith(dir)) {
+        return "/" + DATA_DIR + "/" + inst.id + "/" + dir.relativize(file).toString().replace('\\', '/');
+      }
+    } catch (RuntimeException e) {
+      log.debug("计算截图 URL 失败:{}", briefMessage(e.getMessage()));
+    }
+    return null;
+  }
+
   /**
-   * 只截一个元素,返回 data.path+data.size 或 data.base64
+   * 只截一个元素,返回 data.path+data.url(默认)或 data.base64(inline=true)
    *
    * <p>
    * 和用 execute_js + canvas 抠图相比,这里走 Playwright 自己的截图,不受 canvas 跨域污染限制,
-   * 验证码、二维码、图表这类"必须看图"的元素都能拿到。
+   * 验证码、二维码、图表这类"必须看图"的元素都能拿到。默认同样落盘不回 base64,理由见
+   * {@link #screenshot}。
    */
   public RespBodyVo getElementScreenshot(Long browserId, Integer index, String selector, String path) {
+    return getElementScreenshot(browserId, index, selector, path, null);
+  }
+
+  public RespBodyVo getElementScreenshot(Long browserId, Integer index, String selector, String path, Boolean inline) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
-    return elementScreenshot(inst, index, selector, path);
+    return elementScreenshot(inst, index, selector, path, inline);
   }
 
-  private RespBodyVo elementScreenshot(BrowserInstance inst, Integer index, String selector, String path) {
+  private RespBodyVo elementScreenshot(BrowserInstance inst, Integer index, String selector, String path,
+      Boolean inline) {
     Locator locator;
     String target;
     if (index != null) {
@@ -2906,15 +4670,27 @@ public class PlaywrightService {
     } else {
       return RespBodyVo.fail("get_element_screenshot 需要 index 或 selector");
     }
+    boolean wantInline = inline != null && inline;
+    String file = path;
+    if ((file == null || file.isEmpty()) && !wantInline) {
+      file = defaultShotPath(inst);
+    }
     try {
-      byte[] bytes = locator.screenshot(new Locator.ScreenshotOptions().setTimeout(INDEX_ACTION_TIMEOUT_MS));
-      if (path != null && !path.isEmpty()) {
-        ensureParent(path);
-        Files.write(Paths.get(path), bytes);
-        return RespBodyVo.ok(Kv.by("path", path).set("size", bytes.length).set("target", target));
+      byte[] bytes = locator.screenshot(new Locator.ScreenshotOptions().setTimeout(actionTimeoutMs()));
+      Kv data = Kv.by("size", bytes.length).set("target", target);
+      if (file != null && !file.isEmpty()) {
+        ensureParent(file);
+        Files.write(Paths.get(file), bytes);
+        data.set("path", file);
+        data.set("url", shotUrl(inst, file));
       }
-      return RespBodyVo.ok(
-          Kv.by("base64", Base64.getEncoder().encodeToString(bytes)).set("size", bytes.length).set("target", target));
+      if (wantInline) {
+        data.set("base64", Base64.getEncoder().encodeToString(bytes)).set("inline", true);
+      } else {
+        data.set("inline", false).set("base64Omitted", true).set("note",
+            "默认不返回 base64:要看图请 GET data.url,确实需要内联再传 inline=true");
+      }
+      return RespBodyVo.ok(data);
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(locateFailure("get_element_screenshot", target, e));
     } catch (IOException e) {
@@ -3173,6 +4949,287 @@ public class PlaywrightService {
     return RespBodyVo.ok(Kv.by("dismiss", dismiss));
   }
 
+  // ==================== DOM 弹窗(与上面的原生 alert/confirm 是两回事) ====================
+
+  /**
+   * 页面上当前可见的 DOM 弹窗
+   *
+   * <p>
+   * <b>和 {@code get_dialog} 的区别</b>:那个是浏览器**原生**对话框({@code window.alert/confirm/prompt}),
+   * 由 Playwright 的事件接住;这里是页面里的 **DOM 弹窗**——ant-design 的 {@code .ant-modal-wrap}、
+   * 各类 {@code [role=dialog]}、以及「用户服务协议」这类自定义遮罩层({@code .agreement-container})。
+   * 两者名字相近但完全不是一回事,以前只有前者,于是「页面上明明有个弹窗挡着」在接口里是看不见的。
+   *
+   * <p>
+   * 返回的每一项都带 {@code buttons}(按钮文本)、{@code rect} 和 {@code closePoint}(右上角 × 的
+   * 视口坐标,可直接喂给 {@code mouse_click}),以及 {@code coveredHint} 需要的信息。
+   */
+  public RespBodyVo getModals(Long browserId) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    Kv probe = modalProbe(inst);
+    if (probe == null) {
+      return RespBodyVo.fail("get_modals 失败：读取页面弹窗失败");
+    }
+    return RespBodyVo.ok(probe);
+  }
+
+  /** 页面上可见的弹窗清单(DOM 顺序:旧的在前,最顶层/最新的是最后一个) */
+  private static final String MODALS_PROBE = """
+      () => {
+        const vis = (el) => {
+          if (!el) return false;
+          const cs = getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+        };
+        const text = (el) => el ? (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 80) : null;
+        const center = (el) => {
+          const r = el.getBoundingClientRect();
+          return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)];
+        };
+        const describe = (el, kind) => {
+          const titleEl = el.querySelector('.ant-modal-title, .ant-modal-confirm-title, .ant-drawer-title, [class*=title]');
+          const buttons = [];
+          el.querySelectorAll('button, .ant-btn, a[role=button], [role=button]').forEach(b => {
+            if (!vis(b)) return;
+            const label = (b.innerText || '').trim().replace(/\\s+/g, '');
+            if (label) buttons.push({ label: label, point: center(b) });
+          });
+          const closeEl = el.querySelector('.ant-modal-close, .ant-modal-close-x, [aria-label=Close], [class*=close]');
+          const r = el.getBoundingClientRect();
+          return {
+            kind: kind,
+            title: text(titleEl),
+            text: text(el).slice(0, 80),
+            buttons: buttons.map(b => b.label),
+            buttonPoints: buttons,
+            hasClose: !!closeEl,
+            closePoint: closeEl && vis(closeEl) ? center(closeEl) : null,
+            rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+            zIndex: getComputedStyle(el).zIndex
+          };
+        };
+        const modals = [];
+        // 同一个弹窗会被多个选择器命中(ant 的弹窗里就有 role=dialog),所以收集时要去重:
+        // 已经收过的元素、以及被已收元素包住的元素都不再单独算一个,否则一个弹窗会数成两个
+        const seen = [];
+        const add = (el, kind) => {
+          if (!vis(el)) return;
+          for (const s of seen) {
+            if (s === el || s.contains(el) || el.contains(s)) return;
+          }
+          seen.push(el);
+          modals.push(describe(el, kind));
+        };
+        document.querySelectorAll('.ant-modal-wrap, .ant-drawer-open').forEach(el => add(el, 'ant-modal'));
+        document.querySelectorAll('.agreement-container, [class*=agreement]').forEach(el => add(el, 'agreement'));
+        document.querySelectorAll('[role=dialog], .el-dialog, .vxe-modal--wrapper, .layui-layer').forEach(
+          el => add(el, 'dialog'));
+        // 后出现的通常是后弹出来的,排在最后当作「最顶层」
+        return {
+          count: modals.length,
+          modals: modals,
+          top: modals.length ? modals[modals.length - 1] : null,
+          note: modals.length
+            ? 'modals 按 DOM 顺序排列,最后一个是最后弹出来的(通常就是最顶层);关它用 close_modal'
+            : '当前没有可见的 DOM 弹窗(get_dialog 看的是原生 alert/confirm,两者不同)'
+        };
+      }
+      """;
+
+  private static Kv modalProbe(BrowserInstance inst) {
+    try {
+      Object raw = inst.page.evaluate(MODALS_PROBE);
+      if (!(raw instanceof Map)) {
+        return null;
+      }
+      Kv probe = new Kv();
+      probe.putAll((Map<?, ?>) raw);
+      return probe;
+    } catch (PlaywrightException e) {
+      return null;
+    }
+  }
+
+  /**
+   * 关掉一个 DOM 弹窗
+   *
+   * <p>
+   * <b>为什么必须有这个命令</b>:实测 ant-design 的 {@code Modal.confirm}「确定/取消」和对话框右上角
+   * 的 × **只认真实鼠标事件**,JS 派发 click(甚至元素原生 {@code el.click()})完全无效——点了没反应、
+   * 弹窗不关,而接口照样回成功。反复点还会把确认框一层层叠起来(实测叠到 16 个),之后所有
+   * 「取第一个可见弹窗」的逻辑都在操作最老的那个。所以这里**一律用真实鼠标**点,并且点完**校验**
+   * 弹窗数量是否真的减少了,把结果如实写进回执。
+   *
+   * @param which  选哪个弹窗:{@code top}(默认,最后一个弹出来的)、{@code first}(最早那个)、
+   *               {@code all}(依次关掉全部)
+   * @param title  按标题/文本子串匹配(给了就以它为准,忽略 which)
+   * @param button 点哪个按钮:不给则优先右上角 ×,其次「取消/关闭/知道了/我接受」这类非提交按钮;
+   *               要给就写按钮文本(空格会被忽略,如 {@code 确定}、{@code 我接受})
+   * @return {@code {closed, countBefore, countAfter, clicked, closedAll}}
+   */
+  public RespBodyVo closeModal(Long browserId, String which, String title, String button) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    Kv before = modalProbe(inst);
+    if (before == null) {
+      return RespBodyVo.fail("close_modal 失败：读取页面弹窗失败");
+    }
+    int countBefore = asInt(before.get("count"));
+    if (countBefore == 0) {
+      return RespBodyVo.ok(Kv.by("closed", false).set("countBefore", 0).set("countAfter", 0)
+          .set("note", "当前没有可见的 DOM 弹窗,无需关闭"));
+    }
+    String mode = which == null || which.isBlank() ? "top" : which.trim().toLowerCase(java.util.Locale.ROOT);
+    List<Kv> targets = pickModals(before, mode, title);
+    if (targets.isEmpty()) {
+      return RespBodyVo.fail("close_modal 失败：没有匹配的弹窗（标题/文本含「" + title + "」的弹窗不存在,"
+          + "当前共 " + countBefore + " 个,用 get_modals 看清单）");
+    }
+    List<Kv> clicked = new ArrayList<>();
+    for (Kv target : targets) {
+      Kv hit = clickModalButton(inst, target, button);
+      if (hit != null) {
+        clicked.add(hit);
+      }
+      // 关掉一个就重新探一次:数量真的减少了才算成功
+      if (!"all".equals(mode)) {
+        break;
+      }
+      Kv now = modalProbe(inst);
+      if (now == null || asInt(now.get("count")) == 0) {
+        break;
+      }
+    }
+    Kv after = modalProbe(inst);
+    int countAfter = after == null ? countBefore : asInt(after.get("count"));
+    boolean closed = countAfter < countBefore;
+    Kv data = Kv.by("closed", closed).set("countBefore", countBefore).set("countAfter", countAfter)
+        .set("clicked", clicked).set("closedAll", countAfter == 0).set("which", mode);
+    if (title != null && !title.isBlank()) {
+      data.set("title", title);
+    }
+    if (!closed) {
+      data.set("hint", "点了按钮但弹窗数量没减少:该弹窗可能只认真实鼠标事件、或点中的不是它的关闭按钮。"
+          + "用 get_modals 拿 closePoint / buttonPoints,再直接 mouse_click 那个坐标");
+    }
+    return RespBodyVo.ok(data);
+  }
+
+  /** 按 which/title 选出要关的弹窗 */
+  @SuppressWarnings("unchecked")
+  private static List<Kv> pickModals(Kv probe, String which, String title) {
+    List<Kv> all = new ArrayList<>();
+    Object raw = probe.get("modals");
+    if (raw instanceof List) {
+      for (Object item : (List<Object>) raw) {
+        if (item instanceof Map) {
+          Kv modal = new Kv();
+          modal.putAll((Map<?, ?>) item);
+          all.add(modal);
+        }
+      }
+    }
+    if (title != null && !title.isBlank()) {
+      String needle = title.replaceAll("\\s+", "");
+      List<Kv> matched = new ArrayList<>();
+      for (Kv modal : all) {
+        String haystack = String.valueOf(modal.getStr("title")) + String.valueOf(modal.getStr("text"));
+        if (haystack.replaceAll("\\s+", "").contains(needle)) {
+          matched.add(modal);
+        }
+      }
+      return matched;
+    }
+    if ("all".equals(which)) {
+      return all;
+    }
+    if ("first".equals(which)) {
+      return all.isEmpty() ? all : List.of(all.get(0));
+    }
+    return all.isEmpty() ? all : List.of(all.get(all.size() - 1));
+  }
+
+  /** 真实鼠标点弹窗里的一个按钮;成功返回点了什么 */
+  @SuppressWarnings("unchecked")
+  private static Kv clickModalButton(BrowserInstance inst, Kv modal, String button) {
+    List<Kv> points = new ArrayList<>();
+    Object rawButtons = modal.get("buttonPoints");
+    if (rawButtons instanceof List) {
+      for (Object item : (List<Object>) rawButtons) {
+        if (item instanceof Map) {
+          Kv entry = new Kv();
+          entry.putAll((Map<?, ?>) item);
+          points.add(entry);
+        }
+      }
+    }
+    Kv chosen = null;
+    if (button != null && !button.isBlank()) {
+      String wanted = button.replaceAll("\\s+", "");
+      for (Kv entry : points) {
+        if (wanted.equals(String.valueOf(entry.getStr("label")).replaceAll("\\s+", ""))) {
+          chosen = entry;
+          break;
+        }
+      }
+      if (chosen == null) {
+        // 指定的按钮不存在:退回默认策略,但把这件事说清楚
+        chosen = defaultModalButton(modal, points);
+      }
+    } else {
+      chosen = defaultModalButton(modal, points);
+    }
+    if (chosen == null) {
+      return null;
+    }
+    Object point = chosen.get("point");
+    if (!(point instanceof List) || ((List<Object>) point).size() < 2) {
+      return null;
+    }
+    List<Object> coords = (List<Object>) point;
+    double x = ((Number) coords.get(0)).doubleValue();
+    double y = ((Number) coords.get(1)).doubleValue();
+    try {
+      // 关键:真实鼠标事件。JS 派发对这类按钮无效
+      inst.page.mouse().click(x, y);
+      inst.page.waitForTimeout(400);
+    } catch (PlaywrightException e) {
+      return Kv.by("label", chosen.getStr("label")).set("point", point)
+          .set("error", briefMessage(e.getMessage()));
+    }
+    return Kv.by("label", chosen.getStr("label")).set("point", point).set("via", "mouse");
+  }
+
+  /**
+   * 默认点哪个按钮:先右上角 ×,再「取消/关闭/知道了/我接受」这类**非提交**按钮
+   *
+   * <p>
+   * 刻意把「确定/提交」排在最后:关弹窗的命令不该顺手把「删除」「提交」按下去。
+   */
+  @SuppressWarnings("unchecked")
+  private static Kv defaultModalButton(Kv modal, List<Kv> points) {
+    Object closePoint = modal.get("closePoint");
+    if (closePoint instanceof List && ((List<Object>) closePoint).size() >= 2) {
+      return Kv.by("label", "关闭按钮(×)").set("point", closePoint);
+    }
+    List<String> preferred = List.of("取消", "关闭", "知道了", "我接受", "取 消", "关 闭", "确定", "确 定");
+    for (String name : preferred) {
+      String wanted = name.replaceAll("\\s+", "");
+      for (Kv entry : points) {
+        if (wanted.equals(String.valueOf(entry.getStr("label")).replaceAll("\\s+", ""))) {
+          return entry;
+        }
+      }
+    }
+    return null;
+  }
+
   public RespBodyVo getConsoleLogs(Long browserId) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
@@ -3245,24 +5302,73 @@ public class PlaywrightService {
   }
 
   public RespBodyVo getRequests(Long browserId, String filter) {
+    return getRequests(browserId, filter, null, null, null);
+  }
+
+  /**
+   * 读这个任务页签上记录到的请求
+   *
+   * <p>
+   * <b>为什么以前会「什么都读不到」</b>:记录是挂在**页签**上的,而且是从页签被这个任务认领那一刻
+   * 才开始记。所以「页面在 start 之前就加载完的请求」「发生在另一个页签里的请求」都不在这里,
+   * 空结果并不代表记录坏了。现在回执里带上 {@code recordedSince}(从什么时候开始记)、{@code inflight}
+   * (此刻还有几个在途请求)与一句 {@code note},空的时候一眼能看出是哪种情况。
+   *
+   * @param filter       按 URL 子串过滤
+   * @param resourceType 按类型过滤(document/xhr/fetch/script/image…),可选
+   * @param limit        最多返回多少条(取**最新**的 N 条),可选
+   * @param since        只返回这个时间戳(毫秒)之后发起的请求,可选
+   */
+  public RespBodyVo getRequests(Long browserId, String filter, String resourceType, Integer limit, Long since) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
-    return RespBodyVo.ok(Kv.by("requests", filterRequests(inst, filter)));
+    List<Kv> matched = filterRequests(inst, filter, resourceType, since);
+    if (limit != null && limit > 0 && matched.size() > limit) {
+      matched = new ArrayList<>(matched.subList(matched.size() - limit, matched.size()));
+    }
+    Kv data = Kv.by("requests", matched).set("count", matched.size()).set("total", inst.requests.size())
+        .set("recordedSince", inst.recorderAttachedAt).set("inflight", inst.inflight.get())
+        .set("filter", filter).set("resourceType", resourceType);
+    if (matched.isEmpty()) {
+      data.set("note", inst.recorderAttachedAt == 0
+          ? "这个任务还没有认领页签,所以什么都没记到"
+          : "没有匹配的请求。记录挂在页签上、且从认领那一刻开始:页面在 start 之前发出的请求、"
+              + "以及发生在别的页签里的请求都不会出现在这里。先做一次动作(导航/点击)再读,"
+              + "或检查 filter/resourceType 是否把结果过滤掉了");
+    }
+    return RespBodyVo.ok(data);
   }
 
-  /** 按 URL 子串过滤请求记录(最多 200 条),filter 为空时返回全部 */
+  /** 按 URL 子串/类型/时间过滤请求记录(最多 200 条),都不传时返回全部 */
   private static List<Kv> filterRequests(BrowserInstance inst, String filter) {
+    return filterRequests(inst, filter, null, null);
+  }
+
+  private static List<Kv> filterRequests(BrowserInstance inst, String filter, String resourceType, Long since) {
     List<Kv> all = new ArrayList<>(inst.requests);
-    if (filter == null || filter.isEmpty()) {
-      return all;
-    }
     List<Kv> matched = new ArrayList<>();
     for (Kv kv : all) {
-      if (kv.getStr("url") != null && kv.getStr("url").contains(filter)) {
-        matched.add(kv);
+      if (filter != null && !filter.isEmpty()) {
+        String url = kv.getStr("url");
+        if (url == null || !url.contains(filter)) {
+          continue;
+        }
       }
+      if (resourceType != null && !resourceType.isEmpty()) {
+        String type = kv.getStr("resourceType");
+        if (type == null || !type.equalsIgnoreCase(resourceType)) {
+          continue;
+        }
+      }
+      if (since != null) {
+        Object at = kv.get("requestedAt");
+        if (at instanceof Number && ((Number) at).longValue() < since) {
+          continue;
+        }
+      }
+      matched.add(kv);
     }
     return matched;
   }
@@ -3564,9 +5670,33 @@ public class PlaywrightService {
     if (inst == null) {
       return notFound(browserId);
     }
+    if (inst.domState == null) {
+      // 以前这里直接失败,要求调用方「先调 get_browser_state」——多一次往返,而且很容易漏。
+      // 索引本来就是本命令的产物,自己建一次快照即可(不落盘,不产生截图/文本垃圾文件)。
+      RespBodyVo built = buildState(inst, false, 0);
+      if (!built.isOk()) {
+        return built;
+      }
+    }
+    List<Kv> items = interactiveElements(inst);
+    return RespBodyVo.ok(Kv.by("count", items.size()).set("elements", items)
+        .set("source", "get_browser_state 快照(索引与 click_element_by_index / input_text / "
+            + "check_element_by_index 等按索引命令共用)"));
+  }
+
+  /**
+   * 当前快照里的可交互元素清单
+   *
+   * <p>
+   * 索引型命令(click_element_by_index、input_text、check_element_by_index、get_element_text …)靠的就是
+   * 这份清单里的 {@code index};以前只有 {@code get_interactive_map} 能拿到它,而 {@code get_browser_state}
+   * 只回一棵文本树,调用方很容易以为索引 API 不可用(实测踩过:整场任务全部退回手写 execute_js)。
+   */
+  private static List<Kv> interactiveElements(BrowserInstance inst) {
     DOMState state = inst.domState;
-    if (state == null) {
-      return RespBodyVo.fail("get_interactive_map 需要先调用 get_browser_state 获取元素索引");
+    List<Kv> items = new ArrayList<>();
+    if (state == null || state.getSelectorMap() == null) {
+      return items;
     }
     List<Integer> indices = new ArrayList<>(state.getSelectorMap().keySet());
     indices.sort(null);
@@ -3575,18 +5705,24 @@ public class PlaywrightService {
       DOMElementNode node = state.getSelectorMap().get(index);
       xpaths.add("/" + (node == null ? "" : node.getXpath()));
     }
-    List<Kv> items = new ArrayList<>();
     Object raw;
     try {
       raw = inst.page.evaluate("(list) => list.map(xpath => {"
           + " const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
-          + " const e = r.singleNodeValue; if (!e) return null;" + " return { tag: e.tagName, id: e.id || null,"
+          + " const e = r.singleNodeValue; if (!e) return null;"
+          + " const rect = e.getBoundingClientRect();"
+          + " return { tag: e.tagName, id: e.id || null,"
           + " className: typeof e.className === 'string' ? e.className : null,"
           + " href: e.getAttribute ? e.getAttribute('href') : null,"
           + " name: e.getAttribute ? e.getAttribute('name') : null,"
-          + " text: (e.innerText || '').trim().slice(0, 120) }; })", xpaths);
+          + " type: e.getAttribute ? e.getAttribute('type') : null,"
+          + " value: (e.value === undefined ? null : String(e.value).slice(0, 120)),"
+          + " checked: (e.checked === undefined ? null : !!e.checked),"
+          + " visible: rect.width > 0 && rect.height > 0,"
+          + " rect: [Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)],"
+          + " text: (e.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 120) }; })", xpaths);
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail("get_interactive_map 失败：" + briefMessage(e.getMessage()));
+      return items;
     }
     List<?> list = raw instanceof List ? (List<?>) raw : new ArrayList<>();
     for (int i = 0; i < indices.size(); i++) {
@@ -3601,7 +5737,7 @@ public class PlaywrightService {
       }
       items.add(item);
     }
-    return RespBodyVo.ok(Kv.by("count", items.size()).set("elements", items));
+    return items;
   }
 
   // ==================== 人机协同 ====================
@@ -3639,7 +5775,8 @@ public class PlaywrightService {
     Kv data = Kv.by("requestId", requestId).set("prompt", prompt).set("expiresAt", expiresAt).set("url",
         inst.page.url());
     if (index != null || (selector != null && !selector.isEmpty())) {
-      RespBodyVo shot = elementScreenshot(inst, index, selector, null);
+      // 请人看验证码/二维码是「确实必须看图」的场景,这里显式要内联图片
+      RespBodyVo shot = elementScreenshot(inst, index, selector, null, Boolean.TRUE);
       if (shot.isOk() && shot.getData() instanceof Kv) {
         Kv shotData = (Kv) shot.getData();
         data.set("imageBase64", shotData.getStr("base64"));

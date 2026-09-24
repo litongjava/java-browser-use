@@ -88,6 +88,15 @@ public final class ChromeBrowser {
    */
   public static final String KEY_PROFILE_DIR = "browser.profileDir";
 
+  /**
+   * 没显式配 {@code browser.profileDir} 时,是否按服务端口派生托管 profile 目录(默认开)
+   *
+   * <p>
+   * 开了之后默认目录从 {@code profiles/shared} 变成 {@code profiles/shared-<端口>},多个服务实例
+   * 同时跑不会抢同一份 profile 锁;要沿用老的 {@code shared} 就显式配 {@code browser.profileDir}。
+   */
+  public static final String KEY_PROFILE_DIR_PER_PORT = "browser.profileDir.perPort";
+
   /** 本类自带的配置资源 */
   private static final String CONFIG_RESOURCE = "browser.properties";
 
@@ -159,13 +168,54 @@ public final class ChromeBrowser {
    * <p>
    * 默认 {@code ~/.config/browseruse/profiles/shared}。这里是 agent 自己养登录态的地方 ——
    * 第一次登录之后,Cookie 就留在这份 profile 里,后续任务不用再登。
+   *
+   * <p>
+   * <b>多实例安全</b>:同一个 profile 目录同时只能被一个浏览器进程使用,两个服务实例(比如一个发布包
+   * 跑在 10049、一个开发态跑在 10050)共用同一份目录时,后启动的会撞上 profile 锁,而
+   * {@code releaseStaleProfileLock} 的自愈逻辑还有可能把**对方正在用的**浏览器当成孤儿清掉。
+   * 所以打开 {@code browser.profileDir.perPort}(默认开)时,没配 {@code browser.profileDir} 的情况
+   * 会按服务端口派生目录名({@code shared-10050}),各实例互不干扰。
+   *
+   * <p>
+   * 想沿用某一份已有的登录态(比如从单实例时代留下来的 {@code shared}),显式配
+   * {@code browser.profileDir} 指过去即可 —— 显式配置永远优先,不会被端口派生覆盖。
    */
   public static Path managedProfileDir() {
     String configured = config(KEY_PROFILE_DIR);
     if (configured != null) {
       return Paths.get(configured).toAbsolutePath().normalize();
     }
-    return Paths.get(EnvUtils.get("user.home", "."), ".config", "browseruse", "profiles", "shared");
+    Path base = Paths.get(EnvUtils.get("user.home", "."), ".config", "browseruse", "profiles", "shared");
+    if (!perPortProfileDir()) {
+      return base;
+    }
+    String suffix = portSuffix();
+    return suffix == null ? base : Paths.get(base.toString() + "-" + suffix);
+  }
+
+  /** 托管 profile 目录是否按端口派生(默认开,见 {@link #managedProfileDir()}) */
+  public static boolean perPortProfileDir() {
+    return booleanConfig(KEY_PROFILE_DIR_PER_PORT, true);
+  }
+
+  /**
+   * 当前服务端口,用于派生 profile 目录名
+   *
+   * @return 端口字符串;取不到(或非数字)时返回 null,调用方退回不分端口的老目录
+   */
+  private static String portSuffix() {
+    String port = config("server.port");
+    if (port == null) {
+      port = EnvUtils.get("server.port");
+    }
+    if (port == null || port.isBlank()) {
+      port = EnvUtils.get("SERVER_PORT");
+    }
+    if (port == null) {
+      return null;
+    }
+    String trimmed = port.trim();
+    return trimmed.matches("\\d+") ? trimmed : null;
   }
 
   /**
@@ -316,8 +366,14 @@ public final class ChromeBrowser {
     return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
   }
 
-  /** 清掉探测缓存,下次重新探测(测试里改完系统属性用) */
-  static void resetForTests() {
+  /**
+   * 清掉探测缓存,下次重新探测(测试里改完系统属性用)
+   *
+   * <p>public 是给**其它包的测试**用的:配置读取({@code ChromeBrowser.config})被 UploadStore、
+   * CommandTraceLog 这些同样走配置的类共用,而它们各自的测试在别的包里 —— 改完系统属性后必须能清掉
+   * 这份缓存,否则读到的还是上一个用例的设置。
+   */
+  public static void resetForTests() {
     synchronized (LOCK) {
       resolved = false;
       executablePath = null;

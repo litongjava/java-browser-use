@@ -12,6 +12,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -50,8 +51,16 @@ import nexus.io.model.body.RespBodyVo;
  * <li>{@code browser.trace.enabled}(默认 {@code true}):整个审计开关。关掉就完全不落盘;</li>
  * <li>{@code browser.trace.dir}:留空时是 {@code <启动目录>/logs/trace};</li>
  * <li>{@code browser.trace.maxRecordChars}(默认 8000000):单次调用完整报文的上限,超了截断并打标记
- * (只有 {@code screenshot} 不带 {@code path} 时的 base64 大图可能撞到这个值)。</li>
+ * (只有 {@code screenshot} 不带 {@code path} 时的 base64 大图可能撞到这个值);</li>
+ * <li>{@code browser.trace.redact.enabled}(默认 {@code true}):落盘前脱敏。填表这类任务里请求体带着
+ * 姓名、手机号、证件号、详细地址,原文留在磁盘上迟早出问题;</li>
+ * <li>{@code browser.trace.redact}:追加的自定义正则(逗号分隔),在内置规则之后生效;</li>
+ * <li>{@code browser.trace.redact.mask}(默认 {@code ***}):命中后替换成的文本。</li>
  * </ul>
+ *
+ * <p>
+ * 内置脱敏规则:手机号、18 位身份证号/统一社会信用代码、邮箱、16~19 位长数字。<b>脱敏是「尽力而为」</b>:
+ * 它按模式匹配,不认识的个人信息(例如姓名、门牌号)不会被掩掉,所以交付前仍要自己看一眼日志目录。
  *
  * <p>
  * <b>这里绝不影响业务</b>:所有写盘都在 try/catch 里,失败只留一条警告(且同一种失败只警告一次),
@@ -66,6 +75,26 @@ public final class CommandTraceLog {
   public static final String KEY_DIR = "browser.trace.dir";
   /** 单次调用完整报文的上限(字符数) */
   public static final String KEY_MAX_RECORD_CHARS = "browser.trace.maxRecordChars";
+  /** 脱敏开关,默认开 */
+  public static final String KEY_REDACT_ENABLED = "browser.trace.redact.enabled";
+  /** 自定义脱敏正则(逗号分隔),会**追加**在内置规则之后 */
+  public static final String KEY_REDACT = "browser.trace.redact";
+  /** 命中后替换成的文本 */
+  public static final String KEY_REDACT_MASK = "browser.trace.redact.mask";
+
+  /**
+   * 内置脱敏规则:手机号、18 位身份证/统一社会信用代码、邮箱、银行卡式长数字
+   *
+   * <p>
+   * 每条都带「前后不能还是数字/字母」的边界(而不是 {@code \b}),原因是有过一次实测教训:手机号规则
+   * {@code 1[3-9]\d{9}} 把 13 位的毫秒时间戳当成了手机号 —— 2026 年的 epoch 毫秒是 {@code 1790…},
+   * 开头正好是 {@code 17},于是日志里的 {@code recordedSince} 被掩成了 {@code ***87},排查时反而
+   * 看不懂。加上边界后,「一长串数字里的一截」不再算命中,独立的 11 位号码照旧命中。
+   */
+  private static final String[] BUILT_IN_PATTERNS = { "(?<!\\d)1[3-9]\\d{9}(?!\\d)",
+      "(?<!\\d)[1-9]\\d{5}(?:19|20)\\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\\d|3[01])\\d{3}[0-9Xx](?![0-9A-Za-z])",
+      "(?<![0-9A-Za-z])[0-9A-HJ-NPQRTUWXY]{18}(?![0-9A-Za-z])",
+      "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "(?<!\\d)\\d{16,19}(?!\\d)" };
 
   private static final DateTimeFormatter FILE_STAMP = DateTimeFormatter.ofPattern("yyyyMMdd");
   private static final DateTimeFormatter HUMAN_STAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
@@ -96,12 +125,16 @@ public final class CommandTraceLog {
       String method = request == null ? null : request.getString("method");
       String taskId = request == null ? null : request.getString("id");
       JSONObject responseJson = toJson(response);
+      // 脱敏在**落盘之前**做:日志里有证件号、手机号、地址这类个人信息,原文留在磁盘上迟早出问题
+      String redactedBody = redact(requestBody);
+      redactJson(request);
+      redactJson(responseJson);
 
       Path dir = dayDir();
       Files.createDirectories(dir);
       String base = String.format("%06d-%s-%s", seq, taskId == null ? "na" : taskId, safeName(method));
-      writeFile(dir.resolve(base + ".json"), fullRecord(requestBody, responseJson, startedAtMillis, now, seq, method,
-          taskId));
+      writeFile(dir.resolve(base + ".json"),
+          fullRecord(redactedBody, responseJson, startedAtMillis, now, seq, method, taskId));
       append(dir.resolve("calls.jsonl"), summaryLine(request, responseJson, startedAtMillis, now, seq, method, taskId,
           base));
       append(dir.resolve("steps.log"), humanLine(responseJson, startedAtMillis, now, seq, method, taskId));
@@ -110,6 +143,117 @@ public final class CommandTraceLog {
         log.warn("写调用追踪日志失败(后续同类错误不再重复提示):{}", e.toString());
       }
     }
+  }
+
+  /**
+   * 记一次文件暂存({@code POST /playwright/upload})
+   *
+   * <p>上传不走命令表,但「我到底传没传上去、传成了哪个文件」同样是排查时最先要看的,所以单独在
+   * 同一天的目录里追加一行 {@code uploads.log}。文件名与大小会留档,<b>文件内容不会</b>。
+   */
+  public static void recordUpload(com.jfinal.kit.Kv saved) {
+    if (!enabled() || saved == null) {
+      return;
+    }
+    try {
+      Path dir = dayDir();
+      Files.createDirectories(dir);
+      JSONObject line = new JSONObject();
+      line.put("ts", iso(System.currentTimeMillis()));
+      for (String key : new String[] { "filename", "relativePath", "path", "size", "existed", "sha256", "contentType" }) {
+        Object value = saved.get(key);
+        if (value != null) {
+          line.put(key, redact(String.valueOf(value)));
+        }
+      }
+      append(dir.resolve("uploads.log"), JSON.toJSONString(line));
+    } catch (RuntimeException | IOException e) {
+      if (WARNED.compareAndSet(false, true)) {
+        log.warn("写上传追踪日志失败(后续同类错误不再重复提示):{}", e.toString());
+      }
+    }
+  }
+
+  /** 追踪日志目录(当天的),给 {@code start} 的回执用,方便交付时告诉用户去哪清理 */
+  public static Path currentDir() {
+    return dayDir();
+  }
+
+  // ==================== 脱敏 ====================
+
+  /** 脱敏总开关,默认开;关掉后日志是原文(排查「值到底传没传对」时可能需要) */
+  public static boolean redactEnabled() {
+    String configured = ChromeBrowser.config(KEY_REDACT_ENABLED);
+    return configured == null || Boolean.parseBoolean(configured);
+  }
+
+  /**
+   * 把一段文本里的个人信息替换成掩码
+   *
+   * <p>内置规则覆盖手机号、18 位身份证/统一社会信用代码、邮箱、16~19 位长数字,可以用
+   * {@code browser.trace.redact} 追加自定义正则(逗号分隔)。规则写坏时只跳过那一条,不影响其它规则。
+   */
+  public static String redact(String text) {
+    if (text == null || text.isEmpty() || !redactEnabled()) {
+      return text;
+    }
+    String mask = mask();
+    String result = text;
+    for (String pattern : patterns()) {
+      try {
+        result = result.replaceAll(pattern, java.util.regex.Matcher.quoteReplacement(mask));
+      } catch (RuntimeException e) {
+        // 单条规则非法不该让整条日志丢掉
+      }
+    }
+    return result;
+  }
+
+  /** 递归脱敏一个 JSON 结构里的所有字符串值(键名不动,免得看不出请求长什么样) */
+  private static void redactJson(Object node) {
+    if (!redactEnabled() || node == null) {
+      return;
+    }
+    if (node instanceof JSONObject) {
+      JSONObject object = (JSONObject) node;
+      for (String key : new java.util.ArrayList<>(object.keySet())) {
+        Object value = object.get(key);
+        if (value instanceof String) {
+          object.put(key, redact((String) value));
+        } else {
+          redactJson(value);
+        }
+      }
+    } else if (node instanceof JSONArray) {
+      JSONArray array = (JSONArray) node;
+      for (int i = 0; i < array.size(); i++) {
+        Object value = array.get(i);
+        if (value instanceof String) {
+          array.set(i, redact((String) value));
+        } else {
+          redactJson(value);
+        }
+      }
+    }
+  }
+
+  private static List<String> patterns() {
+    List<String> all = new java.util.ArrayList<>(java.util.Arrays.asList(BUILT_IN_PATTERNS));
+    String configured = ChromeBrowser.config(KEY_REDACT);
+    if (configured != null) {
+      for (String piece : configured.split(",")) {
+        String trimmed = piece.trim();
+        if (!trimmed.isEmpty()) {
+          all.add(trimmed);
+        }
+      }
+    }
+    return all;
+  }
+
+  private static String mask() {
+    String configured = ChromeBrowser.config(KEY_REDACT_MASK);
+    return configured == null ? "***" : configured;
   }
 
   /** 今天的目录:换天后自动落到新目录,不需要重启 */

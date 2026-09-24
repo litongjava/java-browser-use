@@ -23,20 +23,38 @@ import nexus.io.ai.browser.actions.registry.CommandTable;
 /**
  * 校验技能文档与命令表保持一致,避免文档漂移
  *
- * <p>技能文档是仓库根的 {@code SKILL.md}(装进 DSH 时位于
- * {@code .dsh/skills/deepseek-browser-use/SKILL.md},两个位置都认),而 Maven 测试的工作目录是
- * playwright-server,所以用 .. 回到仓库根。文档不存在时跳过整个类,便于单独拷贝模块构建。
+ * <p>技能文档现在放在仓库的 {@code skills/<技能名>/SKILL.md}(装进 DSH 时位于
+ * {@code .dsh/skills/<技能名>/SKILL.md}),而 Maven 测试的工作目录是 playwright-server,所以用 ..
+ * 回到仓库根。历史位置(仓库根的 SKILL.md、{@code .dsh/skills/...})也认,免得换个装法就失效。
  *
- * <p>覆盖三件事:命令表里的每个方法都写进了文档、文档里没有旧接口名与旧包名、frontmatter 合法。
+ * <p><b>命令表只由主技能文档负责覆盖</b>:{@code skills/} 下还有别的技能(例如某个具体站点的操作手册),
+ * 它们讲的是「怎么把命令组合起来用」,不该被迫把 90 多个方法都列一遍。所以:
+ * <ul>
+ * <li>命令清单覆盖、端点、frontmatter、旧接口名 → 只查主技能({@code SKILL_NAME});</li>
+ * <li>「文档里当作命令写的名字必须真实存在」→ 查**每一个**技能文档,免得某份操作手册里写了一个
+ * 不存在的命令名,模型照着发请求才发现。</li>
+ * </ul>
+ *
+ * <p>文档不存在时跳过整个类,便于单独拷贝模块构建。
  */
 public class SkillDocConsistencyTest {
 
   /** 技能名:frontmatter 的 name,也是装进 DSH 时用的目录名 */
   private static final String SKILL_NAME = "deepseek-browser-use";
 
-  /** 依次尝试的位置:仓库根的 SKILL.md、装成技能时的 .dsh 目录 */
-  private static final List<Path> SKILL_PATHS = List.of(Paths.get("..", "SKILL.md"),
+  /**
+   * 依次尝试的位置
+   *
+   * <p>{@code skills/SKILL.md} 是当前的实际位置;{@code skills/<技能名>/SKILL.md} 与
+   * {@code .dsh/skills/<技能名>/SKILL.md} 是「一技能一目录」的装法;仓库根的 {@code SKILL.md}
+   * 是历史位置。都认,免得挪一次目录这个守卫就静默失效(它跳过时只会报 Skipped,不会报错)。
+   */
+  private static final List<Path> SKILL_PATHS = List.of(Paths.get("..", "skills", "SKILL.md"),
+      Paths.get("..", "skills", SKILL_NAME, "SKILL.md"), Paths.get("..", "SKILL.md"),
       Paths.get("..", ".dsh", "skills", SKILL_NAME, "SKILL.md"));
+
+  /** 主技能文档的上一级目录:仓库根的 skills/(找不到时退回仓库根) */
+  private static final List<Path> SKILL_ROOTS = List.of(Paths.get("..", "skills"), Paths.get(".."));
 
   /** 文档里形如 `method_name` 的命令名 */
   private static final Pattern DOC_COMMAND = Pattern.compile("`([a-z][a-z0-9_]{2,})`");
@@ -70,6 +88,24 @@ public class SkillDocConsistencyTest {
     doc = new String(Files.readAllBytes(found), StandardCharsets.UTF_8);
   }
 
+  /** skills/ 下的全部技能文档(主技能 + 各站点操作手册) */
+  private static List<Path> allSkillDocs() throws IOException {
+    List<Path> docs = new ArrayList<>();
+    for (Path root : SKILL_ROOTS) {
+      if (!Files.isDirectory(root)) {
+        continue;
+      }
+      try (java.util.stream.Stream<Path> stream = Files.walk(root, 3)) {
+        stream.filter(path -> path.getFileName().toString().equals("SKILL.md")).filter(Files::isRegularFile)
+            .forEach(docs::add);
+      }
+      if (!docs.isEmpty()) {
+        break;
+      }
+    }
+    return docs;
+  }
+
   /** 命令表里的每个方法都要在文档里出现,否则模型根本不知道有这个能力 */
   @Test
   public void everyCommandIsDocumented() {
@@ -101,6 +137,31 @@ public class SkillDocConsistencyTest {
       }
     }
     assertTrue("文档里写了命令表里不存在的命令:" + unknown, unknown.isEmpty());
+  }
+
+  /**
+   * 每一份技能文档里当作命令写的名字都必须真实存在
+   *
+   * <p>站点操作手册会大量提到命令名,写错一个(例如把 {@code get_tabs} 写成 {@code list_tabs}),
+   * 模型照着发请求就会拿到「不支持的方法」。这一条把 skills/ 下的所有文档都过一遍。
+   */
+  @Test
+  public void everySkillDocOnlyMentionsRealCommands() throws IOException {
+    List<String> offenders = new ArrayList<>();
+    for (Path path : allSkillDocs()) {
+      String text = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+      Matcher matcher = DOC_COMMAND.matcher(text);
+      while (matcher.find()) {
+        String name = matcher.group(1);
+        if (NOT_COMMANDS.contains(name.toLowerCase()) || !name.contains("_")) {
+          continue;
+        }
+        if (CommandTable.get(name) == null) {
+          offenders.add(path.getFileName() + "@" + path.getParent().getFileName() + " → " + name);
+        }
+      }
+    }
+    assertTrue("技能文档里写了命令表里不存在的命令:" + offenders, offenders.isEmpty());
   }
 
   /** 唯一的端点必须写清楚 */
