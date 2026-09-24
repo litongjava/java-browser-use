@@ -13,4 +13,26 @@
   <modules>
     <module>playwright-server</module>
   </modules>
+  <build>
+    <pluginManagement>
+      <plugins>
+        <!--
+          编译器插件必须显式钉版本,别让 Maven 用它 super POM 里那份 3.1(2013 年)。
+
+          3.1 的 **testCompile 不跑 classpath 上的注解处理器**,于是 Lombok 只在主代码里生效:
+          主代码里 @Slf4j 一切正常,测试代码里同一个 @Slf4j 却报
+          `cannot find symbol: variable log` —— `mvn test` 连编译都过不去,而报错信息完全指不到
+          「换个插件版本」这个真正的原因。实测(src/test 下唯一用 Lombok 的 PlayWrightKeheLogin.java
+          就这样挂了)确认:把版本钉到 3.13.0 之后,该文件与新增的 @Slf4j 探针类都能正常编译。
+
+          钉在根 pom 的 pluginManagement 里,子模块跟着走,不用每个模块各写一遍。
+        -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.13.0</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
 </project>

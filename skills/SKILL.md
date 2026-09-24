@@ -470,6 +470,7 @@ current tab is: 1
 - `<seq>.txt` 的内容是「页签文本块 + 空行 + 可交互结构化文本」，也就是 `data.browser_state` 加 `data.text`，方便事后离线复看某一步的页面。
 - 哪些方法算「会改变页面」：导航类（`navigate`、`go_to_url`、`go_back`、`go_forward`、`reload`）、点击与交互类、滚动与鼠标类、页签类、等待类、`execute_js` 与部分设置类。纯读取类（`get_url`、`get_cookies`、`is_visible`……）不截图，否则每读一个值就多一张一模一样的图。
 - 截图前会尽力等页面进入 DOMCONTENTLOADED（最多 1.5 秒），等不到也照常截图，不会因为等待失败丢掉这一张。
+- **出图的像素尺寸取决于视口策略**（服务端配置 `browser.viewport`，默认 `window` = 视口跟随真实窗口）。`window` 下 `devicePixelRatio` 是**真实系统 DPI 比**，出图 = CSS 视口 × 该比值 —— 实测 150% 缩放的屏幕上，1470×925 的视口出的是 **2205×1388** 的图；`fixed` / 显式尺寸下固定为 1.0，出图就是 CSS 视口那么大。所以**要把图上的像素位置换算成页面坐标**（`data.text` 里的坐标、`clip` 参数、`set_viewport` 用的都是 CSS 像素）**就除以 `devicePixelRatio`**。`start` 回执里的 `data.browser.viewport` 说明这次用的是哪一种。
 - 批量调用时**每一步的结果里都有它自己那一步的截图**，所以一次批量请求就能拿到整段操作的页面变化历史。
 - 这些文件不会自动清理，`data/` 已经加进 `.gitignore`；不需要时直接删目录即可。
 

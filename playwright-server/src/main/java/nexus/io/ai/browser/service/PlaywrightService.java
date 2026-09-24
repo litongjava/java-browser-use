@@ -1,7 +1,6 @@
 package nexus.io.ai.browser.service;
 
 import java.awt.Dimension;
-import java.awt.Toolkit;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -57,6 +56,7 @@ import com.microsoft.playwright.options.LoadState;
 import com.microsoft.playwright.options.MouseButton;
 import com.microsoft.playwright.options.SelectOption;
 import com.microsoft.playwright.options.ServiceWorkerPolicy;
+import com.microsoft.playwright.options.ViewportSize;
 
 import lombok.extern.slf4j.Slf4j;
 import nexus.io.model.body.RespBodyVo;
@@ -430,6 +430,14 @@ public class PlaywrightService {
     final BrowserChoice resolvedType;
     /** 持久化上下文模式的启动参数;CDP 模式(自己拉 Chrome)下为 null */
     final LaunchPersistentContextOptions opts;
+    /**
+     * 这次启动用的页面视口策略(见 {@link BrowserViewport})
+     *
+     * <p>
+     * 回执里要如实报出来:「页面上的视口」和「窗口里能看见的区域」对不对得上,决定了截图能不能代表
+     * 用户所见,也决定了 {@code get_browser_state} 的 {@code viewport_height} 该怎么理解。
+     */
+    final BrowserViewport.Policy viewport;
     /** 没能用上用户 profile 时的原因,会一起返回给调用方 */
     final String profileNote;
 
@@ -471,6 +479,8 @@ public class PlaywrightService {
       this.headless = headless;
       this.opts = opts;
       this.profileNote = profileNote;
+      // 由 headless 推出来,不作为构造参数:多一个能传错的入口,迟早会有人传出一个和 headless 不一致的视口
+      this.viewport = BrowserViewport.policy(headless);
       this.resolvedType = resolvedType == null ? BrowserChoice.resolve(null) : resolvedType;
       // 引擎由类型推出来,不单独记:两者能不一致的写法迟早会不一致
       this.engine = this.resolvedType.engine();
@@ -898,6 +908,10 @@ public class PlaywrightService {
         .set("headless", browser.headless)
         // cdp = 自己拉的用户 Chrome(connectOverCDP),managed = Playwright 持久化上下文
         .set("mode", browser.browser != null ? "cdp" : "managed");
+    // 页面视口:跟随真实窗口(window)还是钉死一个尺寸(fixed 1484x1019)。它决定 screenshot 能不能代表
+    // 用户所见,也决定 get_browser_state 里的 viewport_height 该怎么理解 —— 所以必须如实回报
+    info.set("viewport", Kv.by("mode", browser.viewport.mode).set("size", browser.viewport.describe())
+        .set("note", browser.viewport.note));
     if (browser.resolvedType.isGoogleChrome()) {
       // --profile-directory 是本机 Chrome 的概念:内置 Chromium 不传它,Edge 与 Firefox 也没有这一项
       info.set("profileDirectory", ChromeBrowser.profileDirectory());
@@ -1060,8 +1074,8 @@ public class PlaywrightService {
     opts.setIgnoreDefaultArgs(Lists.of("--enable-automation"));
 
     Dimension window = windowSize();
-    int screenWidth = window.width;
-    int screenHeight = window.height;
+    // 在这里就解析视口策略:配置写错时要在**拉起浏览器之前**失败,而不是先开出一个窗口再报错
+    BrowserViewport.Policy viewport = BrowserViewport.policy(headless);
 
     // 覆写/追加启动参数
     List<String> args = chromiumArgs();
@@ -1075,6 +1089,11 @@ public class PlaywrightService {
     } else {
       // 调用方自己补的参数(语言、代理、--disable-extensions 之类)
       args.addAll(ChromeBrowser.extraArgs());
+    }
+    if (viewport.followsWindow()) {
+      // 视口交给窗口时 Playwright 不会替我们定窗口大小(它的 --window-size 是跟着视口一起给的),
+      // 不给的话窗口会用 profile 里上次留下的尺寸,或者 Chrome 自己的默认值 —— 那就不可预期了
+      args.add("--window-size=" + window.width + "," + window.height);
     }
     opts.setArgs(args);
 
@@ -1092,11 +1111,8 @@ public class PlaywrightService {
     opts.setAcceptDownloads(true);
     opts.setDownloadsPath(Paths.get(userHome(), "Downloads", "broswer"));
 
-    // 视窗 & 设备仿真
-    opts.setViewportSize(screenWidth, screenHeight);
-    opts.setDeviceScaleFactor(1.0);
-    opts.setIsMobile(false);
-    opts.setHasTouch(false);
+    // 视窗 & 设备仿真(设置哪些项由视口策略决定,见 applyViewport)
+    applyViewport(opts, viewport);
 
     // 权限 & HTTP 头
     opts.setPermissions(Arrays.asList("clipboard-read", "clipboard-write", "notifications"));
@@ -1136,7 +1152,7 @@ public class PlaywrightService {
     LaunchPersistentContextOptions opts = new BrowserType.LaunchPersistentContextOptions().setHeadless(headless);
     opts.setTimeout(launchTimeoutMs());
 
-    Dimension window = windowSize();
+    BrowserViewport.Policy viewport = BrowserViewport.policy(headless);
     opts.setArgs(BrowserEngine.firefoxExtraArgs());
     opts.setFirefoxUserPrefs(BrowserEngine.firefoxUserPrefs());
 
@@ -1148,10 +1164,11 @@ public class PlaywrightService {
     opts.setAcceptDownloads(true);
     opts.setDownloadsPath(Paths.get(userHome(), "Downloads", "broswer"));
 
-    opts.setViewportSize(window.width, window.height);
-    opts.setDeviceScaleFactor(1.0);
-    opts.setIsMobile(false);
-    opts.setHasTouch(false);
+    // 视口策略与 Chromium 一致(见 applyViewport)。这边**不额外给窗口尺寸参数**:
+    // Playwright 给 Firefox 传的是 -width/-height,自己再补一组会多出一份互相冲突的参数,而这份 Firefox
+    // 是 Playwright 自带的 juggler 构建、本机装不上(见类注释),不方便实测 —— 猜参数不如不猜。
+    // 结果是 Firefox 的窗口用它自己的默认尺寸,视口跟随这个窗口。
+    applyViewport(opts, viewport);
 
     opts.setPermissions(BrowserEngine.firefoxPermissions());
 
@@ -1159,13 +1176,50 @@ public class PlaywrightService {
   }
 
   /**
-   * 窗口/视口尺寸:屏幕宽度的 28/32,高度取满
+   * 浏览器窗口的外框尺寸:可用工作区宽度的 28/32,高度取满
    *
-   * <p>Chromium 与 Firefox 共用同一套算法,免得两个引擎的窗口大小不一致(排查时看到的页面布局也就不一致)。
+   * <p>
+   * Chromium 与 Firefox 共用同一套算法(见 {@link BrowserViewport#windowSize()}),免得两个引擎的窗口大小
+   * 不一致(排查时看到的页面布局也就不一致)。注意这里量的是<b>可用工作区</b>、不是整块屏幕:任务栏不算
+   * 进可用高度,否则窗口底边会被任务栏压住,压住的那几十像素正好是页面底部。
    */
   static Dimension windowSize() {
-    Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
-    return new Dimension((screenSize.width / 32) * 28, screenSize.height);
+    return BrowserViewport.windowSize();
+  }
+
+  /**
+   * 把视口策略落到启动参数上
+   *
+   * <p>
+   * {@code followsWindow} 时用 {@code noDefaultViewport}({@code setViewportSize((ViewportSize) null)} →
+   * {@code Optional.empty()} → 协议里的 {@code noDefaultViewport:true}),页面从此按窗口的实际内容区排版、
+   * 随窗口缩放回流;否则钉死一个尺寸。
+   *
+   * <p>
+   * <b>为什么显式传 null 而不是「什么都不设」</b>:不设的话 Playwright 会套上它自己的默认视口
+   * 1280x720,于是又变回「页面尺寸和窗口对不上」,只是数字换了一个 —— 这正是以前那个毛病的来源。
+   *
+   * <p>
+   * <b>设备仿真这三项必须跟着视口一起决定,不能无条件设。</b>Playwright 在校验上下文参数时明确拒绝
+   * 「{@code viewport} 为 null 却给了 {@code deviceScaleFactor} / {@code isMobile} / {@code hasTouch}」
+   * 的组合,报的是
+   * {@code "deviceScaleFactor" option is not supported with null "viewport"},启动直接失败
+   * (实测踩过:全量测试里两个打真实站点的用例就是这么挂的)。所以它们只在视口钉死时给;跟随窗口时
+   * 由真实窗口与系统决定 —— {@code devicePixelRatio} 用真实 DPI 比,比硬写 1.0 更接近用户所见。
+   */
+  static void applyViewport(LaunchPersistentContextOptions opts, BrowserViewport.Policy viewport) {
+    if (viewport.followsWindow()) {
+      // 这个 cast 不能省:setViewportSize 有 (int,int) 与 (ViewportSize) 两个重载,不写类型会挑不准
+      opts.setViewportSize((ViewportSize) null);
+      log.info("页面视口:跟随真实窗口(noDefaultViewport),窗口缩放时页面会跟着回流");
+    } else {
+      opts.setViewportSize(viewport.width, viewport.height);
+      opts.setDeviceScaleFactor(1.0);
+      opts.setIsMobile(false);
+      opts.setHasTouch(false);
+      log.info("页面视口:固定 {}x{}{}", viewport.width, viewport.height,
+          viewport.note == null ? "" : "（" + viewport.note + "）");
+    }
   }
 
   /**
@@ -1437,8 +1491,8 @@ public class PlaywrightService {
       // 这条路径不经过 Playwright,chromiumSandbox=false 不会自动变成 --no-sandbox,得自己加
       args.add("--no-sandbox");
     }
-    Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
-    args.add("--window-size=" + (screenSize.width / 32) * 28 + "," + screenSize.height);
+    Dimension window = BrowserViewport.windowSize();
+    args.add("--window-size=" + window.width + "," + window.height);
     if (headless) {
       args.add("--headless=new");
       args.add("--hide-scrollbars");
@@ -5490,6 +5544,24 @@ public class PlaywrightService {
    * <b>默认落盘,不回 base64</b>:没给 {@code path} 时服务自己写到 {@code data/&lt;id&gt;/shot-N.png},
    * 只返回路径与可直接 GET 的 URL。理由是 base64 会把整张图塞进模型上下文——一次几十 KB,读几次就
    * 把上下文淹了,而定位与操作要的信息全在结构化文本里。确实需要内联图片时显式传 {@code inline:true}。
+   *
+   * <p>
+   * <b>出图尺寸跟着视口策略走</b>(Playwright 的默认 {@code scale: device},按设备像素):
+   * <ul>
+   * <li>{@code browser.viewport=window}(默认):{@code devicePixelRatio} 是真实系统 DPI 比,
+   * 图片像素 = CSS 视口 × 这个比值。实测(这台机器 DPI 缩放 150%,视口 1470x925)出图 <b>2205x1388</b> ——
+   * 也就是屏幕上真实显示的物理像素,和图给视觉模型看是自洽的。要换算回 DOM 的 CSS 坐标,除以
+   * {@code devicePixelRatio} 即可。</li>
+   * <li>{@code browser.viewport=fixed / 宽x高}:那边 {@code deviceScaleFactor} 是 1.0,出图就是 CSS 视口
+   * 那么大(实测 1484x1019),与 DOM 坐标 1:1。</li>
+   * </ul>
+   *
+   * <p>
+   * 想在这边用 {@code scale: css} 把图压回 CSS 像素是<b>做不到的</b>,不是没试:Playwright 的
+   * {@code crPage.takeScreenshot} 是 {@code clip.scale /= (this._browserContext._options.deviceScaleFactor || 1)},
+   * 除的是**上下文选项里**那个值,而它恰好被 {@code viewport: null} 禁止设置 —— 于是 {@code css}
+   * 在这里退化成空操作(除 1)。所以「视口跟随窗口」与「CSS 像素截图」在 Playwright 里二选一:
+   * 要后者就用 {@code browser.viewport=fixed}。
    */
   public RespBodyVo screenshot(Long browserId, String path, Boolean fullPage, Integer index, String selector,
       Double clipX, Double clipY, Double clipWidth, Double clipHeight, Boolean inline) {

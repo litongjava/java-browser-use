@@ -105,12 +105,14 @@ public class BrowserEngineTest {
 
   /**
    * Firefox 与 Chromium 共用同一套窗口尺寸算法:两个引擎看到的页面布局不该不一样
+   *
+   * <p>
+   * 算法本身(以及「高度取可用工作区、不是整块屏幕」这条)的断言在 {@link BrowserViewportTest};这里只钉住
+   * 「两个引擎走的是同一个来源」—— {@code PlaywrightService.windowSize()} 是
+   * {@link BrowserViewport#windowSize()} 的转发,谁把它改成各算各的,这条就会失败。
    */
   @Test
   public void windowSizeIsSharedByBothEngines() {
-    java.awt.Dimension size = PlaywrightService.windowSize();
-    java.awt.Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
-    assertEquals((screen.width / 32) * 28, size.width);
-    assertEquals(screen.height, size.height);
+    assertEquals(BrowserViewport.windowSize(), PlaywrightService.windowSize());
   }
 }

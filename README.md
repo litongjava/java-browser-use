@@ -175,7 +175,8 @@ curl -H "Content-Type: application/json" -d '{"filename":"图样.jpg","contentBa
   "mode":"managed",
   "profileDir":"C:\\Users\\you\\.config\\browseruse\\profiles\\shared",
   "executable":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-  "profileDirectory":"Default","headless":true}}}
+  "profileDirectory":"Default","headless":true,
+  "viewport":{"mode":"window","size":"window","note":null}}}}
 ```
 
 **为什么不能一个任务一个浏览器？** 用户数据目录天生是单例：同一个 `User Data` 目录同时只允许一个
@@ -253,6 +254,66 @@ Chrome 与 Edge 都用各自的 UA —— 所以 `navigator.userAgent` 里出现
 
 用户 profile 用不上时（Chrome 正在运行、启动失败等），`start` 会**退回托管 profile**，并把原因放进
 `data.browser.note`；`browser.chrome.profileFallback=false` 可以让它直接报错而不是悄悄换一份。
+
+### 窗口多大、页面视口跟不跟着窗口（`browser.viewport`）
+
+窗口尺寸和页面视口是两件事，这里分开说：
+
+- **窗口尺寸**按屏幕的**可用工作区**算：宽取 28/32、高取满。注意是工作区 —— 任务栏不算在内。
+  老算法用的是 `getScreenSize()`，把任务栏也算进高度，窗口底边会被任务栏压住，压住的那几十像素
+  正好是页面底部（实测 1707×1067 的逻辑分辨率下，可用工作区只有 1019）。
+- **页面视口**由 `browser.viewport` 决定：
+
+| 取值 | 行为 | 什么时候用 |
+| --- | --- | --- |
+| `window`（默认） | 视口交给真实窗口：页面按窗口的实际内容区排版、拖动窗口页面跟着回流，截图尺寸 = 窗口里真实可见的页面区 | 默认。**所见即所得** |
+| `fixed` | 一直用按屏幕算出来的固定尺寸 | 需要固定尺寸截图做前后对比，或者站点只认固定视口 |
+| 宽x高（如 `1440x900`） | 钉死这个尺寸 | 想让所有截图尺寸完全一致 |
+
+**为什么默认从 `fixed` 改成 `window`。** 视口钉死时，「页面上的视口高度」和「窗口里能看见的高度」
+对不上：
+
+| 量 | 实测值（旧默认，屏幕 1707×1067） |
+| --- | --- |
+| 页面自称视口（`window.innerHeight`） | **1067** |
+| OS 窗口外框 | 1019 |
+| 真实可见的页面区 | ≈ 931（1019 减标题栏/标签栏/地址栏 ≈88px） |
+| `screenshot` 的像素 | 1484 × **1067** |
+
+`innerHeight > outerHeight` 对真实浏览器窗口是物理上不可能的 —— 这就是「视口被模拟、跟窗口脱钩」的
+铁证。后果是**每页底部约 13% 渲染在窗口外面**（人看不见），而截图把这部分也拍了进去，于是
+**喂给视觉模型的画面和用户眼睛看到的不是一回事**；`get_browser_state` 的 `viewport_height` 以及
+`pixels_above` / `pixels_below` 也是按这个数算的。
+
+> 无头模式没有真实窗口可跟随，所以配 `window` 时会**自动退回固定视口**，并把原因写进
+> `data.browser.viewport.note`，不会静默失效。
+
+单个任务也能在运行时改视口：`{"method":"set_viewport","params":{"width":1440,"height":900}}`。
+但它是**钉死**一个尺寸，钉死之后没有 API 再交还给窗口（Playwright 的 `Page.setViewportSize`
+只有 `int` 重载）；要回到跟随窗口，请重新 `start` 一个任务。
+
+只影响托管 profile 那条路（Playwright 的 `launchPersistentContext`）。CDP 那条路（用户自己的
+Chrome profile / Edge）本来就不套视口模拟，页面尺寸一直跟着窗口走。
+
+**截图的像素尺寸也跟着变**，这点值得单独说。Playwright 默认 `scale: device`（按设备像素出图）：
+
+| `browser.viewport` | `devicePixelRatio` | 出图 | 与 DOM 的 CSS 坐标 |
+| --- | --- | --- | --- |
+| `window`（默认） | 真实系统 DPI 比（这台机器 150% 缩放 → **1.5**） | CSS 视口 × 1.5（实测 1470×925 → **2205×1388**） | 除以 `devicePixelRatio` 换算 |
+| `fixed` / `宽x高` | 固定 1.0 | 就是 CSS 视口（实测 1484×1019） | 1:1 |
+
+`window` 下出的是屏幕上真实的物理像素 —— 也就是用户实际看到的那一屏，和"所见即所得"是自洽的，
+只是文件大一些。**想让它回到 CSS 像素是做不到的**，不是没试：Playwright 的
+`crPage.takeScreenshot` 里那一步是
+
+```js
+if (scale === "css")
+  clip.scale /= (this._browserContext._options.deviceScaleFactor || 1);
+```
+
+它除的是**上下文选项里**那个 `deviceScaleFactor`，而那个选项恰好被 `viewport: null` 禁止设置
+（见上），于是 `scale: "css"` 在这里退化成空操作（除以 1）。所以「视口跟随窗口」与「CSS 像素截图」
+在 Playwright 里只能二选一 —— 要后者就把 `browser.viewport` 配成 `fixed`。
 
 ### 换成 Firefox：`browser.engine=firefox`
 
