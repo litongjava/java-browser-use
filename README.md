@@ -157,7 +157,7 @@ curl -H "Content-Type: application/json" -d '{"filename":"图样.jpg","contentBa
 
 表单快照显示实时值、只读和禁用状态，密码值脱敏；普通布局缩进折叠。点击回执会短暂观察异步变化，`changed=false` 仅代表尚未观察到变化。单条和批量动作均自动归档截图。
 
-网络请求及响应通过 requestId 关联，支持按 ID 回查特定响应，并明确报告请求体、响应体的截断状态。业务查询返回空记录时，调用方需核实查询条件，不能直接推断金额为零。
+网络请求及响应通过 requestId 关联，支持按 ID 回查特定响应，并明确报告请求体、响应体的截断状态。**响应体在收到的当下就被抄了一份**（只抄 `xhr`/`fetch`，单条上限 10 万字符）：浏览器只短暂保留响应体，实测一条 **7 秒前**的 XHR 再取 body 就已经是 `No resource with given identifier found`，一导航更是彻底没了——不抄的话「保留最近 100 个响应」在真实站点上等于「一个都读不到」。抄到的那份带 `bodyFromCache` / `bodyCapturedAt`，跳转之后照样读得到。业务查询返回空记录时，调用方需核实查询条件，不能直接推断金额为零。
 
 ## 四、核心概念
 
@@ -536,13 +536,15 @@ deepseek-browser-use/
 │       ├── browser.properties             内嵌 Chromium 修订号 + 浏览器/profile/日志/上传配置
 │       └── dom/dom_tree/                  DOM 转结构化文本的 JS
 ├── scripts/package/build-release.mjs      发行版打包脚本
+├── scripts/run/start-server.ps1           后台启动服务(脱离当前进程树) + 等健康检查
+├── scripts/run/stop-server.ps1            先 shutdown 再结束进程树,不留孤儿浏览器
 ├── scripts/trace/browse.ps1               客户端侧调用留档脚本(与服务端同一套脱敏规则)
 ├── client/dsb.py                           Python 客户端(CLI + 可 import,只用标准库)
 ├── client/dsb.cmd                          Windows 薄包装(能直接敲 dsb,不必写 python 前缀)
 ├── client/README.md                        Python 客户端的用法与退出码约定
 ├── recipes/*.json                          显式 opt-in 的站点配方(run_recipe 用)
 ├── skills/SKILL.md                        给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
-├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register)
+├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register、railway-12306-ticket)
 └── dist/                                  发行版产物(构建后生成)
 ```
 
@@ -570,6 +572,22 @@ deepseek-browser-use/
 浏览器是**独立进程**：强杀服务（或它的 mvn 进程）不会关掉它启动的浏览器，残留的浏览器会一直占着 profile 目录，下一次 `start` 可能卡到启动超时（默认 60 秒，`browser.launch.timeoutMs`）。
 
 - **规范做法**：先 `close` 掉任务再停服务 —— 关掉最后一个任务时浏览器会跟着退出。
+- **别手动拼这套流程**：仓库里有两个脚本，后台启动 / 干净停止各一个（Windows）：
+
+  ```shell
+  # 后台启动(脱离当前进程树,宿主回收自己的子进程时不会带走它),并等健康检查通过
+  scripts\run\start-server.cmd -Port 10049 -Engine chromium
+
+  # 先 shutdown(关任务与共享浏览器),再按端口结束整棵进程树
+  scripts\run\stop-server.cmd -Port 10049
+  ```
+
+  `start-server` 优先用 WMI(`Win32_Process.Create`)创建进程：该进程由 `WmiPrvSE` 创建，不在当前进程的 Job 里，宿主的 `taskkill /T` 不会带走它；拿不到 WMI 时退回 `Start-Process` 并明确提示。pid 落在 `logs/server/server-<端口>.pid`，日志在 `logs/server/server-<端口>.{out,err}.log`。
+
+  > **为什么走 `.cmd` 而不是 `.ps1`**：本机 PowerShell 的执行策略是 `Restricted`，直接跑 `.ps1` 会被拒（`cannot be loaded because running scripts is disabled`）。`.cmd` 包装里的 `-ExecutionPolicy Bypass` 只影响这个子进程，不改机器策略。
+  >
+  > **写 `.ps1` 记得带 UTF-8 BOM**：Windows PowerShell 5.1 会按 ANSI（本机是 GBK）读没有 BOM 的 `.ps1`，中文注释直接变乱码并引发 `Unexpected token` / `missing the terminator` 这类语法错（刚踩过，仓库里 `browse.ps1` / `smoke.ps1` 都带 BOM）。反过来 `.cmd` 必须保持纯 ASCII。
+- **重启服务是有代价的**：关掉最后一个任务时浏览器就退出了，而 **session cookie 型的登录态**（12306、政务站点等）会随之失效，人工得重新登录一次；持久 cookie 不受影响。所以「顺手重启一下」之前先想清楚有没有正在进行的登录环节。
 - 已经留下了孤儿：先结束残留的浏览器进程，再重启服务。
 - 服务侧也有兜底：Windows 上会自动清掉 profile 里的 `parent.lock` 与 `.startup-incomplete` 这两种残留标记（`parent.lock` 删得掉就说明没有活着的持有者），并且第一次启动失败后会自动重建驱动重试一次 —— 实测这个重试通常就能起来（表现为第一次等 60 秒、第二次 2 秒）。
 

@@ -94,24 +94,48 @@ REDACT_RULES = (
 )
 
 
+#: 「下一步还要回填给接口的凭据」所在的键:这些值不脱敏
+#:
+#: 理由是实测踩过:``request_human_input`` 回的 ``requestId`` 是 ``hr-1-1790232350369``,被「长号码」
+#: 规则把数字段打成 ``***`` 之后,``submit_human_input`` / ``get_response_body(requestId=…)`` 就没法用了 ——
+#: **让人看不见自己下一步要用的凭据,比泄露它的代价更大**。同理 ``jobId``(异步批次取结果要用)。
+ID_KEYS = frozenset({"requestId", "jobId"})
+
+#: 文本形态下的同类保护:JSON 里的 requestId/jobId 字段值、以及 hr-<n>-<雪花号> 形式的人工请求号
+PROTECTED_ID = re.compile(r'"(?:requestId|jobId)"\s*:\s*"[^"]*"' r'|hr-\d+-\d+')
+
+
 def redact(text: str, extra: tuple[str, ...] = ()) -> str:
-    """把文本里的敏感信息打码(用于落盘与终端输出)"""
+    """把文本里的敏感信息打码(用于落盘与终端输出)
+
+    会把 :data:`ID_KEYS` 对应的值与 ``hr-<n>-<雪花号>`` 先摘出来,脱敏完再放回去。
+    """
     if not text:
         return text
+    guarded: list[str] = []
+
+    def stash(match: re.Match) -> str:
+        guarded.append(match.group(0))
+        return f"\x00dsbid{len(guarded) - 1}\x00"
+
+    text = PROTECTED_ID.sub(stash, text)
     for _, pattern, replacement in REDACT_RULES:
         text = pattern.sub(replacement, text)
     for word in extra:
         if word:
             text = text.replace(word, "***")
+    for index, value in enumerate(guarded):
+        text = text.replace(f"\x00dsbid{index}\x00", value)
     return text
 
 
 def redact_obj(value, extra: tuple[str, ...] = ()):
-    """递归脱敏:JSON 结构里只处理字符串叶子"""
+    """递归脱敏:JSON 结构里只处理字符串叶子(``requestId``/``jobId`` 这类凭据原样保留)"""
     if isinstance(value, str):
         return redact(value, extra)
     if isinstance(value, dict):
-        return {key: redact_obj(item, extra) for key, item in value.items()}
+        return {key: (item if key in ID_KEYS and isinstance(item, str) else redact_obj(item, extra))
+                for key, item in value.items()}
     if isinstance(value, list):
         return [redact_obj(item, extra) for item in value]
     return value
@@ -187,7 +211,8 @@ class Client:
                  task_id: int | str = DEFAULT_TASK_ID, timeout: float = DEFAULT_TIMEOUT,
                  session: str | None = DEFAULT_SESSION, record: bool = True,
                  redact_enabled: bool = True, redact_patterns: tuple[str, ...] = (),
-                 verbose: bool = False, record_dir: str | None = None):
+                 verbose: bool = False, record_dir: str | None = None,
+                 response_mode: str | None = None, diagnostics: bool = False):
         self.base_url = (base_url or f"http://{host}:{port}").rstrip("/")
         self.task_id = _as_task_id(task_id)
         self.timeout = float(timeout)
@@ -196,6 +221,8 @@ class Client:
         self.redact_enabled = redact_enabled
         self.redact_patterns = tuple(redact_patterns or ())
         self.verbose = verbose
+        self.response_mode = response_mode
+        self.diagnostics = bool(diagnostics)
         self.record_dir = Path(record_dir) if record_dir else _default_record_dir(session)
         self.counter = _next_index(self.record_dir)
         self.last_response: Response | None = None
@@ -287,6 +314,11 @@ class Client:
         """发一条命令。失败(业务失败)不抛异常,由调用方看 `ok`;传输失败抛 TransportError。"""
         payload = {"id": _as_task_id(task_id if task_id is not None else self.task_id),
                    "method": method, "params": params or {}}
+        # responseMode / diagnostics 是**信封级**字段(与 method/params 平级),不是 params 里的东西
+        if self.response_mode:
+            payload["responseMode"] = self.response_mode
+        if self.diagnostics:
+            payload["diagnostics"] = True
         try:
             response = self.request(PATH_COMMAND, method="POST", body=_json_bytes(payload),
                                     content_type="application/json", timeout=timeout)
@@ -428,17 +460,25 @@ def _next_index(directory: Path) -> int:
 
 
 def _summarize(data) -> str:
-    """把回执里的关键字段压成一行,便于 steps.log 里一眼看出发生了什么"""
+    """把回执里的关键字段压成一行,便于 steps.log 里一眼看出发生了什么
+
+    只挑「一眼能判断这一步成不成」的标量字段;挑不出任何字段时返回空串,由调用方决定退化成什么
+    (``--summary`` 模式会退回一行 JSON,不会静默吞掉内容)。
+    """
     if not isinstance(data, dict):
         return ""
     parts = []
-    for key in ("count", "succeeded", "failed", "expectFailed", "seq", "status", "mode", "matched",
-                "stable", "closed", "elementCount", "jobId", "step", "title"):
-        if key in data and data[key] not in (None, "", [], {}):
-            value = data[key]
-            if isinstance(value, str) and len(value) > 40:
-                value = value[:40] + "…"
-            parts.append(f"{key}={value}")
+    for key in ("count", "countBlocking", "countStrict", "succeeded", "failed", "expectFailed", "seq", "status",
+                "mode", "matched", "stable", "closed", "elementCount", "jobId", "step", "title", "url",
+                "value", "visible", "enabled", "checked", "result"):
+        if key not in data or data[key] in (None, "", [], {}):
+            continue
+        value = data[key]
+        if not isinstance(value, (str, int, float, bool)):
+            continue
+        if isinstance(value, str) and len(value) > 40:
+            value = value[:40] + "…"
+        parts.append(f"{key}={value}")
     if "screenshot" in data:
         parts.append(f"shot={data['screenshot']}")
     if "results" in data and isinstance(data["results"], list):
@@ -545,7 +585,12 @@ def setup_stdout() -> None:
 
 
 class Printer:
-    """输出策略:默认「摘要 + JSON」,`--json` 只出 JSON,`--compact` 只出摘要"""
+    """输出策略:默认「摘要 + JSON」,`--json` 只出 JSON,`--summary`(`--compact`)只出摘要
+
+    `--summary` 是**本地输出**开关,与服务端协议里的 `responseMode:"compact"`(响应精简模式)不是
+    一回事 —— 后者要用 `--response-mode compact` 传。同名但不同义,以前实测照文档用错过一次,
+    所以这里连名字一起改清楚。
+    """
 
     def __init__(self, mode: str = "full", mask: bool = True, patterns: tuple[str, ...] = (),
                  out=sys.stdout):
@@ -568,6 +613,11 @@ class Printer:
             if not response.ok and response.msg:
                 detail += f" msg={response.msg}"
             print(self._clean(head + detail), file=self.out)
+            # 摘要为空时**不能**只回一行「OK 27ms」:那等于把答案吞了(实测 get_tabs / get_console_logs
+            # / get_dialog 都是这样,让人以为「没有数据」)。这时退回一行 JSON,信息不丢、也还是一行。
+            if self.mode == "compact" and not detail:
+                body = response.data if payload is None else payload
+                print(self._clean(json.dumps(body, ensure_ascii=False, separators=(",", ":"))), file=self.out)
         if self.mode != "compact":
             self.json(response.envelope if payload is None else payload)
 
@@ -608,7 +658,9 @@ def build_client(args) -> Client:
     return Client(base_url=base_url, host=host, port=port, task_id=task_id,
                   timeout=opt("timeout", DEFAULT_TIMEOUT), session=session,
                   redact_enabled=not getattr(args, "no_redact", False), redact_patterns=patterns,
-                  verbose=getattr(args, "verbose", False), record_dir=opt("record_dir"))
+                  verbose=getattr(args, "verbose", False), record_dir=opt("record_dir"),
+                  response_mode=getattr(args, "response_mode", None),
+                  diagnostics=bool(getattr(args, "diagnostics", False)))
 
 
 def printer_for(args) -> Printer:
@@ -1046,7 +1098,13 @@ def add_common_options(parser: argparse.ArgumentParser, *, suppress_defaults: bo
     add("--no-redact", action="store_true", help="关闭脱敏(默认对手机号/证件号/邮箱等打码)")
     add("--redact-pattern", action="append", help="额外要打码的词,可重复")
     add("--json", action="store_true", help="只输出 JSON(便于管道)")
-    add("--compact", action="store_true", help="只输出一行摘要")
+    add("--compact", "--summary", dest="compact", action="store_true",
+        help="只输出一行摘要(--summary 是同一个开关的正名;注意它只管本地输出,"
+             "服务端的响应精简模式要用 --response-mode compact)")
+    add("--response-mode", dest="response_mode", metavar="MODE",
+        help="请求信封里的 responseMode(服务端目前认 compact=响应精简模式),与 --compact/--summary 无关")
+    add("--diagnostics", action="store_true",
+        help="请求信封里带 diagnostics:true,精简模式也保留点击诊断字段")
     add("--index", type=int, help="从批量结果里取第 N 步(单条响应只能用 0)")
     add("-v", "--verbose", action="store_true", help="打印调试信息")
 

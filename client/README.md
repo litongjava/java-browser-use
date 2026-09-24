@@ -62,7 +62,16 @@ Windows 下把 `python client/dsb.py` 换成 `client\dsb.cmd`(或先把 `client`
 | `selftest [--browser firefox]` | 对当前服务跑一遍端到端自检(30 项检查) |
 
 通用选项(放在子命令**前面或后面都行**):`--base-url` / `--host` / `--port` / `--id` / `--timeout` /
-`--session` / `--no-record` / `--no-redact` / `--redact-pattern` / `--json` / `--compact` / `--index`。
+`--session` / `--no-record` / `--no-redact` / `--redact-pattern` / `--json` / `--compact`(`--summary`) /
+`--response-mode` / `--diagnostics` / `--index`。
+
+### 三个容易用错的选项
+
+| 选项 | 它到底做什么 | 别混淆 |
+| --- | --- | --- |
+| `--summary`(`--compact` 是同一个开关) | **只影响本地输出**:一行摘要 + 不打 JSON。摘要为空的方法(`get_tabs`/`get_console_logs`/`get_dialog`…)会自动退回打印一行 JSON —— 静默只回一句 `get_tabs OK 21ms` 等于把答案吞了 | 它**不会**给服务端发任何精简请求 |
+| `--response-mode compact` | 请求**信封**里的 `responseMode`(服务端的响应精简模式:去掉重复页签描述、本机截图路径等) | 它是信封级字段,不是 `params` 里的;与上面的 `--summary` 无关 |
+| `--diagnostics` | 信封里带 `diagnostics:true`,精简模式下也保留点击诊断字段 | — |
 
 环境变量:`DSB_BASE_URL`、`DSB_HOST`、`DSB_PORT`、`DSB_TASK_ID`、`DSB_SESSION`、`DSB_RECORD_DIR`、`DSB_REDACT`。
 
@@ -99,7 +108,13 @@ logs/agent/dsb/steps.log       一行一次调用:时间 #序号 id 方法 OK/FA
 
 **默认脱敏**:落盘与终端输出都会把手机号、身份证、统一社会信用代码、邮箱、长号码打码
 (`***手机号***` 之类),`--no-redact` 关掉,`--redact-pattern 某某公司` / `DSB_REDACT=a,b` 追加要打码的词。
-脱敏规则本身有本地自测:`python client/test_dsb.py`。
+
+**但「下一步还要回填给接口的凭据」不脱敏**:`requestId`、`jobId` 的值以及 `hr-<n>-<雪花号>` 形式的人工请求号
+一律原样保留。理由是实测踩过 —— `request_human_input` 回的 `hr-1-1790232350369` 被「长号码」规则打成
+`hr-1-***长号码***` 之后,`submit_human_input` 和 `get_response_body(requestId=…)` 根本没有可用的 ID:
+**让人看不见自己下一步要用的凭据,比泄露它的代价更大**。其余敏感模式照旧打码。
+
+脱敏规则本身有本地自测:`python client/test_dsb.py`(同时覆盖上面这条「ID 不打码」的约定)。
 
 ## 当库用
 

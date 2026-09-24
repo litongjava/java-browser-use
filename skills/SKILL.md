@@ -35,7 +35,10 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | 不确定页面到底动没动 | `diff_dom_text`（不落盘、比重读整页省） |
 | 表单填了但提交说为空 | 看 `data.mode` / `data.committed`；改用 `input_text_by_selector`（可见字段走真实输入，进框架模型） |
 | 上传了但页面没反应 | 看 `upload_file` 回执里的 `data.consumed`（`noListener` 就是这个坑）；用 `get_element_listeners` 复核 |
-| 有弹窗挡住点击 | `get_modals` + `close_modal`（现在有几何兜底，注意每条结果的 `matchedBy` 置信度） |
+| 有弹窗挡住点击 | `get_modals` + `close_modal`（每条结果看 `blocking`/`matchedBy`；`buttons` 里连 `<a class="btn92s">确认</a>` 这种自有按钮也认） |
+| **`execute_js` 里 `.click()` 点了没反应**（点了 window.open / 带 onclick 的锚） | **不是页面坏了**：JS 派发的点击不是可信事件，弹窗会被浏览器拦掉。改用 `click_element_by_selector`（真实鼠标事件）点它 |
+| 想读某个接口的返回，`get_response_body` 却回 `bodyAvailable:false` | 响应体在收到的当下就抄过一份，**跳转/等一会儿也能读**；真读不到说明它不是 xhr/fetch，改用 `wait_for_response` 等一次新响应 |
+| 多行 JS 报 `SyntaxError: Unexpected end of input` | 脚本在命令行里被截断了：改用 `js @脚本.js`（或服务端 `bodyFile`），别看语法错误去改脚本 |
 | 某个元素到底有没有挂事件 | `get_element_listeners`；`get_interactive_map` 每条也带 `hasListeners` |
 | 需要人扫码 / 输验证码 / 支付确认 | `request_human_input`（一串动作用 `steps` 一次交办） |
 | 模型读不了图，但要读验证码 / 维护图 | `ocr_image`（Windows 自带 OCR，支持中文） |
@@ -136,6 +139,18 @@ python client/dsb.py --port 10049 last                            # 重放最近
 不对一眼就能看出来；**退出码把「服务没起」与「业务失败」分开**（`1` 与 `2`），写脚本时不用去解析 `msg` 猜。
 Windows 下把上面例子里的 `python client/dsb.py` 换成 `.\client\dsb.cmd` 即可，其余参数完全一致。
 
+三个容易用错的地方：
+
+- **`--summary`（`--compact` 是同一个开关）只管本地输出**，与服务端协议里的 `responseMode:"compact"`
+  （响应精简模式）不是一回事；后者要用 `--response-mode compact` 传（**信封级字段**，不是 `params` 里的）。
+  摘要为空时（`get_tabs`/`get_console_logs`/`get_dialog` 这类没有可摘要字段的方法）dsb 会自动退回打印一行
+  JSON —— 静默只回一句 `get_tabs OK 21ms` 等于把答案吞了。
+- **默认脱敏不会掩掉「下一步还要回填的凭据」**：`requestId`、`jobId` 与 `hr-<n>-<雪花号>` 原样保留，
+  其余（手机号、证件号、邮箱、长号码）照旧打码。理由很实际：把要回填的 ID 掩成 `***` 之后，
+  `submit_human_input` / `get_response_body(requestId=…)` 就没法用了，比泄露它更糟。
+- **多行脚本不要写在命令行里**：经 cmd/PowerShell 传参会只剩第一行。用 `js @脚本.js`、`--params @文件.json`
+  或 `batch cmds.json`。
+
 不确定服务端现在是什么状态（引擎、profile 目录、命令数、配方数）时，先跑一次自检：
 
 ```shell
@@ -198,6 +213,8 @@ python client/dsb.py --port 10049 selftest --browser chrome
 `get_requests` 中每次请求有独立 requestId（雪花 ID 字符串）、requestedAt、method、url、resourceType；有请求体时附 postData、postDataLength、postDataTruncated。响应到达后回填 status 和 respondedAt，网络失败则记录 failure 和 finishedAt。
 
 `get_response_body` 和 `wait_for_response` 返回相同 requestId、对应 request 元数据、respondedAt 和 ageMs。bodyLength 是完整响应字符数，truncated 明示是否截断，bodyAvailable 指示响应体是否可用。重复 URL 应优先通过 requestId 回查，避免把上次查询结果当成本次结果。
+
+**响应体是「当场抄下来」的，不是「要的时候再去取」。** 浏览器只短暂保留响应体：实测在 12306 这种每秒轮询的页面上，一条 **7 秒前**的 XHR 再取 body 就是 `Protocol error (Network.getResponseBody): No resource with given identifier found`，一导航更是彻底没了——于是「保留最近 100 个响应」在真实站点上等于「一个都读不到」，而调用方最想知道的是「我这一步提交到底成功了没有」（当时只能靠后面又冒出了 `checkOrderInfo`/`getQueueCount` 反推）。现在收到响应时就把 **xhr/fetch** 的 body 抄一份存起来：单条最多 10 万字符（超出标 `bodyTruncated`、`bodyCachedChars`），同时抄的有名额上限（满了会说明「用 `wait_for_response` 重新等一次」）。非 xhr/fetch（文档、脚本、图片）不抄——它们又大又不是「接口返回」。
 
 接口只报告网站返回的记录和查询条件：空列表或 Total=0 表示该条件下没有记录，不能自动解释为税额、余额等业务金额为零。
 
@@ -779,7 +796,7 @@ curl -H "Content-Type: application/json" \
 | `get_dialog` | `id`, `consume`(bool) | 返回 `data.dialog`（`type/message/defaultValue/seq/timestamp`）或 null。**记录不会自动清除**，可能是很早以前的弹窗；`consume=true` 读后即清。`get_js_dialog` 是它的同义名 |
 | `clear_dialog` | `id` | 清空弹窗记录，返回 `data.cleared`。`clear_js_dialog` 是它的同义名 |
 | `set_dialog_behavior` | `id`, `dismiss`(bool) | 弹窗**默认自动确认**；`dismiss=true` 改成自动取消 |
-| `get_modals` | `id` | 列出当前可见的 DOM 弹窗：`data.count`、`data.modals[]`（`kind`/`matchedBy`/`className`/`id`/`title`/`text`/`buttons`/`buttonPoints`/`hasClose`/`closePoint`/`rect`/`zIndex`/`frameIndex`）、`data.top`（最后弹出来的那个）、`data.scannedBy`（跑了哪几轮扫描）。**主 frame 与每个 iframe 各扫一遍**，iframe 里的坐标已换算成主页面视口坐标 |
+| `get_modals` | `id` | 列出当前可见的 DOM 弹窗：`data.count` / `countStrict` / `countHeuristic` / `countBlocking`、`data.modals[]`（`kind`/`matchedBy`/`confidence`/`blocking`/`hasMask`/`className`/`id`/`title`/`text`/`buttons`/`buttonPoints`/`hasClose`/`closePoint`/`rect`/`zIndex`/`frameIndex`）、`data.top`（**最后一条 `blocking` 的**；没有 blocking 时才是最后一条）、`data.topIsBlocking`、`data.scannedBy`（跑了哪几轮扫描）。**主 frame 与每个 iframe 各扫一遍**，iframe 里的坐标已换算成主页面视口坐标 |
 | `close_modal` | `id`, `which`(可选，默认 `top`), `title`(可选), `button`(可选) | 关掉 DOM 弹窗。**一律用真实鼠标点**，并且点完**校验数量是否真的减少**，返回 `data.closed`、`data.countBefore`、`data.countAfter`、`data.clicked` |
 | `get_console_logs` | `id` | 返回 `data.logs` 与 `data.errors`，各最多 200 条 |
 | `clear_console_logs` | `id` | 清空 |
@@ -788,16 +805,19 @@ curl -H "Content-Type: application/json" \
 
 **DOM 弹窗用 `get_modals` / `close_modal`，不要自己写 JS 点它**：`close_modal` 的 `which` 取 `top`（默认）/ `first` / `all` / `class:<子串>`，`title` 按标题或文本子串匹配（给了就以它为准），`button` 指定点哪个按钮（不给则优先右上角 ×，其次「取消/关闭/知道了/我接受」这类非提交按钮）。反复点一个关不掉的弹窗会把确认框**一层层叠起来**（实测叠到 16 个），之后所有「取第一个可见弹窗」的逻辑都在操作最老的那个——所以要看 `data.closed`：为 `false` 说明点了但数量没减少，这时用 `get_modals` 拿 `closePoint`/`buttonPoints`，再 `mouse_click` 那个坐标。
 
+**`buttons` 认的不只是框架按钮。** 只认 `.ant-btn` / `role=button` 会在老站点上全军覆没：实测 12306 的确认框按钮是 `<a id="qr_submit_id" class="btn92s">确认</a>`，老选择器给出 `buttons: []`，`close_modal` 连「确认」都点不到，只能退回手写 JS。现在会一并认「class 里带 `btn`」「`id` 以 `_id` 结尾」「带 `onclick`」的元素，一个都没认出来时还会兜底扫「短文本 + 可点」的锚（每条按钮带 `matchedBy: selector` 或 `fallback-anchor`）。同时按「像不像按钮」过滤：选座的 `A`/`B`/`C`、加减号、`×` 不会被算成按钮。
+
 **`get_modals` 有通用兜底，不会再漏检自定义类名的弹窗。** 它按三轮扫描，每条结果的 `matchedBy` 说明命中来源：
 
 | `matchedBy` | 怎么命中的 | 置信度 |
 | --- | --- | --- |
-| `selector:.ant-modal-wrap, .ant-drawer-open` 等 | 框架专用选择器（ant-design / element-ui / vxe / layui / 协议层） | 最高 |
-| `heuristic:class-name` | 类名里有 `dialog`/`modal`/`popup`/`overlay`/`mask`/`confirm`… 这类词 | 较高：企业微信 / 微信系的自有类名（``qui_dialog``、``ww_dialog``、``mall_invoice_dialog_container``）靠它命中 |
-| `heuristic:fixed-overlay` | 可见 + 面积够大 + `position:fixed` 或 `z-index > 50` 的几何兜底 | 一般：只用来兜底，可能多列出一条整页遮罩 |
+| `selector:.ant-modal-wrap, .ant-drawer-open` 等 | 框架专用选择器（ant-design / element-ui / vxe / layui / 协议层） | 最高（`confidence: strict`） |
+| `heuristic:class-name` | 类名里有 `dialog`/`modal`/`popup`/`overlay`/`mask`/`confirm`… 这类词 | 较高（`confidence: heuristic`）：企业微信 / 微信系的自有类名（``qui_dialog``、``ww_dialog``、``mall_invoice_dialog_container``）靠它命中 |
+| `heuristic:fixed-overlay` | 可见 + 面积够大 + `position:fixed` 或 `z-index > 50` 的几何兜底 | 一般：只用来兜底 |
 
 - 启发式扫描只保留**最内层**的候选：包住另一个候选的元素通常是整页遮罩，真正带标题和按钮的是它里面那个。
-- 所以 `data.count: 0` 现在是可信的（三种扫描都跑过，`data.scannedBy` 会告诉你跑了哪几种）；但 `count > 0` 时要看 `matchedBy` 判断是不是真弹窗。
+- **整页遮罩不算弹窗**（面积 ≈ 视口、没有文字也没有按钮的那种 scrim），**sticky 页头/静态提示条也不算**：它们没有按钮、没有标题、也没有关闭，只会把 `count` 抬高。实测 12306 的查询页老逻辑给出 `count: 5`，其中 4 条是页头与提示条，而 `top` 正好落在页头上——照 `top` 去关弹窗就会去点页头。所以判断「该处理哪个」看 `blocking`（本身像悬浮框且有内容）与 `countBlocking`，`top` 现在也优先取 blocking 的那条。
+- 所以 `data.count: 0` 现在是可信的（三种扫描都跑过，`data.scannedBy` 会告诉你跑了哪几种）；`count > 0` 时按 `blocking` 与 `matchedBy` 判断是不是真弹窗。
 - **弹窗没有标题、也没有 `role=dialog` 时**用类名关：`{"close_modal":{"which":"class:mall_invoice_dialog_container"}}`。`get_modals` 的每项都带 `className`，照着填即可。
 - 弹窗在 iframe 里也能被找到（每项带 `frameIndex`），坐标已经换算成主页面视口坐标，`close_modal` 的鼠标点击因此仍然有效。
 
@@ -809,7 +829,7 @@ curl -H "Content-Type: application/json" \
 | `unroute` | `id`, `urlPattern`(可选) | 不传则移除全部路由 |
 | `get_requests` | `id`, `filter`(可选), `resourceType`(可选), `limit`(可选), `since`(可选) | 返回 `data.requests`（`method/url/resourceType/status`，**带请求体的请求另有 `postData`，最多 4000 字符**），最多 200 条。`filter` 按 URL 子串过滤，`resourceType` 按 `xhr`/`fetch`/`document`/`script` 等过滤，`limit` 限制条数，`since` 只返回该毫秒时间戳之后的。返回里另有 `data.count`/`data.total`/`data.recordedSince`/`data.inflight`/`data.note`。**只有元数据，没有响应体** |
 | `wait_for_response` | `id`, `urlPattern`, `timeoutSeconds`(可选), `maxChars`(可选), `lookBackSeconds`(可选) | 等 `urlPattern` 匹配的响应并返回它的响应体：`data.url`、`data.status`、`data.body`（默认最多 20000 字符）、`data.bodyLength`、`data.ageMs`、`data.fromLookBack`。匹配规则见下面的「URL 匹配」 |
-| `get_response_body` | `id`, `filter`(可选), `index`(可选), `maxChars`(可选), `requestId`(可选) | 回看**已经发生过**的响应体（保留最近 100 个响应）。`filter` 按 URL 子串过滤，不传取最近一个；`index` 在多个匹配里选第几个（默认最后一个）。可用 `requestId` 精确关联重复 URL 的某次请求。响应体已被释放时返回 `data.bodyError`，且 `data.bodyAvailable=false` |
+| `get_response_body` | `id`, `filter`(可选), `index`(可选), `maxChars`(可选), `requestId`(可选) | 回看**已经发生过**的响应体（保留最近 100 个响应）。`filter` 按 URL 子串过滤，不传取最近一个；`index` 在多个匹配里选第几个（默认最后一个）。可用 `requestId` 精确关联重复 URL 的某次请求。**响应体在收到的当下就被抄了一份**（见下），所以跳转/等一会儿之后照样读得到；读的是缓存时另有 `data.bodyFromCache: true` 与 `data.bodyCapturedAt`，还在抄时是 `data.bodyCapturePending: true`。抄不到（非 xhr/fetch、或超过缓存名额）时才回到惰性读法，并给 `data.bodyError` / `data.bodyHint`、`data.bodyAvailable=false` |
 
 **URL 匹配**（`wait_for_response` 的 `urlPattern`、`switch_tab_by_url` 的 `url`）：先按**子串**匹配，再按**通配**匹配，通配里的 `*` 和 `**` 都表示任意字符、**可以跨 `/`**。模式没写尾部通配时，URL 后面还可以再跟内容（`#fragment`、`?query` 都算），所以：
 
@@ -993,6 +1013,12 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 - 与 `get_browser_state` 的分工：**读页面优先用 `get_browser_state`**（结构化、带索引、token 可控）；`execute_js` 用于取快照里没有的东西（`id`/`class`/`href`、滚动位置、localStorage 原始值）或做特殊交互。
 
 ### 用 `bodyFile` + `vars` 传长脚本（客户端-服务器模式下必看）
+
+> **多行脚本走命令行会被 shell 吃掉，这是 Windows 上最常见的一类假故障。** 把多行 JS 直接塞进
+> `dsb.cmd`/PowerShell 的参数里时，可能只有第一行到达服务端，报错却是语法级的
+> `SyntaxError: Unexpected end of input` —— 只说语法，人根本想不到是传输层把脚本切了。所以服务端遇到这类
+> 语法错误会额外回一句 `data.hint`（「脚本像是被截断了…改用 bodyFile 或 `js @脚本.js`」）并给出
+> `data.scriptLength`，客户端侧也用文件传（`js @脚本.js` / `--params @文件.json`），别在命令行里拼多行脚本。
 
 脚本里带中文、引号、换行时，在客户端拼 JSON 很容易出错（PowerShell 尤其容易吃掉引号）。两种做法：
 
@@ -1190,7 +1216,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 20. **`get_dialog` 是「最近一次弹窗」，不会自动清除**：它可能来自很早以前的一次操作，别把内容当成当前这一步的结果。实测提交验证码失败过之后，后续查询明明成功了，`get_dialog` 仍返回上一轮的「验证码输入错误」，据此误判会白跑一轮。用 `data.dialog.seq`/`timestamp` 判断新旧，或在每次提交动作前先 `get_dialog` 加 `consume: true`。
 21. **`ok=true` 不代表点中了东西**：点击类方法只保证动作没抛异常。实测点悬浮菜单时文本命中的是纯文本容器，方法返回成功但页面毫无变化。是否观察到变化看回执里的 `data.changed`；`click_element_by_text` / `click_element_by_role` / `hover_and_click` 还会返回真正命中的 `data.tag`/`data.outerHtml`。
 22. **`input_text` 清空不了**：`text` 是必填参数。要清空用 `clear_text`。
-23. **`get_requests` 只有元数据**：`method/url/resourceType/status`，加带请求体请求的 `postData`（最多 4000 字符），**没有响应体**。要读接口返回的内容用 `wait_for_response`（先回看最近 10 秒，再等新响应）或 `get_response_body`（回看最近 100 个响应）。另外 `wait_for_response` 遇到页面**自己**发起的 fetch 时，回调可能迟迟不执行（见第 18 条），这时用 `execute_js` 主动发一次同样的请求，或改用 `get_response_body` 回看。
+23. **`get_requests` 只有元数据**：`method/url/resourceType/status`，加带请求体请求的 `postData`（最多 4000 字符），**没有响应体**。要读接口返回的内容用 `wait_for_response`（先回看最近 10 秒，再等新响应）或 `get_response_body`（回看最近 100 个响应）。另外 `wait_for_response` 遇到页面**自己**发起的 fetch 时，回调可能迟迟不执行（见第 18 条），这时用 `execute_js` 主动发一次同样的请求，或改用 `get_response_body` 回看。**响应体是收到时当场抄下来的**（xhr/fetch、单条上限 10 万字符），所以「等一下再读」「已经跳走了再读」都还能读到；`data.bodyFromCache` 说明读的是缓存。真读不到（非 xhr/fetch）才回 `bodyAvailable:false`，那时用 `wait_for_response` 重新等。
 24. **页签索引不稳定**：实测点一次菜单会弹出两个同 URL 的重复页签，这时 `pageIndex` 很容易指错。按 URL 用 `switch_tab_by_url` 切换，用 `close_other_tabs` 清理，别一个个 `close_tab`（索引会整体前移）。
 25. **图片类元素只能靠截图接口拿**：`get_browser_state` 只有文本，`execute_js` + canvas 抠图遇到跨域图片会被污染直接失败。用 `get_element_screenshot`（走 Playwright 元素截图，不受同源限制）；智能体本身读不了图时，按第九节请人来看。**但只在确实必须看图时才调它**，非必要不要读图（见开头的省 token 铁律）。
 26. **截图序号是任务级的，不是调用级的**：`seq` 只增不减，`close` 再 `start` 同一个 id 也会接着往上加（文件不删就继续累加）。想要干净的一轮就从空的 `data/<id>/` 目录开始。
@@ -1249,6 +1275,10 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 40. **`engineHonored:true` 不说明「这份 profile 里有登录态」**：这是两件事。`start` 的回执现在另外给 `data.profileSeenBefore`（这份 profile 之前用过吗）与 `data.profileNote`（例如「该 profile 目录本次是首次创建,任何站点都需要重新登录」/「引擎从 chromium 切到 firefox:两种引擎的 profile 格式不通用,登录态不通用,需要重新登录」）。看到引擎被换过、又碰上「所有站点都退登录了」，先看这两个字段。
 
 41. **站点 skill 里的非命令标识符请用双反引号**：`SkillDocConsistencyTest` 会把单反引号里的 snake_case 名字当命令名检查。Vue 字段、CSS 类名、HTML id、URL 参数、接口字段这些**页面里的名字**写成 `` ``subject_name`` `` 就不会被误判。完整约定见 `skills/README.md`。
+
+42. **`execute_js` 里的 `.click()` 触发不了「真点击才有的东西」**：JS 派发的 click 不是可信事件，`window.open` 会被浏览器拦掉，部分框架的提交按钮也不认它。实测 12306 结果页的「预订」（`<a class="btn72" onclick="checkG1234(...)">`）用 `.click()` 完全没反应，**而接口照样回 `ok:true`** —— 于是「点了没反应」被误判成页面问题。正解是 `click_element_by_selector` / `click_element_by_index`（真实鼠标事件）。判断有没有生效看回执里的 `data.mode`（`js` 就是没走真实交互）与 `data.changed`。
+
+43. **服务进程被杀 = 它启动的浏览器一起退出 = session cookie 型登录态失效**：12306 这类站点的登录 cookie 是会话级的，浏览器一关就得人工重新登录。实测踩过：agent 的后台任务被回收时带走了 mvn / java / Chrome 整棵进程树，人工白登录一次。所以**别把「重启服务」当成无痛操作**：要么用 `scripts/run/start-server.cmd`（脱离当前进程树启动）与 `scripts/run/stop-server.cmd`（先关任务与浏览器再结束进程），要么在动手前先确认没有正在进行的人工登录环节。
 
 ## 十二、站点配方（`run_recipe`）
 

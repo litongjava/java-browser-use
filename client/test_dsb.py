@@ -3,6 +3,7 @@
 为什么单独写一个文件:PowerShell 5.1 把 `python -c "…"` 里的双引号吃掉,测试用例没法直接内联,
 所以固定成文件跑:`python client/test_dsb.py`。
 """
+import json
 import sys
 from pathlib import Path
 
@@ -28,6 +29,13 @@ CASES = [
     ("商标注册号94198837,官费270元", "商标注册号94198837,官费270元"),
     ("2026-09-24 10:37:02 click_element_by_selector", "2026-09-24 10:37:02 click_element_by_selector"),
     ("id=1001 seq=3 elementCount=88", "id=1001 seq=3 elementCount=88"),
+    # 更要紧的一条:**下一步还要回填的凭据不能被打码**
+    # 实测踩过:request_human_input 回的 hr-1-1790232350369 被「长号码」规则打码后,
+    # submit_human_input / get_response_body(requestId=…) 根本没有可用的 ID
+    ("hr-1-1790232350369", "hr-1-1790232350369"),
+    ('"requestId": "1790232350369"', '"requestId": "1790232350369"'),
+    ('"jobId": "1790232350369"', '"jobId": "1790232350369"'),
+    ('"orderNo": "1790232350369123"', '"orderNo": "***长号码***"'),
 ]
 
 KV_CASES = [
@@ -72,6 +80,14 @@ def main() -> int:
     ok = masked == {"联系人": "李四 ***手机号***", "nested": [{"证件": "***统一社会信用代码***"}]}
     failed += 0 if ok else 1
     print(f"[{'通过' if ok else '失败'}] redact_obj 递归脱敏 -> {masked}")
+
+    # 结构里的 requestId / jobId 要原样留着(它是回填凭据,不是隐私)
+    kept = redact_obj({"requestId": "1790232350369", "jobId": "hr-1-1790232350369",
+                       "child": {"requestId": "1790232350369"}, "phone": "13800138000"})
+    ok = (kept["requestId"] == "1790232350369" and kept["jobId"] == "hr-1-1790232350369"
+          and kept["child"]["requestId"] == "1790232350369" and kept["phone"] == "***手机号***")
+    failed += 0 if ok else 1
+    print(f"[{'通过' if ok else '失败'}] redact_obj 保留 requestId/jobId -> {kept}")
 
     # 任务 id 必须是数字:非数字要抛用法错,而不是把错误推给服务端
     for bad in ("abc", "10a", ""):
@@ -162,6 +178,41 @@ def main() -> int:
         ok = "commands OK" in buffer.getvalue() and '"picked": 1' in buffer.getvalue()
         failed += 0 if ok else 1
         print(f"[{'通过' if ok else '失败'}] payload 指定时只印被挑中的那一步")
+
+        # 摘要为空时不能只回一行「OK 21ms」:那等于把答案吞了(实测 get_tabs/get_console_logs/get_dialog
+        # 都是这个样子),要退回一行 JSON
+        no_summary = Response("http://x", 200, {"data": {"tabs": [{"index": 0, "url": "https://a.example"}]},
+                                                "ok": True, "code": 1}, "{}", 21)
+        buffer = io.StringIO()
+        Printer(mode="compact", out=buffer).response(no_summary, label="get_tabs")
+        lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
+        ok = (len(lines) == 2 and lines[0].startswith("get_tabs OK") and '"tabs"' in lines[1])
+        failed += 0 if ok else 1
+        print(f"[{'通过' if ok else '失败'}] --summary 摘要为空时退回一行 JSON -> {lines}")
+
+        # 摘要里有内容时仍然只有一行(不退化)
+        buffer = io.StringIO()
+        Printer(mode="compact", out=buffer).response(sample, label="commands")
+        lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
+        ok = len(lines) == 1 and "count=2" in lines[0]
+        failed += 0 if ok else 1
+        print(f"[{'通过' if ok else '失败'}] --summary 有摘要时不多打一行 -> {lines}")
+
+        # responseMode / diagnostics 是**信封级**字段,不能塞进 params —— 塞错了服务端不会报错,只是不生效
+        captured = {}
+
+        def fake_request(path, *, method="GET", body=None, content_type=None, query=None, timeout=None):
+            captured["body"] = json.loads(body.decode("utf-8"))
+            return Response("http://x", 200, {"data": {}, "ok": True, "code": 1}, "{}", 1)
+
+        env_client = Client(task_id=1001, session=None, response_mode="compact", diagnostics=True)
+        env_client.request = fake_request
+        env_client.command("get_browser_state", {"highlight": False})
+        body = captured.get("body", {})
+        ok = (body.get("responseMode") == "compact" and body.get("diagnostics") is True
+              and "responseMode" not in body.get("params", {}))
+        failed += 0 if ok else 1
+        print(f"[{'通过' if ok else '失败'}] --response-mode 进信封而不是 params -> {body}")
 
     print(f"\n结果:{'全部通过' if failed == 0 else f'{failed} 项失败'}")
     return 1 if failed else 0

@@ -1635,14 +1635,23 @@ public class PlaywrightService {
     }
   }
 
-  /** 保留最近 100 个响应(带时间戳),get_response_body / wait_for_response 靠它回捞响应体 */
+  /**
+   * 保留最近 100 个响应(带时间戳),get_response_body / wait_for_response 靠它回捞响应体
+   *
+   * <p>
+   * 存进去的同时就把 xhr/fetch 的 body 抄一份:浏览器只会短暂保留响应体,不抄的话「保留 100 个响应」
+   * 在真实页面上等于「都读不到」(见 {@link ResponseBodyCache})。
+   */
   private static void rememberResponse(BrowserInstance inst, Response response, Kv request) {
+    BrowserInstance.RecordedResponse recorded =
+        new BrowserInstance.RecordedResponse(response, System.currentTimeMillis(), request);
     synchronized (inst.recentResponses) {
-      inst.recentResponses.addLast(new BrowserInstance.RecordedResponse(response, System.currentTimeMillis(), request));
+      inst.recentResponses.addLast(recorded);
       while (inst.recentResponses.size() > 100) {
         inst.recentResponses.removeFirst();
       }
     }
+    ResponseBodyCache.capture(recorded);
   }
 
   private static String truncate(String value, int max) {
@@ -4069,9 +4078,33 @@ public class PlaywrightService {
       String message = briefMessage(e.getMessage());
       log.error("execute_js 执行失败,id:{},script:{},error:{}", browserId, script, message, e);
       RespBodyVo failure = RespBodyVo.fail("执行 JavaScript 失败：" + message);
-      failure.setData(Kv.by("error", scriptError(e)).set("scriptPreview", truncate(script, 400)));
+      Kv detail = Kv.by("error", scriptError(e)).set("scriptPreview", truncate(script, 400))
+          .set("scriptLength", script.length());
+      // 「脚本被截断」是 Windows 上最常见的一类假故障:多行脚本经 cmd/PowerShell 传参时被吃掉,
+      // 到服务端的只剩第一行,报错却是语法级的 "Unexpected end of input" —— 只说语法,人根本想不到
+      // 是传输层把脚本切了。这里直接说破,并给出传文件的写法
+      if (looksTruncatedScript(message)) {
+        detail.set("hint", "脚本像是被截断了(报的是 " + message + "):多行脚本走命令行时可能只到了第一行。"
+            + "改用文件传:服务端把脚本放进 scripts/js 目录后传 bodyFile,或客户端用 js @脚本.js");
+      }
+      failure.setData(detail);
       return failure;
     }
+  }
+
+  /**
+   * 这是「脚本被截断」而不是「脚本写错了」吗
+   *
+   * <p>
+   * 只看语法级的那几个特征串:未预期的结尾、未闭合的字符串/括号/模板。它们同时也是「多行参数被
+   * shell 吃掉」的典型表现,所以值得专门提示一句。
+   */
+  static boolean looksTruncatedScript(String message) {
+    if (message == null) {
+      return false;
+    }
+    String lower = message.toLowerCase(java.util.Locale.ROOT);
+    return lower.contains("unexpected end of input") || lower.contains("unterminated");
   }
 
   /**
@@ -5903,19 +5936,78 @@ public class PlaywrightService {
         };
         const classOf = (el) => (typeof el.className === 'string' ? el.className : '')
           || (el.className && el.className.baseVal) || '';
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        // 整页遮罩(scrim):面积几乎等于视口、没有文字也没有按钮。它是「挡着点击的东西」,但不是
+        // 「要关的弹窗」,所以既不算进 modals,也不该被 close_modal 当成目标;真弹窗自己那一份
+        // 用 hasMask 记一笔,方便判断「这层遮罩是不是它的」
+        const covers = Array.from(document.querySelectorAll('div,section,aside,span'))
+          .filter(el => {
+            if (!vis(el)) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < vw * 0.8 || r.height < vh * 0.8) return false;
+            return (el.innerText || '').trim().length < 40
+              && !el.querySelector('button, input[type=button], input[type=submit], [class*=btn]');
+          });
+        const isCover = (el) => covers.indexOf(el) >= 0;
+        const hasMask = (el) => covers.some(m => m !== el && !m.contains(el) && !el.contains(m));
+        // 按钮文本要「像按钮」:非 ASCII 文字(中文等),或者 3 个字母以上的英文词。
+        // 这一条把误报挡在外面:选座的 A/B/C/D/F、加减号、数字、× 都不是按钮
+        const looksLikeButton = (label) => /[^\\x00-\\x7F]/.test(label) || /^[A-Za-z][A-Za-z0-9]{2,13}$/.test(label);
+        /**
+         * 弹窗里的按钮 —— 只认框架类名是不够的。
+         *
+         * 实测 12306 的确认框按钮是 <a id="qr_submit_id" class="btn92s">确认</a>:既不是 button,
+         * 也没有 role=button,更不是 .ant-btn,于是老选择器给出 buttons:[],close_modal 连「确认」
+         * 都点不到,只能退回手写 JS。所以这里放宽到「class 里带 btn / id 以 _id 结尾 / 带 onclick」
+         * 的锚元素,并在一个都没认出来时兜底扫「短文本 + 可点」的锚。
+         */
+        const BUTTON_SELECTOR = 'button, input[type=button], input[type=submit], input[type=reset], '
+          + '[role=button], [class*=btn], .ant-btn, .el-button, .layui-layer-btn a, .vxe-button, '
+          + 'a[id$=_id], a[onclick]';
+        const collectButtons = (el) => {
+          const found = [];
+          const push = (b, matchedBy) => {
+            if (!vis(b)) return;
+            const label = ((b.innerText || b.value || '').trim().replace(/\\s+/g, '')).slice(0, 12);
+            if (!label || !looksLikeButton(label)) return;
+            const point = center(b);
+            if (found.some(f => f.label === label
+              && Math.abs(f.point[0] - point[0]) < 3 && Math.abs(f.point[1] - point[1]) < 3)) return;
+            found.push({
+              label: label, point: point, tag: b.tagName.toLowerCase(), id: b.id || null,
+              className: classOf(b).slice(0, 80), matchedBy: matchedBy
+            });
+          };
+          el.querySelectorAll(BUTTON_SELECTOR).forEach(b => push(b, 'selector'));
+          if (!found.length) {
+            el.querySelectorAll('a, span, div, em').forEach(b => {
+              const label = ((b.innerText || '').trim().replace(/\\s+/g, ''));
+              if (!label || label.length > 8 || !looksLikeButton(label)) return;
+              if (b.querySelector('a, span, div, em')) return;
+              const clickable = !!b.id || !!b.getAttribute('onclick')
+                || /^javascript:/i.test(b.getAttribute('href') || '')
+                || getComputedStyle(b).cursor === 'pointer';
+              if (clickable) push(b, 'fallback-anchor');
+            });
+          }
+          return found;
+        };
         const describe = (el, kind, matchedBy) => {
           const titleEl = el.querySelector('.ant-modal-title, .ant-modal-confirm-title, .ant-drawer-title, [class*=title]');
-          const buttons = [];
-          el.querySelectorAll('button, .ant-btn, a[role=button], [role=button]').forEach(b => {
-            if (!vis(b)) return;
-            const label = (b.innerText || '').trim().replace(/\\s+/g, '');
-            if (label) buttons.push({ label: label, point: center(b) });
-          });
+          const buttons = collectButtons(el);
           const closeEl = el.querySelector('.ant-modal-close, .ant-modal-close-x, [aria-label=Close], [class*=close]');
           const r = el.getBoundingClientRect();
+          const cs = getComputedStyle(el);
+          const zIndex = parseInt(cs.zIndex, 10);
+          const overlayish = cs.position === 'fixed' || cs.position === 'absolute' || (!isNaN(zIndex) && zIndex > 50);
+          const mask = hasMask(el);
+          const hasContent = buttons.length > 0 || !!titleEl || !!closeEl;
+          const cover = isCover(el);
           return {
             kind: kind,
             matchedBy: matchedBy,
+            confidence: matchedBy.indexOf('selector:') === 0 ? 'strict' : 'heuristic',
             className: classOf(el).slice(0, 200),
             id: el.id || null,
             title: text(titleEl),
@@ -5924,6 +6016,14 @@ public class PlaywrightService {
             buttonPoints: buttons,
             hasClose: !!closeEl,
             closePoint: closeEl && vis(closeEl) ? center(closeEl) : null,
+            // blocking = 「它正挡着页面」的判据:本身像个悬浮框(有按钮/标题/关闭)才成立。
+            // **不能只看「页面上有遮罩」**:那样一个 sticky 页头也会因为「别处有 mask」被算成 blocking
+            // (实测 12306 的 .header 就是这样混进来的),而页头永远不是要关的弹窗。
+            blocking: overlayish && hasContent,
+            overlayish: overlayish,
+            hasContent: hasContent,
+            hasMask: mask,
+            isCover: cover,
             rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
             zIndex: getComputedStyle(el).zIndex
           };
@@ -5932,6 +6032,18 @@ public class PlaywrightService {
         // 同一个弹窗会被多个选择器命中(ant 的弹窗里就有 role=dialog),所以收集时要去重:
         // 已经收过的元素、以及被已收元素包住的元素都不再单独算一个,否则一个弹窗会数成两个
         const seen = [];
+        /**
+         * 这是「页面自己的框架」而不是浮层吗
+         *
+         * <p>整宽 + 很扁 = 吸顶页头 / 页脚 / 提示条。它们常常也是 `position:fixed` + 高 z-index,
+         * 于是几何兜底会把它们当弹窗列出来(实测 12306 查询页的 `.header` 就是这样混进来的,
+         * 而且因为按 DOM 顺序取最后一条,`top` 正好落在它身上)。判据只用宽度与高度,不看类名 ——
+         * 类名是最不可靠的那一环。
+         */
+        const isPageChrome = (el) => {
+          const r = el.getBoundingClientRect();
+          return r.width >= vw * 0.98 && r.height <= vh * 0.25;
+        };
         const add = (el, kind, matchedBy) => {
           if (!vis(el)) return;
           if (el.id === 'playwright-highlight-container') return;
@@ -5939,8 +6051,16 @@ public class PlaywrightService {
           for (const s of seen) {
             if (s === el || s.contains(el) || el.contains(s)) return;
           }
+          const described = describe(el, kind, matchedBy);
+          // 「整页遮罩」不是弹窗;「整宽的页面框架」(页头/页脚/吸顶条)也不是;**静态的提示条**同样不是。
+          // 判据分两层,顺序不能反:静态元素(overlayish=false)先被挡掉,免得把 .tips-txt 这类静态提示
+          // 当成弹窗;固定的整宽条再被 isPageChrome 挡掉,免得把页头当成弹窗。
+          // 反过来说,「没有类名线索、fixed、里面什么都没有」的浮层必须留下 —— 那正是几何兜底存在的理由。
+          if (described.isCover) return;
+          if (described.confidence === 'heuristic' && !described.hasContent
+            && !(described.overlayish && !isPageChrome(el))) return;
           seen.push(el);
-          modals.push(describe(el, kind, matchedBy));
+          modals.push(described);
         };
         // 第一轮:框架专用选择器(最高置信度)
         const FRAMEWORK = [
@@ -5989,16 +6109,26 @@ public class PlaywrightService {
           add(el, 'heuristic', 'heuristic:fixed-overlay');
           heuristicCount++;
         }
-        // 后出现的通常是后弹出来的,排在最后当作「最顶层」
+        // 后出现的通常是后弹出来的。但「最顶层」本来按 DOM 顺序取最后一条,实测会被页头/提示条这种
+        // 假阳性顶掉,所以优先取最后一条 blocking 的,没有再退回最后一条
+        const blocking = modals.filter(m => m.blocking);
+        const strictCount = modals.filter(m => m.confidence === 'strict').length;
         return {
           count: modals.length,
+          countStrict: strictCount,
+          countHeuristic: modals.length - strictCount,
+          countBlocking: blocking.length,
           modals: modals,
-          top: modals.length ? modals[modals.length - 1] : null,
+          top: blocking.length ? blocking[blocking.length - 1]
+            : (modals.length ? modals[modals.length - 1] : null),
+          topIsBlocking: blocking.length > 0,
           scannedBy: ['selector', 'heuristic:class-name', 'heuristic:fixed-overlay'],
           note: modals.length
-            ? 'modals 按 DOM 顺序排列,最后一个是最后弹出来的(通常就是最顶层);关它用 close_modal'
-              + '每条都带 matchedBy 说明命中来源:selector:… 置信度最高,heuristic:… 是启发式兜底'
-            : '当前没有可见的 DOM 弹窗(已跑过框架选择器 + 类名线索 + 几何兜底三轮扫描;'
+            ? 'modals 按 DOM 顺序排列,top 是最后一条 blocking 的(没有 blocking 时才是最后一条);关它用 close_modal。'
+              + '每条都带 matchedBy 说明命中来源:selector:… 置信度最高,heuristic:… 是启发式兜底;'
+              + 'confidence(strict/heuristic)、blocking(是否真的挡着页面)、buttons(含非框架的自有按钮,'
+              + '例如 <a class="btn92s">确认</a>)与 buttonPoints(可点坐标)是判断「该点哪个」的依据'
+            : '当前没有可见的 DOM 弹窗(已跑过框架选择器 + 类名线索 + 几何兜底三轮扫描,整页遮罩不算弹窗;'
               + 'get_dialog 看的是原生 alert/confirm,两者不同)'
         };
       }
@@ -6068,8 +6198,27 @@ public class PlaywrightService {
     if (!any) {
       return null;
     }
-    merged.set("count", modals.size()).set("modals", modals)
-        .set("top", modals.isEmpty() ? null : modals.get(modals.size() - 1));
+    int strict = 0;
+    int blocking = 0;
+    Kv top = null;
+    for (Kv modal : modals) {
+      boolean strictHit = "strict".equals(modal.getStr("confidence"));
+      boolean blocks = Boolean.TRUE.equals(modal.get("blocking"));
+      if (strictHit) {
+        strict++;
+      }
+      if (blocks) {
+        blocking++;
+        // 「最顶层」优先取最后一条真的挡着页面的:按 DOM 顺序取最后一条会被页头/提示条顶掉
+        top = modal;
+      }
+    }
+    if (top == null && !modals.isEmpty()) {
+      top = modals.get(modals.size() - 1);
+    }
+    merged.set("count", modals.size()).set("countStrict", strict).set("countHeuristic", modals.size() - strict)
+        .set("countBlocking", blocking).set("modals", modals).set("top", top)
+        .set("topIsBlocking", top != null && Boolean.TRUE.equals(top.get("blocking")));
     if (!errors.isEmpty()) {
       merged.set("frameErrors", errors);
     }
@@ -6609,9 +6758,34 @@ public class PlaywrightService {
   }
 
   private static Kv responseInfo(BrowserInstance.RecordedResponse recorded, Integer maxChars) {
-    Kv kv = responseInfo(recorded.response, maxChars);
+    // 先读「收到响应时当场抄下来的」那份:浏览器的响应体早就释放了,惰性读会得到
+    // "No resource with given identifier found"(实测 7 秒前的 XHR 就已经读不到)
+    Kv kv = recorded.body != null ? cachedBodyInfo(recorded, maxChars) : responseInfo(recorded.response, maxChars);
+    if (recorded.body == null && recorded.bodyCaptureError != null
+        && !Boolean.TRUE.equals(kv.get("bodyAvailable"))) {
+      kv.set("bodyError", recorded.bodyCaptureError).set("bodyAvailable", false);
+    }
     kv.set("requestId", recorded.request.get("requestId")).set("request", recorded.request)
         .set("respondedAt", recorded.at).set("ageMs", Math.max(0, System.currentTimeMillis() - recorded.at));
+    if (recorded.body != null) {
+      kv.set("bodyFromCache", true).set("bodyCapturedAt", recorded.bodyAt);
+    } else if (!recorded.bodyCaptured) {
+      kv.set("bodyFromCache", false).set("bodyCapturePending", true);
+    }
+    return kv;
+  }
+
+  /** 用当场抄下来的响应体拼回执,字段与原惰性读法保持一致 */
+  private static Kv cachedBodyInfo(BrowserInstance.RecordedResponse recorded, Integer maxChars) {
+    int limit = maxChars == null || maxChars <= 0 ? DEFAULT_RESPONSE_BODY_CHARS : maxChars;
+    String body = recorded.body;
+    Kv kv = Kv.by("url", recorded.response.url()).set("status", recorded.response.status());
+    kv.set("body", truncate(body, limit));
+    kv.set("bodyLength", body.length()).set("truncated", body.length() > limit || recorded.bodyTruncated)
+        .set("bodyAvailable", true);
+    if (recorded.bodyTruncated) {
+      kv.set("bodyCachedChars", ResponseBodyCache.MAX_CHARS);
+    }
     return kv;
   }
 
@@ -6622,7 +6796,8 @@ public class PlaywrightService {
     try {
       body = response.text();
     } catch (PlaywrightException e) {
-      kv.set("bodyError", briefMessage(e.getMessage())).set("bodyAvailable", false);
+      kv.set("bodyError", briefMessage(e.getMessage())).set("bodyAvailable", false).set("bodyHint",
+          "响应体已经不在浏览器里了:改用 wait_for_response 等一次新响应(它先回看再等,通常一次就能命中)");
     }
     if (body != null) {
       kv.set("body", truncate(body, limit));
