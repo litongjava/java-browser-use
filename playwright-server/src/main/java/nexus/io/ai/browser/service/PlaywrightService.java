@@ -28,13 +28,17 @@ import com.jfinal.kit.Kv;
 import nexus.io.ai.browser.consts.BrowserUserAgent;
 import nexus.io.ai.browser.dom.model.DOMElementNode;
 import nexus.io.ai.browser.dom.model.DOMState;
+import nexus.io.ai.browser.dom.model.FrameSnapshot;
 import nexus.io.ai.browser.dom.service.DomService;
 import nexus.io.ai.browser.handler.CommandTraceLog;
 import nexus.io.ai.browser.upload.UploadStore;
+import nexus.io.ai.browser.util.ListenerProbe;
+import nexus.io.ai.browser.util.WindowsOcr;
 import com.microsoft.playwright.Browser;
 import com.microsoft.playwright.BrowserContext;
 import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.BrowserType.LaunchPersistentContextOptions;
+import com.microsoft.playwright.Frame;
 import com.microsoft.playwright.Locator;
 import com.microsoft.playwright.Mouse;
 import com.microsoft.playwright.Page;
@@ -64,6 +68,13 @@ import nexus.io.tio.utils.snowflake.SnowflakeIdUtils;
 public class PlaywrightService {
 
   private static final ConcurrentHashMap<Long, BrowserInstance> INSTANCES = new ConcurrentHashMap<>();
+
+  /** 本进程的启动时刻:「实例不存在」的报错要用它解释「是不是服务重启过了」 */
+  static final long STARTED_AT = System.currentTimeMillis();
+
+  /** 启动时刻的可读形式(报错信息与自省接口共用) */
+  static final String STARTED_AT_TEXT = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT)
+      .format(new java.util.Date(STARTED_AT));
 
   /**
    * 全进程共享的浏览器
@@ -150,6 +161,7 @@ public class PlaywrightService {
   private static final String JS_MODE_NOTE = "js 模式只改了 DOM 的值并派发了 input/change 事件,"
       + "不保证进入框架(React/Vue)的模型:提交或预览时可能仍然是空的。"
       + "能看见的元素请用 mode=native(默认的 auto 也会优先用真实输入)";
+
 
   /** 等待类接口的默认超时(毫秒) */
   private static final double DEFAULT_WAIT_TIMEOUT_MS = 30_000;
@@ -242,12 +254,146 @@ public class PlaywrightService {
       throw new IllegalStateException("该 id 已经有正在运行的浏览器实例：" + taskId + "，请先调用 close，或换一个 id");
     }
     long startedAt = System.currentTimeMillis();
+    // 「这份 profile 之前用过吗」必须在启动**之前**判断:启动之后目录一定存在,再问就永远是「用过」
+    java.util.Set<String> existedBefore = profileDirsExistingBeforeLaunch(requested);
     SharedBrowser shared = sharedBrowser(headless, requested);
+    applyProfileHistory(shared, existedBefore);
     BrowserInstance instance = newTaskInstance(taskId, shared);
     INSTANCES.put(taskId, instance);
     log.info("task {} 浏览器就绪(browser={}),耗时 {}ms", taskId, shared.resolvedType.id(),
         System.currentTimeMillis() - startedAt);
     return taskId;
+  }
+
+  // ==================== profile 的登录态来历 ====================
+
+  /**
+   * profile 目录里的标记文件:记下「上次是哪次启动、哪个引擎用的这份 profile」
+   *
+   * <p>放在 profile 目录里而不是别处,因为它描述的正是「这份 profile」;随 profile 一起被清掉也是对的。
+   */
+  static final String PROFILE_MARKER = ".dsh-browser-use-profile.json";
+
+  /**
+   * 启动前把「候选 profile 目录里已经有内容」的那些记下来
+   *
+   * <p>启动之后目录一定存在(浏览器自己会建),再问就永远是「用过」,所以必须在启动前问。
+   * 判断口径是「目录存在**且非空**」:空目录(比如刚创建的临时目录)等于没有登录态。
+   */
+  private static java.util.Set<String> profileDirsExistingBeforeLaunch(BrowserChoice requested) {
+    java.util.Set<String> existing = new java.util.HashSet<>();
+    BrowserChoice type = BrowserChoice.resolve(requested);
+    List<Path> candidates = new ArrayList<>();
+    candidates.add(type.profileDir());
+    candidates.add(ChromeBrowser.managedProfileDir());
+    candidates.add(EdgeBrowser.managedProfileDir());
+    candidates.add(ChromeBrowser.userDataDir());
+    for (Path dir : candidates) {
+      if (dir == null) {
+        continue;
+      }
+      try {
+        Path normalized = dir.toAbsolutePath().normalize();
+        if (!Files.isDirectory(normalized)) {
+          continue;
+        }
+        try (java.util.stream.Stream<Path> entries = Files.list(normalized)) {
+          if (entries.findFirst().isPresent()) {
+            existing.add(normalized.toString());
+          }
+        }
+      } catch (IOException | RuntimeException e) {
+        // 拿不到就当不存在:这只是「顺便优化一下提示语」,不该影响启动
+      }
+    }
+    return existing;
+  }
+
+  /**
+   * 记下这份 profile 的来历,并刷新标记文件
+   *
+   * <p>
+   * <b>为什么要做这件事</b>:P6 那次踩坑是「默认引擎被配成了 firefox、而登录态都在 Chromium 的 profile 里」,
+   * 于是 {@code start} 之后所有站点都退登录 —— 而回执里的 {@code engineHonored:true} 只说明参数被采纳了,
+   * 不说明这份 profile 里有登录态。这里把「之前用过吗、上次是什么引擎」记在 {@link SharedBrowser} 上,
+   * 由 {@code browserInfo} 写进回执。
+   *
+   * <p>用户自己的 Chrome profile 不写标记(那是人家的目录,不该塞私有文件);这种情况靠
+   * {@code userProfile=true} 本身就能说明「登录态是用户日常那份」。
+   */
+  private static void applyProfileHistory(SharedBrowser shared, java.util.Set<String> existedBefore) {
+    if (shared == null || shared.profileDir == null) {
+      return;
+    }
+    Path marker = shared.profileDir.resolve(PROFILE_MARKER);
+    Kv recorded = readProfileMarker(marker);
+    shared.previousProfileEngine = recorded == null ? null : recorded.getStr("engine");
+    shared.previousProfileBrowser = recorded == null ? null : recorded.getStr("browser");
+    boolean existed = existedBefore.contains(shared.profileDir.toAbsolutePath().normalize().toString());
+    shared.profileSeenBefore = recorded != null || existed;
+    if (shared.userProfile) {
+      return;
+    }
+    writeProfileMarker(marker, shared.engine.id(), shared.resolvedType.id());
+  }
+
+  /** 读标记文件;不存在或读不出来都返回 null */
+  private static Kv readProfileMarker(Path marker) {
+    try {
+      if (!Files.isRegularFile(marker)) {
+        return null;
+      }
+      JSONObject json = JSON.parseObject(Files.readString(marker, StandardCharsets.UTF_8));
+      return json == null ? null : new Kv().set((Map<String, Object>) json);
+    } catch (IOException | RuntimeException e) {
+      return null;
+    }
+  }
+
+  private static void writeProfileMarker(Path marker, String engine, String browser) {
+    try {
+      Files.createDirectories(marker.getParent());
+      JSONObject json = new JSONObject();
+      json.put("engine", engine);
+      json.put("browser", browser);
+      json.put("updatedAt", System.currentTimeMillis());
+      Files.writeString(marker, json.toJSONString(), StandardCharsets.UTF_8);
+    } catch (IOException | RuntimeException e) {
+      log.debug("写 profile 标记失败:{}", e.getMessage());
+    }
+  }
+
+  /**
+   * 一句话说清「这份 profile 里有没有登录态」
+   *
+   * <p>{@code engineHonored:true} 只说明浏览器参数被采纳了;「这份 profile 之前用过吗」是另一件事,而这
+   * 件事决定了「start 之后要不要重新登录」。所以这里把两者分开说清楚。
+   */
+  static String profileLoginNote(SharedBrowser browser) {
+    if (browser == null) {
+      return null;
+    }
+    StringBuilder note = new StringBuilder();
+    if (browser.userProfile) {
+      note.append("用的是用户自己的 Chrome profile(userProfile=true):登录态就是用户日常那份,通常不需要重新登录。");
+    } else if (Boolean.FALSE.equals(browser.profileSeenBefore)) {
+      note.append("该 profile 目录本次是**首次创建**,里面没有任何登录态:任何需要登录的站点都要重新登录一次")
+          .append("(登录之后会留在这份 profile 里,后续任务不用再登)。");
+    } else if (browser.previousProfileEngine != null && !browser.previousProfileEngine.equals(browser.engine.id())) {
+      note.append("引擎从 ").append(browser.previousProfileEngine).append(" 切到 ").append(browser.engine.id())
+          .append(":两种引擎的 profile 格式不通用,**登录态不通用**,需要重新登录。");
+    } else if (Boolean.TRUE.equals(browser.profileSeenBefore)) {
+      note.append("这份 profile 之前用过(上次是 browser=")
+          .append(browser.previousProfileBrowser == null ? "未知" : browser.previousProfileBrowser)
+          .append("):里面已有的登录态应该还在。");
+    }
+    if (browser.profileNote != null && !browser.profileNote.isEmpty()) {
+      if (note.length() > 0) {
+        note.append(' ');
+      }
+      note.append(browser.profileNote);
+    }
+    return note.length() == 0 ? null : note.toString();
   }
 
   /**
@@ -286,6 +432,22 @@ public class PlaywrightService {
     final LaunchPersistentContextOptions opts;
     /** 没能用上用户 profile 时的原因,会一起返回给调用方 */
     final String profileNote;
+
+    /**
+     * 这份 profile 在这次启动**之前**就已经有内容了吗
+     *
+     * <p>
+     * {@code start} 回执里的 {@code engineHonored:true} 只说明「浏览器参数被采纳了」,不说明「这份 profile 里
+     * 有登录态」。实测踩过:服务端默认引擎被配成 firefox,而登录态都在 Chromium 那份 profile 里,于是
+     * 「所有站点都退登录了」,但回执里没有任何线索。这个字段直接回答「这份 profile 之前用过吗」。
+     *
+     * <p>null 表示没测到(还没启动过或目录不可读)。
+     */
+    volatile Boolean profileSeenBefore;
+    /** 上次用这份 profile 的引擎(读自 profile 目录里的标记文件);没记录过为 null */
+    volatile String previousProfileEngine;
+    /** 上次用这份 profile 的浏览器类型(读自标记文件);没记录过为 null */
+    volatile String previousProfileBrowser;
     volatile BrowserContext context;
     /** CDP 模式(自己拉 Chrome)下的连接;托管 profile 模式为 null */
     volatile Browser browser;
@@ -745,6 +907,18 @@ public class PlaywrightService {
     }
     if (browser.profileNote != null) {
       info.set("note", browser.profileNote);
+    }
+    // 「这份 profile 里有没有登录态」:engineHonored:true 回答不了这件事,但它决定了要不要重新登录
+    if (browser.profileSeenBefore != null) {
+      info.set("profileSeenBefore", browser.profileSeenBefore);
+    }
+    if (browser.previousProfileEngine != null) {
+      info.set("previousEngine", browser.previousProfileEngine);
+      info.set("previousBrowser", browser.previousProfileBrowser);
+    }
+    String loginNote = profileLoginNote(browser);
+    if (loginNote != null) {
+      info.set("profileNote", loginNote);
     }
     // 这次任务的调用追踪日志落在哪、暂存上传目录在哪:客户端-服务器模式下用户要知道去哪清理敏感数据
     info.set("trace", Kv.by("dir", CommandTraceLog.currentDir().toString())
@@ -1542,23 +1716,55 @@ public class PlaywrightService {
    */
   public RespBodyVo getBrowserState(Long browserId, Boolean highlight, Integer viewportExpansion,
       Boolean includeElements, Integer maxElements) {
+    return getBrowserState(browserId, highlight, viewportExpansion, includeElements, maxElements, null);
+  }
+
+  /**
+   * 同上,额外控制「要不要连跨域 iframe 里的元素一起纳入快照」
+   *
+   * <p>
+   * <b>为什么要有 {@code includeFrames}</b>:实测企业微信后台把「邮件」应用套在 {@code exmail.qq.com} 的
+   * 跨域 iframe 里(微盘 / 文档 / 会议同理),顶层 {@code document} 里一个元素都没有 —— 常规手段全部失效。
+   * 而 Playwright 本身能跨 frame(走浏览器协议,不依赖往页面里注入 JS),缺的只是把 {@code page.frames()}
+   * 暴露出来。传 {@code includeFrames:true} 之后:
+   *
+   * <ul>
+   * <li>每个 frame 的元素都进**同一个索引空间**,索引全局唯一,每项带 {@code frameIndex};</li>
+   * <li>{@code data.text} 里用 {@code --- frame[i] <url> elements=N index=a..b ---} 标出边界;</li>
+   * <li>按索引命令(click_element_by_index / input_text / …)**自动路由**到索引所在的 frame,调用方不必
+   * 再传 frame 参数 —— 索引里已经带了 frame 信息。</li>
+   * </ul>
+   *
+   * <p>
+   * 默认 {@code false},行为与以前完全一致(只看顶层文档):带 frame 要多跑几轮脚本,而且绝大多数页面没有
+   * 跨域 iframe,不该让所有调用方都付这个代价。
+   *
+   * @param includeFrames 是否把跨域 iframe 里的元素也纳入快照,默认 {@code false}
+   */
+  public RespBodyVo getBrowserState(Long browserId, Boolean highlight, Integer viewportExpansion,
+      Boolean includeElements, Integer maxElements, Boolean includeFrames) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     boolean doHighlight = highlight == null || highlight;
     int expansion = viewportExpansion == null ? 0 : viewportExpansion;
+    boolean withFrames = Boolean.TRUE.equals(includeFrames);
 
     DOMState state;
     try {
-      state = DomService.getClickableElements(inst.page, doHighlight, -1, expansion);
+      // 一律走「按 frame 逐个求值」这条路:同源 iframe 的元素仍然全部在快照里(和以前顺着 iframe 递归
+      // 的结果一致),但每个索引现在都记着它属于哪个 frame,按索引命令**自动路由**到正确的文档 ——
+      // 以前同源 iframe 里的元素拿不到正确路由(它们的 xpath 相对 iframe 文档,在主文档里求值必然失败)。
+      // includeFrames 控制的是「要不要连跨域 iframe 也纳入」。
+      state = DomService.getFrameState(inst.page, doHighlight, expansion, !withFrames);
     } catch (PlaywrightException e) {
       return RespBodyVo.fail("构建页面结构失败：" + briefMessage(e.getMessage()));
     }
-    inst.domState = state;
+    recordSnapshot(inst, state);
 
     Kv kv = Kv.by("url", inst.page.url());
-    String text = state.getElementTree().clickableElementsToString(null);
+    String text = frameText(state);
     String browserState = browserStateText(inst);
     kv.set("title", safeTitle(inst.page));
     // 给模型读的页签块,格式见 browserStateText
@@ -1571,6 +1777,18 @@ public class PlaywrightService {
     kv.set("page_height", state.getPageHeight());
     // 供 diff_dom_text 比较"这一次快照和上一次差在哪"
     inst.lastDomText = text;
+
+    if (withFrames) {
+      kv.set("frames", frameList(state));
+      kv.set("frameCount", state.getFrames().size());
+      kv.set("includeFrames", true);
+    } else {
+      // 顶层看不到元素时主动提一句:这类站点的下一步不是「换个选择器」,而是 includeFrames / list_frames
+      String hint = frameHint(inst, state);
+      if (hint != null) {
+        kv.set("frameHint", hint);
+      }
+    }
 
     // 索引清单:text 是给人读的树,index 才是按索引命令要用的东西,直接内联免得再跑一趟
     if (includeElements == null || includeElements) {
@@ -1595,6 +1813,158 @@ public class PlaywrightService {
   }
 
   /**
+   * 带 frame 的快照文本:每段前面一行 {@code --- frame[i] ... ---}
+   *
+   * <p>
+   * 分隔行是**必须的**:不带边界的话,模型无法判断某个 {@code [index]} 到底属于哪个文档,也就无法解释
+   * 「为什么这个索引点下去没反应」。
+   */
+  static String frameText(DOMState state) {
+    if (state == null || !state.hasFrames()) {
+      return state == null || state.getElementTree() == null ? ""
+          : state.getElementTree().clickableElementsToString(null);
+    }
+    List<FrameSnapshot> included = new ArrayList<>();
+    for (FrameSnapshot frame : state.getFrames()) {
+      if (!frame.skipped) {
+        included.add(frame);
+      }
+    }
+    // 只有一个 frame(绝大多数页面)时不加分隔行,文本与以前逐字节一致
+    boolean withHeaders = included.size() > 1;
+    StringBuilder sb = new StringBuilder();
+    for (FrameSnapshot frame : included) {
+      if (sb.length() > 0) {
+        sb.append('\n');
+      }
+      if (withHeaders) {
+        sb.append(frame.header()).append('\n');
+      }
+      if (frame.text != null && !frame.text.isEmpty()) {
+        sb.append(frame.text).append('\n');
+      }
+    }
+    return sb.toString().stripTrailing();
+  }
+
+  /** frame 清单(给 list_frames 与带 frame 的 get_browser_state 共用) */
+  static List<Kv> frameList(DOMState state) {
+    List<Kv> items = new ArrayList<>();
+    if (state == null || !state.hasFrames()) {
+      return items;
+    }
+    for (FrameSnapshot frame : state.getFrames()) {
+      Kv item = Kv.by("index", frame.index).set("url", frame.url).set("name", frame.name)
+          .set("isMain", frame.main).set("depth", frame.depth).set("elementCount", frame.elementCount);
+      if (frame.parentIndex >= 0) {
+        item.set("parentIndex", frame.parentIndex);
+      }
+      if (frame.hasElements()) {
+        item.set("indexRange", frame.firstIndex + "-" + frame.lastIndex);
+      }
+      if (frame.readFailure != null) {
+        item.set("readError", frame.readFailure);
+      }
+      if (frame.skipped) {
+        item.set("skipped", true).set("skipReason", frame.skipReason);
+      }
+      items.add(item);
+    }
+    return items;
+  }
+
+  /**
+   * 顶层一个元素都没读到、但页面上确实有 iframe 时,主动指出下一步
+   *
+   * <p>
+   * 这类站点的症状很有迷惑性:{@code get_browser_state} 只回一个主站外壳,看起来像「页面还没加载完」或
+   * 「选择器写错了」,于是反复重取快照。真实原因是内容在跨域 iframe 里,下一步应该是 {@code includeFrames}
+   * 或 {@code list_frames},而不是重试。
+   *
+   * <p>顶层一个元素都没读到时说得更重一点 —— 那几乎肯定就是「内容全在 iframe 里」。
+   */
+  private static String frameHint(BrowserInstance inst, DOMState state) {
+    int skipped = 0;
+    if (state != null) {
+      for (FrameSnapshot frame : state.getFrames()) {
+        if (frame.skipped) {
+          skipped++;
+        }
+      }
+    }
+    if (skipped == 0) {
+      return null;
+    }
+    String next = "用 get_browser_state 传 includeFrames:true 一次拿到全部 frame 的元素"
+        + "(索引全局唯一、自动路由),或先 list_frames 看有哪些 frame";
+    if (state.getSelectorMap().isEmpty()) {
+      return "顶层文档里没有可交互元素,而页面上还有 " + skipped + " 个跨域 iframe 没纳入本次快照:"
+          + "内容很可能就在它们里面(企业微信的邮件/微盘/文档/会议都是这种形态)。" + next;
+    }
+    return "页面上还有 " + skipped + " 个跨域 iframe 没纳入本次快照,它们里面的元素这次读不到。" + next;
+  }
+
+  /**
+   * 列出页面上所有 frame
+   *
+   * <p>
+   * 顺序固定:主 frame 是 0,其余按 frame 树深度优先编号(自己从 {@code mainFrame()} 递归 {@code childFrames()}
+   * 展开,不用顺序没有写进契约的 {@code page.frames()})。带上每个 frame 的可交互元素数与索引区间,便于判断
+   * 「要读的内容在哪个 frame 里」。
+   *
+   * @param refresh 是否顺便重建一次带 frame 的快照(默认 true):没有快照时只回 URL/名称,拿不到元素数与
+   *                索引区间,对定位帮助有限
+   */
+  public RespBodyVo listFrames(Long browserId, Boolean refresh) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    boolean rebuild = refresh == null || refresh;
+    if (rebuild) {
+      try {
+        recordSnapshot(inst, DomService.getFrameState(inst.page, false, 0));
+      } catch (PlaywrightException e) {
+        return RespBodyVo.fail("list_frames 失败：读取页面 frame 失败（" + briefMessage(e.getMessage()) + "）");
+      }
+    }
+    List<Kv> frames = frameList(inst.domState);
+    if (frames.isEmpty()) {
+      // 快照不是带 frame 的那种时,至少把 frame 的 URL/名称给出来,别让调用方以为「一个 frame 都没有」
+      for (DomService.FrameNode node : DomService.frameTree(inst.page)) {
+        Kv item = Kv.by("index", frames.size()).set("url", safeFrameUrl(node.frame))
+            .set("name", safeFrameName(node.frame)).set("isMain", node.parentIndex < 0).set("depth", node.depth);
+        if (node.parentIndex >= 0) {
+          item.set("parentIndex", node.parentIndex);
+        }
+        frames.add(item);
+      }
+    }
+    Kv data = Kv.by("count", frames.size()).set("frames", frames)
+        .set("note", "index 0 是主 frame;跨域 iframe 也能读到 URL(这是识别它的主要依据)。"
+            + "要读 iframe 里的元素用 get_browser_state 的 includeFrames:true");
+    return RespBodyVo.ok(data);
+  }
+
+  private static String safeFrameUrl(Frame frame) {
+    try {
+      String url = frame.url();
+      return url == null ? "" : url;
+    } catch (PlaywrightException e) {
+      return "";
+    }
+  }
+
+  private static String safeFrameName(Frame frame) {
+    try {
+      String name = frame.name();
+      return name == null ? "" : name;
+    } catch (PlaywrightException e) {
+      return "";
+    }
+  }
+
+  /**
    * 只重取一次快照,不落盘
    *
    * <p>
@@ -1609,7 +1979,7 @@ public class PlaywrightService {
     } catch (PlaywrightException e) {
       return RespBodyVo.fail("构建页面结构失败：" + briefMessage(e.getMessage()));
     }
-    inst.domState = state;
+    recordSnapshot(inst, state);
     String text = state.getElementTree().clickableElementsToString(null);
     inst.lastDomText = text;
     return RespBodyVo.ok(Kv.by("url", inst.page.url()).set("title", safeTitle(inst.page))
@@ -1888,7 +2258,13 @@ public class PlaywrightService {
       if (node == null) {
         return null;
       }
-      return inst.page.locator("xpath=/" + node.getXpath()).first();
+      // 带 frame 的快照里,索引可能属于某个 iframe:xpath 必须**相对该 frame 的 document** 求值。
+      // 索引里已经带了 frame 信息,所以调用方不必传 frame 参数(见 get_browser_state 的 includeFrames)
+      Frame frame = frameForIndex(inst, state, index);
+      if (frame == null) {
+        return inst.page.locator("xpath=/" + node.getXpath()).first();
+      }
+      return frame.locator("xpath=/" + node.getXpath()).first();
     }
     if (selector == null) {
       return null;
@@ -1900,13 +2276,181 @@ public class PlaywrightService {
     return inst.page.locator(selector).nth(index);
   }
 
-  /** 索引越界时补充说明,提醒客户端索引应当来自 get_browser_state */
-  private static String indexHint(BrowserInstance inst) {
-    return inst.domState == null ? ",当前没有页面快照,请先调用 get_browser_state 获取元素索引" : "";
+  /**
+   * 取某个索引所属的 frame;返回 null 表示「就在顶层文档里」
+   *
+   * <p>
+   * frame 是运行期对象,页面一导航或 iframe 被重建,快照里那个句柄就 detach 了。所以这里先按 URL 在**当前**
+   * 的 frame 树里重新认一次(同 URL 只认第一个,认不出来再退回快照句柄)。这样做的好处是:同一个快照里的
+   * 索引在 iframe 重新加载之后仍然可用,不会报一句「元素不存在」就让人重取快照。
+   */
+  private static Frame frameForIndex(BrowserInstance inst, DOMState state, int index) {
+    if (state == null) {
+      // 没有快照时索引走的是「CSS 选择器索引空间」,只在顶层文档里数,没有 frame 可路由
+      return null;
+    }
+    FrameSnapshot snapshot = state.frameOf(index);
+    if (snapshot == null || snapshot.main) {
+      return null;
+    }
+    Frame current = findFrameByUrl(inst, snapshot.url, snapshot.name);
+    if (current != null) {
+      return current;
+    }
+    // 认不出来(URL 也变了)就退回快照时的句柄:能用就用,不能用会让上层报元素不存在
+    return snapshot.frame == null || snapshot.frame.isDetached() ? null : snapshot.frame;
   }
 
+  /** 在当前 frame 树里按 URL(其次 name)认一个 frame */
+  private static Frame findFrameByUrl(BrowserInstance inst, String url, String name) {
+    try {
+      for (DomService.FrameNode node : DomService.frameTree(inst.page)) {
+        if (node.parentIndex < 0) {
+          continue;
+        }
+        String candidate = safeFrameUrl(node.frame);
+        if (url != null && !url.isEmpty() && url.equals(candidate)) {
+          return node.frame;
+        }
+      }
+      if (name != null && !name.isEmpty()) {
+        for (DomService.FrameNode node : DomService.frameTree(inst.page)) {
+          if (node.parentIndex < 0) {
+            continue;
+          }
+          if (name.equals(safeFrameName(node.frame))) {
+            return node.frame;
+          }
+        }
+      }
+    } catch (PlaywrightException e) {
+      return null;
+    }
+    return null;
+  }
+
+  /**
+   * 按 {@code frame} 参数取一个 frame
+   *
+   * <p>
+   * 给「按选择器 / 按文本」这类**不带索引**的命令用:它们的定位目标是 {@code page.locator(...)},够不着
+   * iframe 内部。取值可以是:
+   * <ul>
+   * <li>整数或数字串:frame 序号(见 {@code list_frames} 的 {@code index},0 是主 frame);</li>
+   * <li>字符串:按 URL / name 子串匹配,例如 {@code "exmail.qq.com"}。</li>
+   * </ul>
+   *
+   * @return 命中的 frame;{@code frame} 参数为空时返回 {@code page.mainFrame()}
+   * @throws IllegalArgumentException 指定了但没匹配到
+   */
+  static Frame frameOf(BrowserInstance inst, Object frame) {
+    String wanted = frame == null ? null : String.valueOf(frame).trim();
+    if (wanted == null || wanted.isEmpty()) {
+      return inst.page.mainFrame();
+    }
+    List<DomService.FrameNode> nodes = DomService.frameTree(inst.page);
+    Integer ordinal = null;
+    try {
+      ordinal = Integer.valueOf(wanted);
+    } catch (NumberFormatException ignored) {
+      // 不是数字就按 URL / name 子串匹配
+    }
+    if (ordinal != null) {
+      if (ordinal < 0 || ordinal >= nodes.size()) {
+        throw new IllegalArgumentException("frame 序号越界：" + ordinal + "，当前共 " + nodes.size()
+            + " 个 frame（0 是主 frame），用 list_frames 看清单");
+      }
+      return nodes.get(ordinal).frame;
+    }
+    for (DomService.FrameNode node : nodes) {
+      String url = safeFrameUrl(node.frame);
+      String name = safeFrameName(node.frame);
+      if ((url != null && url.contains(wanted)) || (name != null && name.contains(wanted))) {
+        return node.frame;
+      }
+    }
+    StringBuilder available = new StringBuilder();
+    for (int i = 0; i < nodes.size(); i++) {
+      if (available.length() > 0) {
+        available.append(" / ");
+      }
+      available.append(i).append(':').append(safeFrameUrl(nodes.get(i).frame));
+    }
+    throw new IllegalArgumentException("没有匹配 frame 的 frame：" + wanted + "（可用：" + available
+        + "；也可以用 list_frames 看清单）");
+  }
+
+  /** 索引越界时补充说明,提醒客户端索引应当来自 get_browser_state */
+  private static String indexHint(BrowserInstance inst) {
+    DOMState state = inst.domState;
+    if (state == null) {
+      return ",当前没有页面快照,请先调用 get_browser_state 获取元素索引";
+    }
+    return "," + snapshotSuffix(inst);
+  }
+
+  /**
+   * 一句话说清「当前这份索引的来历」
+   *
+   * <p>
+   * <b>为什么要把这些数字放进报错里</b>:P3 那类问题的共性是「错误信息描述现象,但不指向原因,也不给动作」——
+   * 拿到「索引越界」或「元素已脱离页面」之后,调用方只能自己想到「是不是快照过期了」,再去取一次快照对比。
+   * 把「快照建于 12.3 秒前、共 38 个可交互元素(0–37)、这期间页面发生过 3 次 DOM 变更」直接写在报错里,
+   * 一眼就能判断是索引取错了、还是页面早就变了。
+   */
+  private static String snapshotSuffix(BrowserInstance inst) {
+    DOMState state = inst.domState;
+    if (state == null) {
+      return "当前没有页面快照,请先调用 get_browser_state 获取元素索引";
+    }
+    int total = state.getSelectorMap() == null ? 0 : state.getSelectorMap().size();
+    StringBuilder sb = new StringBuilder("当前索引来自快照(");
+    long age = inst.domStateAt <= 0 ? -1 : System.currentTimeMillis() - inst.domStateAt;
+    if (age >= 0) {
+      sb.append(String.format(java.util.Locale.ROOT, "%.1f 秒前", age / 1000.0));
+    } else {
+      sb.append("时间未知");
+    }
+    sb.append("),共 ").append(total).append(" 个可交互元素");
+    if (total > 0) {
+      sb.append("(合法区间 0-").append(total - 1).append(")");
+    }
+    if (inst.domStateMutations > 0) {
+      int now = readMutationCount(inst);
+      int delta = now - inst.domStateMutations;
+      if (delta > 0) {
+        sb.append(",这期间页面发生过 ").append(delta).append(" 次 DOM 变更");
+      }
+    }
+    if (state.hasFrames()) {
+      sb.append(",含 ").append(state.getFrames().size()).append(" 个 frame(索引已全局编号,自动路由)");
+    }
+    sb.append("。页面变化后索引会全部重算,请重新调用 get_browser_state,或改用 *_by_selector 这类不依赖索引的命令");
+    return sb.toString();
+  }
+
+  /** 给一份快照记上「什么时候建的」与「当时页面变过多少次」,供报错时解释索引为什么失效 */
+  private static void recordSnapshot(BrowserInstance inst, DOMState state) {
+    inst.domState = state;
+    inst.domStateAt = System.currentTimeMillis();
+    inst.domStateMutations = readMutationCount(inst);
+  }
+
+  /**
+   * 实例不存在
+   *
+   * <p>
+   * <b>为什么要带上服务启动时间</b>:P5 那次实测里,服务重启(进程换了一对 PID)之后操作原任务拿到的是
+   * {@code retryable:false} + 「没有找到对应的浏览器实例」,于是第一反应是「id 是不是写错了」——真实原因
+   * 是**实例只在内存里,重启即失效**。把「服务于 X 启动」写进报错,这件事就不用靠人再想一遍,也不会被
+   * {@code retryable:false} 误导(它不是「这个 id 不存在」,而是「这个进程里没有这个 id」)。
+   */
   private static RespBodyVo notFound(Long browserId) {
-    return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
+    StringBuilder message = new StringBuilder("没有找到对应的浏览器实例：").append(browserId);
+    message.append("（本服务进程启动于 ").append(STARTED_AT_TEXT)
+        .append(",任务实例只存在内存里、重启即失效。先用 list_tasks 看现存任务;"
+            + "确认是重启导致的话重新 start 一个即可——登录态在 profile 里,不会因为这个丢）");
+    return RespBodyVo.fail(message.toString());
   }
 
   /**
@@ -1998,6 +2542,21 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     return act(action, inst.page.locator(selector).first(), consumer, "选择器 " + selector);
+  }
+
+  /**
+   * 选择器定位的根:不传 {@code frame} 就是主 frame,传了就把选择器限定在指定 frame 里
+   *
+   * <p>
+   * 按选择器 / 按文本的命令用的是 {@code page.locator(...)},天生够不着 iframe 内部(跨域 iframe 里
+   * {@code document.querySelector} 也穿不透)。要给这类命令加上 frame 能力,只需要换定位的根 ——
+   * Playwright 的 {@code frame.locator(...)} 是在该 frame 自己的文档里求值的。
+   *
+   * @param frame frame 序号(0 是主 frame,见 {@code list_frames})或 URL/name 子串;为空表示主 frame
+   * @throws IllegalArgumentException 指定了但没匹配到
+   */
+  private static Locator locatorIn(BrowserInstance inst, String frame, String selector) {
+    return frameOf(inst, frame).locator(selector).first();
   }
 
   private RespBodyVo actByLocator(Long browserId, String action, String target,
@@ -2446,9 +3005,28 @@ public class PlaywrightService {
 
   /** 动作前后探针:url、页签数、正文长度,用于观察变化，不能证明业务成功或失败 */
   private static Kv stateProbe(BrowserInstance inst) {
+    return stateProbe(inst, null);
+  }
+
+  /**
+   * 同上,但探针在指定的 frame 里取
+   *
+   * <p>
+   * <b>为什么必须分 frame</b>:点 iframe 里的按钮时,顶层文档的 `body.innerText` 与 DOM 结构**一点都不会变**
+   * (iframe 的内容不在顶层文档里),于是回执永远是 `changed:false` —— 动作明明生效了,却被报成「没变化」,
+   * 这比不报还误导。所以动作目标在哪个 frame,探针就在哪个 frame 里取。
+   *
+   * @param frame 探针所在的 frame;null 表示顶层文档
+   */
+  private static Kv stateProbe(BrowserInstance inst, Frame frame) {
+    Frame target = frame == null ? inst.page.mainFrame() : frame;
     Kv probe = Kv.by("url", inst.page.url()).set("tabCount", pagesOf(inst).size());
+    if (frame != null) {
+      // 一并记住 frame 自己的 URL:iframe 内部跳页时顶层 URL 不变,靠它才能看出变化
+      probe.set("frameUrl", safeFrameUrl(frame));
+    }
     try {
-      Object fingerprint = inst.page.evaluate("""
+      Object fingerprint = target.evaluate("""
           () => {
             const text = document.body ? document.body.innerText : '';
             const controls = Array.from(document.querySelectorAll('input,textarea,select')).map(e =>
@@ -2474,18 +3052,19 @@ public class PlaywrightService {
   private static boolean probeChanged(Kv before, Kv after) {
     return !java.util.Objects.equals(before.get("url"), after.get("url"))
         || !java.util.Objects.equals(before.get("tabCount"), after.get("tabCount"))
+        || !java.util.Objects.equals(before.get("frameUrl"), after.get("frameUrl"))
         || (before.containsKey("fingerprint") && after.containsKey("fingerprint")
             && !java.util.Objects.equals(before.get("fingerprint"), after.get("fingerprint")));
   }
 
-  private static Kv observeAfter(Kv before, BrowserInstance inst) {
-    Kv after = stateProbe(inst);
+  private static Kv observeAfter(Kv before, BrowserInstance inst, Frame frame) {
+    Kv after = stateProbe(inst, frame);
     long deadline = System.nanoTime() + 500_000_000L;
     while (!probeChanged(before, after) && !after.containsKey("probeError") && System.nanoTime() < deadline) {
       // Pump Playwright events while waiting, allowing delayed popups and framework
       // updates to arrive.
       inst.page.waitForTimeout(50);
-      after = stateProbe(inst);
+      after = stateProbe(inst, frame);
     }
     return after;
   }
@@ -2502,7 +3081,12 @@ public class PlaywrightService {
    * 接口返回成功但页面毫无变化。这里把前后状态一起返回,changed 为 false 只说明观察窗口内尚未发现变化。
    */
   private static Kv receipt(Kv before, BrowserInstance inst) {
-    Kv after = observeAfter(before, inst);
+    return receipt(before, inst, null);
+  }
+
+  /** 同上,{@code frame} 非空时探针取在该 frame 里(见 {@link #stateProbe(BrowserInstance, Frame)}) */
+  private static Kv receipt(Kv before, BrowserInstance inst, Frame frame) {
+    Kv after = observeAfter(before, inst, frame);
     String urlBefore = String.valueOf(before.get("url"));
     String urlAfter = String.valueOf(after.get("url"));
     int tabBefore = asInt(before.get("tabCount"));
@@ -2510,11 +3094,15 @@ public class PlaywrightService {
     int lenBefore = asInt(before.get("textLength"));
     int lenAfter = asInt(after.get("textLength"));
     boolean changed = probeChanged(before, after);
-    return Kv.by("urlBefore", urlBefore).set("urlAfter", urlAfter).set("tabCountBefore", tabBefore)
+    Kv report = Kv.by("urlBefore", urlBefore).set("urlAfter", urlAfter).set("tabCountBefore", tabBefore)
         .set("tabCountAfter", tabAfter).set("textLengthBefore", lenBefore).set("textLengthAfter", lenAfter)
         .set("changed", changed).set("changeStatus", changed ? "observed" : "not_observed")
         .set("observationComplete", !before.containsKey("probeError") && !after.containsKey("probeError"))
         .set("observationWindowMs", 500);
+    if (frame != null) {
+      report.set("probedFrameUrl", after.get("frameUrl"));
+    }
+    return report;
   }
 
   /** 动作成功但页面毫无变化时,把 changed=false 和提示一起返回 */
@@ -2524,7 +3112,12 @@ public class PlaywrightService {
 
   /** extra 非空时并进回执(点击方式 mode、命中元素信息这类) */
   private static RespBodyVo okWithReceipt(Kv before, BrowserInstance inst, String action, Kv extra) {
-    Kv report = receipt(before, inst);
+    return okWithReceipt(before, inst, action, extra, null);
+  }
+
+  /** frame 非空时探针取在该 frame 里(点 iframe 里的元素时必传,否则 changed 永远是 false) */
+  private static RespBodyVo okWithReceipt(Kv before, BrowserInstance inst, String action, Kv extra, Frame frame) {
+    Kv report = receipt(before, inst, frame);
     if (extra != null) {
       report.set(extra);
     }
@@ -2568,18 +3161,29 @@ public class PlaywrightService {
     if (locator == null) {
       return RespBodyVo.fail(action + " 索引越界: " + index + indexHint(inst));
     }
-    Kv before = withReceipt ? stateProbe(inst) : null;
+    // 命中元素的信息一起带回去:拿到 changed=false 之后,「这次到底点中了什么」是唯一的下一步线索。
+    // click_element_by_text 一直是这么做的,这里把它推广到按索引的动作
+    Kv hit = describe(locator, "index=" + index);
+    if (hit != null) {
+      if (extra == null) {
+        extra = new Kv();
+      }
+      extra.set("hit", hit);
+    }
+    // 目标在哪个 frame,探针就在哪个 frame 里取:否则点 iframe 里的元素永远是 changed:false
+    Frame probeFrame = frameForIndex(inst, inst.domState, index);
+    Kv before = withReceipt ? stateProbe(inst, probeFrame) : null;
     PlaywrightException failure;
     try {
       consumer.accept(locator);
-      return withReceipt ? okWithReceipt(before, inst, action, extra) : RespBodyVo.ok(extra);
+      return withReceipt ? okWithReceipt(before, inst, action, extra, probeFrame) : RespBodyVo.ok(extra);
     } catch (PlaywrightException e) {
       failure = e;
     }
     sleepQuietly(300);
     try {
       consumer.accept(locator);
-      return withReceipt ? okWithReceipt(before, inst, action, extra) : RespBodyVo.ok(extra);
+      return withReceipt ? okWithReceipt(before, inst, action, extra, probeFrame) : RespBodyVo.ok(extra);
     } catch (PlaywrightException e) {
       failure = e;
     }
@@ -2587,12 +3191,13 @@ public class PlaywrightService {
     if (recovered != null) {
       try {
         consumer.accept(recovered);
-        return withReceipt ? okWithReceipt(before, inst, action, extra) : RespBodyVo.ok(extra);
+        return withReceipt ? okWithReceipt(before, inst, action, extra, probeFrame) : RespBodyVo.ok(extra);
       } catch (PlaywrightException e) {
         failure = e;
       }
     }
-    return RespBodyVo.fail(actionFailure(action, failure));
+    // 失败信息里也带上快照来历:是索引过期、还是元素真的不可操作,这两件事的下一步完全不同
+    return RespBodyVo.fail(actionFailure(action, failure) + "（" + snapshotSuffix(inst) + "）");
   }
 
   private static void sleepQuietly(long millis) {
@@ -2834,6 +3439,14 @@ public class PlaywrightService {
    * </ul>
    */
   public RespBodyVo uploadFile(Long browserId, Integer index, String selector, String path, Integer timeoutMs) {
+    return uploadFile(browserId, index, selector, path, timeoutMs, null);
+  }
+
+  /**
+   * 同上,额外支持 {@code frame}(file input 在跨域 iframe 里时用)
+   */
+  public RespBodyVo uploadFile(Long browserId, Integer index, String selector, String path, Integer timeoutMs,
+      String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
@@ -2852,23 +3465,127 @@ public class PlaywrightService {
     }
     Locator locator;
     String target;
+    Frame probeFrame;
     if (selector != null && !selector.isBlank()) {
-      locator = inst.page.locator(selector).first();
-      target = "selector=" + selector;
+      try {
+        // 权威的监听器探测(CDP)必须知道元素在哪个 frame 里:不传 frame 参数就是主 frame
+        probeFrame = frame == null || frame.isBlank() ? inst.page.mainFrame() : frameOf(inst, frame);
+        locator = locatorIn(inst, frame, selector);
+      } catch (IllegalArgumentException e) {
+        return RespBodyVo.fail("upload_file 失败：" + e.getMessage());
+      }
+      target = "selector=" + selector + frameSuffix(frame);
     } else {
       locator = locatorOf(inst, index);
       target = "index=" + index;
       if (locator == null) {
         return RespBodyVo.fail("upload_file 索引越界: " + index + indexHint(inst));
       }
+      probeFrame = frameForIndex(inst, inst.domState, index);
+      if (probeFrame == null) {
+        probeFrame = inst.page.mainFrame();
+      }
     }
+    Kv before = stateProbe(inst, probeFrame);
     try {
       locator.setInputFiles(file, new Locator.SetInputFilesOptions().setTimeout(actionTimeoutMs(timeoutMs)));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(locateFailure("upload_file", target, e));
     }
-    return RespBodyVo.ok(Kv.by("filename", file.getFileName().toString()).set("path", file.toString())
-        .set("size", UploadStore.sizeOf(file)).set("target", target).set("mode", "native"));
+    Kv data = Kv.by("filename", file.getFileName().toString()).set("path", file.toString())
+        .set("size", UploadStore.sizeOf(file)).set("target", target).set("mode", "native");
+    // setInputFiles 的语义只是「把文件放进 input」,页面有没有消费完全是另一回事 —— 所以必须回读
+    appendUploadReadback(locator, probeFrame, elementResolveScript(inst, index, selector), data);
+    Kv report = receipt(before, inst, probeFrame);
+    data.set("changed", report.get("changed")).set("changeStatus", report.get("changeStatus"))
+        .set("observationWindowMs", report.get("observationWindowMs"));
+    if ("noListener".equals(data.getStr("consumed")) && Boolean.FALSE.equals(report.getBoolean("changed"))) {
+      data.set("effective", false);
+    }
+    return RespBodyVo.ok(data);
+  }
+
+  /**
+   * 给 CDP 用的「解析这个元素」表达式
+   *
+   * <p>优先用调用方给的 CSS 选择器;按索引定位时用快照里的 xpath。两条都拿不到就返回 null,
+   * 这时只走启发式探测(结论会如实标成「未知」,而不是「没有」)。
+   */
+  private static String elementResolveScript(BrowserInstance inst, Integer index, String selector) {
+    if (selector != null && !selector.isBlank()) {
+      return "document.querySelector(" + JSON.toJSONString(selector) + ")";
+    }
+    if (index == null || inst.domState == null) {
+      return null;
+    }
+    DOMElementNode node = inst.domState.getSelectorMap().get(index);
+    if (node == null) {
+      return null;
+    }
+    return "document.evaluate(" + JSON.toJSONString("/" + node.getXpath())
+        + ", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue";
+  }
+
+  /**
+   * 上传之后回读 input 的真实状态
+   *
+   * <p>
+   * <b>为什么必须回读</b>:实测企业微信后台的营业执照上传,{@code upload_file} 回了 {@code ok:true},页面却
+   * 一直停在「请上传工商营业执照」。根因是那个 {@code <input class="uploadInput">} **没有挂任何事件监听器**
+   * (Vue 2 的 {@code el._vei} 为空):{@code setInputFiles} 把 {@code input.files} 设好了,但派发的
+   * {@code change} 到不了框架的 handler,组件的 {@code upload()} 从来没被调用。
+   *
+   * <p>
+   * 「报成功但没生效」比报错危险得多 —— 它会把排查引到选择器、文件、接口上去。所以这里把三件事一起回读:
+   * <ul>
+   * <li>{@code filesLength}:input 里现在到底有几个文件(正常应当是 1);</li>
+   * <li>{@code listeners}/{@code hasListeners}:这个 input 挂了哪些事件(见 {@link ListenerProbe#probe});</li>
+   * <li>{@code consumed}:启发式结论 {@code listened} / {@code noListener} / {@code unknown}。</li>
+   * </ul>
+   *
+   * @param frame        {@code locator} 所在的 frame;null 表示主 frame(权威探测要拿它开 CDP 会话)
+   * @param elementScript 解析该元素的 JS 表达式,给 CDP 用;为 null 时只走启发式
+   */
+  private static void appendUploadReadback(Locator locator, Frame frame, String elementScript, Kv data) {
+    try {
+      Object raw = locator.first().evaluate("(el) => ({"
+          + " filesLength: el && el.files ? el.files.length : null,"
+          + " value: el && el.value ? String(el.value).slice(0, 200) : '',"
+          + " disabled: el ? !!el.disabled : null,"
+          + " accept: el && el.getAttribute ? el.getAttribute('accept') : null })");
+      if (raw instanceof Map) {
+        data.putAll((Map<?, ?>) raw);
+      }
+    } catch (PlaywrightException e) {
+      data.set("readbackError", briefMessage(e.getMessage()));
+    }
+    Kv probe = ListenerProbe.probe(locator, frame, elementScript);
+    if (!Boolean.TRUE.equals(probe.getBoolean("found"))) {
+      data.set("consumed", "unknown");
+      return;
+    }
+    data.set("listeners", Kv.by("vue2", probe.get("vue2")).set("vue3", probe.get("vue3"))
+        .set("react", probe.get("react")).set("inline", probe.get("inline"))
+        .set("jquery", probe.get("jquery")).set("events", probe.get("listeners")))
+        .set("listenerDetection", probe.get("detection"));
+    Object has = probe.get("hasListeners");
+    if (Boolean.TRUE.equals(has)) {
+      data.set("hasListeners", true).set("consumed", "listened");
+    } else if (Boolean.FALSE.equals(has)) {
+      // 浏览器自己报的监听器清单是空的 —— 这就是「报成功但没生效」的根因,必须明说
+      data.set("hasListeners", false).set("consumed", "noListener");
+      String note = ListenerProbe.note(probe);
+      if (note != null) {
+        data.set("hint", note);
+      }
+    } else {
+      // 没探到不等于没有:原生 addEventListener 在元素上不留痕迹,只能报「未知」
+      data.set("hasListeners", null).set("consumed", "unknown");
+      String note = ListenerProbe.note(probe);
+      if (note != null) {
+        data.set("hint", note);
+      }
+    }
   }
 
   /**
@@ -2897,6 +3614,12 @@ public class PlaywrightService {
    */
   public RespBodyVo uploadFileInline(Long browserId, Integer index, String selector, String filename,
       String contentType, String contentBase64, String url, Integer timeoutMs) {
+    return uploadFileInline(browserId, index, selector, filename, contentType, contentBase64, url, timeoutMs, null);
+  }
+
+  /** 同上,额外支持 {@code frame} */
+  public RespBodyVo uploadFileInline(Long browserId, Integer index, String selector, String filename,
+      String contentType, String contentBase64, String url, Integer timeoutMs, String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
@@ -2937,7 +3660,7 @@ public class PlaywrightService {
     } catch (IOException e) {
       return RespBodyVo.fail("upload_file 失败：写入服务端暂存目录出错（" + briefMessage(e.getMessage()) + "）");
     }
-    RespBodyVo uploaded = uploadFile(browserId, index, selector, saved.getStr("path"), timeoutMs);
+    RespBodyVo uploaded = uploadFile(browserId, index, selector, saved.getStr("path"), timeoutMs, frame);
     if (!uploaded.isOk()) {
       return uploaded;
     }
@@ -3287,9 +4010,35 @@ public class PlaywrightService {
    * @param vars     注入脚本的变量,脚本里用 {@code {{key}}} 引用
    */
   public RespBodyVo executeJs(Long browserId, String body, String bodyFile, JSONObject vars) {
+    return executeJs(browserId, body, bodyFile, vars, null);
+  }
+
+  /**
+   * 同上,额外支持在指定的 frame 里执行
+   *
+   * <p>
+   * <b>为什么要在 frame 里执行</b>:跨域 iframe 里 {@code page.evaluate} 是够不着的 —— 它在顶层文档执行,
+   * {@code document.querySelector} 穿不透 iframe。而「找到主站发 token 的接口、用同源 XHR 现取一个未被
+   * 消费的 token,再把它当顶层页面打开」这类绕过手法,恰恰必须在**那个 frame 的文档里**发请求。传
+   * {@code frame} 即可(序号见 {@code list_frames},或写 URL/name 子串)。
+   *
+   * <p>
+   * <b>会不会 await Promise</b>:会。Playwright 的求值语义是「返回值是 Promise 就等它 settle,是函数就先调用
+   * 再等」,所以 {@code async () =&gt; { const r = await fetch(...); return r.json(); }} 能直接拿到结果,
+   * 不需要用已废弃的同步 XHR 绕。回执里的 {@code data.awaited} 会说明这次是不是等了 Promise。
+   *
+   * @param frame frame 序号或 URL/name 子串;为空表示主 frame
+   */
+  public RespBodyVo executeJs(Long browserId, String body, String bodyFile, JSONObject vars, String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return RespBodyVo.fail("没有找到对应的浏览器实例：" + browserId);
+    }
+    Frame target;
+    try {
+      target = frameOf(inst, frame);
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("execute_js 失败：" + e.getMessage());
     }
     String raw = body;
     if ((raw == null || raw.isBlank()) && bodyFile != null && !bodyFile.isBlank()) {
@@ -3305,11 +4054,16 @@ public class PlaywrightService {
     }
     String script = normalizeScript(applyVars(raw, vars));
     try {
-      Object result = inst.page.evaluate(script);
+      Object result = target.evaluate(script);
       Kv data = Kv.by("result", result);
       if (vars != null && !vars.isEmpty()) {
         data.set("varsApplied", new ArrayList<>(vars.keySet()));
       }
+      if (frame != null && !frame.isBlank()) {
+        data.set("frame", frame).set("frameUrl", safeFrameUrl(target));
+      }
+      // 「到底等没等 Promise」以前只能靠猜,于是有人退回同步 XHR 来规避。这里如实回报
+      data.set("awaited", true);
       return RespBodyVo.ok(data);
     } catch (PlaywrightException e) {
       String message = briefMessage(e.getMessage());
@@ -3618,13 +4372,97 @@ public class PlaywrightService {
     return read(browserId, index, "get_element_attribute", "value", (locator) -> locator.getAttribute(name));
   }
 
+  /**
+   * 看一个元素到底挂了哪些事件监听器
+   *
+   * <p>
+   * 「这个元素有没有挂事件」是 SPA 自动化的**基础诊断信息**,以前只能靠手写 {@code execute_js} 去摸
+   * ({@code el._vei} 之类)。它直接回答的是最贵的那个坑:{@code upload_file} / {@code input_text} 报了成功、
+   * 页面却毫无反应 —— 根因往往不是选择器错了,而是**这个 input 根本没人监听**,JS 派发的事件到不了框架的
+   * handler。
+   *
+   * <p>
+   * 判定依据与三态语义见 {@link ListenerProbe#probe}。返回 {@code data.found} 为 false 时说明定位没命中,
+   * 其余字段才有意义。
+   *
+   * @param index    元素索引(来自 {@code get_browser_state});与 {@code selector} 二选一
+   * @param selector CSS 选择器;与 {@code index} 二选一
+   * @param frame    {@code selector} 在跨域 iframe 里时传(序号见 {@code list_frames},或 URL/name 子串)
+   */
+  public RespBodyVo getElementListeners(Long browserId, Integer index, String selector, String frame) {
+    BrowserInstance inst = INSTANCES.get(browserId);
+    if (inst == null) {
+      return notFound(browserId);
+    }
+    if ((selector == null || selector.isBlank()) && index == null) {
+      return RespBodyVo.fail("get_element_listeners 需要 index 或 selector 之一");
+    }
+    Locator locator;
+    String target;
+    if (selector != null && !selector.isBlank()) {
+      try {
+        locator = locatorIn(inst, frame, selector);
+      } catch (IllegalArgumentException e) {
+        return RespBodyVo.fail("get_element_listeners 失败：" + e.getMessage());
+      }
+      target = "selector=" + selector + frameSuffix(frame);
+    } else {
+      locator = locatorOf(inst, index);
+      target = "index=" + index;
+      if (locator == null) {
+        return RespBodyVo.fail("get_element_listeners 索引越界: " + index + indexHint(inst));
+      }
+    }
+    Kv probe;
+    Frame probeFrame = null;
+    String elementScript;
+    try {
+      if (locator.count() == 0) {
+        return RespBodyVo.ok(Kv.by("found", false).set("target", target)
+            .set("note", "没找到这个元素:选择器/索引可能已经过期,重新 get_browser_state 再试"));
+      }
+      // CDP 的权威探测需要 frame 与本元素的解析表达式;拿不到就退回启发式,并把结论标成「未知」
+      if (selector != null && !selector.isBlank()) {
+        probeFrame = frame == null || frame.isBlank() ? inst.page.mainFrame() : frameOf(inst, frame);
+      } else {
+        probeFrame = frameForIndex(inst, inst.domState, index);
+        if (probeFrame == null) {
+          probeFrame = inst.page.mainFrame();
+        }
+      }
+      elementScript = elementResolveScript(inst, index, selector);
+      probe = ListenerProbe.probe(locator, probeFrame, elementScript);
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("get_element_listeners 失败：" + e.getMessage());
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail("get_element_listeners 失败：" + briefMessage(e.getMessage()));
+    }
+    if (!Boolean.TRUE.equals(probe.getBoolean("found"))) {
+      return RespBodyVo.ok(Kv.by("found", false).set("target", target)
+          .set("note", "没找到这个元素:选择器/索引可能已经过期,重新 get_browser_state 再试"));
+    }
+    Kv data = Kv.by("found", true).set("target", target).set(probe);
+    String note = ListenerProbe.note(probe);
+    if (note != null) {
+      data.set("note", note);
+    }
+    return RespBodyVo.ok(data);
+  }
+
   public RespBodyVo getElementCount(Long browserId, String selector) {
+    return getElementCount(browserId, selector, null);
+  }
+
+  /** 同上,{@code frame} 非空时只数指定 frame 里的命中(跨域 iframe 里的元素在主文档里数不到) */
+  public RespBodyVo getElementCount(Long browserId, String selector, String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     try {
-      return RespBodyVo.ok(Kv.by("count", inst.page.locator(selector).count()));
+      return RespBodyVo.ok(Kv.by("count", frameOf(inst, frame).locator(selector).count()));
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("get_element_count 失败：" + e.getMessage());
     } catch (PlaywrightException e) {
       return RespBodyVo.fail("get_element_count 失败：" + briefMessage(e.getMessage()));
     }
@@ -3687,22 +4525,44 @@ public class PlaywrightService {
    * @param timeoutMs 按次覆盖超时(毫秒)
    */
   public RespBodyVo clickElementBySelector(Long browserId, String selector, String mode, Integer timeoutMs) {
+    return clickElementBySelector(browserId, selector, mode, timeoutMs, null);
+  }
+
+  /**
+   * 按选择器点击
+   *
+   * @param mode      {@code auto}(默认:原生失败自动降级为 JS 派发)/{@code native}/{@code js}
+   * @param timeoutMs 按次覆盖超时(毫秒)
+   * @param frame     frame 序号(见 {@code list_frames},0 是主 frame)或 URL/name 子串;不传就是主 frame。
+   *                  目标在跨域 iframe 里时必传 —— {@code page.locator} 够不着 iframe 内部
+   */
+  public RespBodyVo clickElementBySelector(Long browserId, String selector, String mode, Integer timeoutMs,
+      String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     int tabCountBefore = pagesOf(inst).size();
-    Kv before = stateProbe(inst);
+    Locator target;
+    Frame probeFrame;
+    try {
+      probeFrame = frame == null || frame.isBlank() ? null : frameOf(inst, frame);
+      target = locatorIn(inst, frame, selector);
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("click_element_by_selector 失败：" + e.getMessage());
+    }
+    Kv before = stateProbe(inst, probeFrame);
     ActionOutcome outcome = new ActionOutcome();
     try {
-      clickWithMode(inst.page.locator(selector).first(), mode, outcome,
-          () -> inst.page.locator(selector).first().click(clickOptions(timeoutMs)));
+      Locator locator = target;
+      clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions(timeoutMs)));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(
-          locateFailure("click_element_by_selector", "选择器 " + selector, e) + blockerSuffix(inst.page.locator(selector).first()));
+          locateFailure("click_element_by_selector", "选择器 " + selector + frameSuffix(frame), e)
+              + blockerSuffix(target));
     }
     adoptNewTab(inst, tabCountBefore);
-    return okWithReceipt(before, inst, "click_element_by_selector", outcome.extra);
+    return okWithReceipt(before, inst, "click_element_by_selector", outcome.extra, probeFrame);
   }
 
   public RespBodyVo inputTextBySelector(Long browserId, String selector, String value) {
@@ -3710,17 +4570,33 @@ public class PlaywrightService {
   }
 
   public RespBodyVo inputTextBySelector(Long browserId, String selector, String value, String mode) {
+    return inputTextBySelector(browserId, selector, value, mode, null);
+  }
+
+  /** 同上,{@code frame} 非空时把选择器限定在指定 frame 里(见 {@code click_element_by_selector} 的说明) */
+  public RespBodyVo inputTextBySelector(Long browserId, String selector, String value, String mode, String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
     ActionOutcome outcome = new ActionOutcome();
+    Locator target;
     try {
-      fillWithMode(inst.page.locator(selector).first(), value, mode, outcome);
+      target = locatorIn(inst, frame, selector);
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("input_text_by_selector 失败：" + e.getMessage());
+    }
+    try {
+      fillWithMode(target, value, mode, outcome);
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(locateFailure("input_text_by_selector", "选择器 " + selector, e));
+      return RespBodyVo.fail(locateFailure("input_text_by_selector", "选择器 " + selector + frameSuffix(frame), e));
     }
     return inputResult(outcome);
+  }
+
+  /** 报错信息里带上 frame,免得「选择器明明对」却查不出是找错了文档 */
+  private static String frameSuffix(String frame) {
+    return frame == null || frame.isBlank() ? "" : "（frame=" + frame + "）";
   }
 
   /**
@@ -4004,13 +4880,23 @@ public class PlaywrightService {
   // ==================== 等待 ====================
 
   public RespBodyVo waitForElement(Long browserId, String selector, Double timeoutSeconds) {
+    return waitForElement(browserId, selector, timeoutSeconds, null);
+  }
+
+  /** 同上,{@code frame} 非空时只等指定 frame 里的元素 */
+  public RespBodyVo waitForElement(Long browserId, String selector, Double timeoutSeconds, String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
+    Locator target;
     try {
-      inst.page.locator(selector).first()
-          .waitFor(new Locator.WaitForOptions().setTimeout(timeoutMillis(timeoutSeconds)));
+      target = locatorIn(inst, frame, selector);
+    } catch (IllegalArgumentException e) {
+      return RespBodyVo.fail("wait_for_element 失败：" + e.getMessage());
+    }
+    try {
+      target.waitFor(new Locator.WaitForOptions().setTimeout(timeoutMillis(timeoutSeconds)));
     } catch (PlaywrightException e) {
       return RespBodyVo.fail(waitFailure("wait_for_element", e));
     }
@@ -4656,6 +5542,12 @@ public class PlaywrightService {
 
   private RespBodyVo elementScreenshot(BrowserInstance inst, Integer index, String selector, String path,
       Boolean inline) {
+    return elementScreenshot(inst, index, selector, path, inline, null);
+  }
+
+  /** 同上,{@code frame} 非空时把选择器限定在指定 frame 里(验证码在跨域 iframe 里时要传) */
+  private RespBodyVo elementScreenshot(BrowserInstance inst, Integer index, String selector, String path,
+      Boolean inline, String frame) {
     Locator locator;
     String target;
     if (index != null) {
@@ -4665,8 +5557,12 @@ public class PlaywrightService {
         return RespBodyVo.fail("get_element_screenshot 索引越界: " + index + indexHint(inst));
       }
     } else if (selector != null && !selector.isEmpty()) {
-      locator = inst.page.locator(selector).first();
-      target = "selector=" + selector;
+      try {
+        locator = locatorIn(inst, frame, selector);
+      } catch (IllegalArgumentException e) {
+        return RespBodyVo.fail("get_element_screenshot 失败：" + e.getMessage());
+      }
+      target = "selector=" + selector + frameSuffix(frame);
     } else {
       return RespBodyVo.fail("get_element_screenshot 需要 index 或 selector");
     }
@@ -4976,21 +5872,38 @@ public class PlaywrightService {
     return RespBodyVo.ok(probe);
   }
 
-  /** 页面上可见的弹窗清单(DOM 顺序:旧的在前,最顶层/最新的是最后一个) */
+  /**
+   * 页面上可见的弹窗清单(DOM 顺序:旧的在前,最顶层/最新的是最后一个)
+   *
+   * <p>
+   * <b>为什么要加通用兜底</b>:原来只认框架专用的类名({@code .ant-modal-wrap} / {@code .el-dialog} /
+   * {@code .layui-layer} …),而企业微信自己的弹窗用的是 {@code qui_dialog} / {@code ww_dialog} /
+   * {@code .mall_invoice_dialog_container} 这类自有类名 —— 一个都命中不了,于是 {@code count:0} 被理解成
+   * 「没有弹窗」,继续去点被它挡住的元素。这种**假阴性比假阳性危险**:假阳性是多看一条,假阴性是把人误导到
+   * 错的方向。所以这里在框架选择器之后补两轮启发式扫描(类名线索 + 几何线索)。
+   *
+   * <p>
+   * 每条结果都带 {@code matchedBy},调用方据此判断置信度:{@code selector:…} 是框架/类名直接命中,
+   * {@code heuristic:class-name} 是类名里有 dialog/modal/popup 这类词,{@code heuristic:fixed-overlay}
+   * 是「可见 + 够大 + fixed 或高 z-index」的几何兜底。
+   */
   private static final String MODALS_PROBE = """
       () => {
         const vis = (el) => {
           if (!el) return false;
           const cs = getComputedStyle(el);
           const r = el.getBoundingClientRect();
-          return cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0;
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0'
+            && r.width > 0 && r.height > 0;
         };
         const text = (el) => el ? (el.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 80) : null;
         const center = (el) => {
           const r = el.getBoundingClientRect();
           return [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)];
         };
-        const describe = (el, kind) => {
+        const classOf = (el) => (typeof el.className === 'string' ? el.className : '')
+          || (el.className && el.className.baseVal) || '';
+        const describe = (el, kind, matchedBy) => {
           const titleEl = el.querySelector('.ant-modal-title, .ant-modal-confirm-title, .ant-drawer-title, [class*=title]');
           const buttons = [];
           el.querySelectorAll('button, .ant-btn, a[role=button], [role=button]').forEach(b => {
@@ -5002,6 +5915,9 @@ public class PlaywrightService {
           const r = el.getBoundingClientRect();
           return {
             kind: kind,
+            matchedBy: matchedBy,
+            className: classOf(el).slice(0, 200),
+            id: el.id || null,
             title: text(titleEl),
             text: text(el).slice(0, 80),
             buttons: buttons.map(b => b.label),
@@ -5016,42 +5932,200 @@ public class PlaywrightService {
         // 同一个弹窗会被多个选择器命中(ant 的弹窗里就有 role=dialog),所以收集时要去重:
         // 已经收过的元素、以及被已收元素包住的元素都不再单独算一个,否则一个弹窗会数成两个
         const seen = [];
-        const add = (el, kind) => {
+        const add = (el, kind, matchedBy) => {
           if (!vis(el)) return;
+          if (el.id === 'playwright-highlight-container') return;
+          if (el.tagName === 'HTML' || el.tagName === 'BODY') return;
           for (const s of seen) {
             if (s === el || s.contains(el) || el.contains(s)) return;
           }
           seen.push(el);
-          modals.push(describe(el, kind));
+          modals.push(describe(el, kind, matchedBy));
         };
-        document.querySelectorAll('.ant-modal-wrap, .ant-drawer-open').forEach(el => add(el, 'ant-modal'));
-        document.querySelectorAll('.agreement-container, [class*=agreement]').forEach(el => add(el, 'agreement'));
-        document.querySelectorAll('[role=dialog], .el-dialog, .vxe-modal--wrapper, .layui-layer').forEach(
-          el => add(el, 'dialog'));
+        // 第一轮:框架专用选择器(最高置信度)
+        const FRAMEWORK = [
+          ['.ant-modal-wrap, .ant-drawer-open', 'ant-modal'],
+          ['.agreement-container, [class*=agreement]', 'agreement'],
+          ['[role=dialog], [role=alertdialog], .el-dialog, .vxe-modal--wrapper, .layui-layer', 'dialog']
+        ];
+        for (const [selector, kind] of FRAMEWORK) {
+          document.querySelectorAll(selector).forEach(el => add(el, kind, 'selector:' + selector));
+        }
+        // 第二轮:类名线索。企业微信 / 微信系的弹窗用的是 qui_dialog / ww_dialog / xxx_dialog_container
+        // 这类自有类名,选择器命中不了,但类名里有 dialog/modal/popup 这样的词
+        const CLASS_HINT = /(dialog|modal|popup|pop-box|popover|overlay|mask|drawer|lightbox|confirm|tips?|alert)/i;
+        const bigEnough = (el) => {
+          const r = el.getBoundingClientRect();
+          return r.width >= 120 && r.height >= 50;
+        };
+        // 只保留「最内层」的候选:包住另一个候选的元素通常是整页遮罩,真正带标题和按钮的是它里面那个。
+        // 不加这一层的话,整页 mask 会先把真弹窗吃掉(contains 去重会认为真弹窗已经被收过)。
+        const innermost = (candidates) => candidates.filter(
+          el => !candidates.some(other => other !== el && el.contains(other)));
+        const classCandidates = Array.from(document.querySelectorAll('div,section,aside,dialog,form,ul'))
+          .filter(el => CLASS_HINT.test(classOf(el)) && vis(el) && bigEnough(el));
+        let heuristicCount = 0;
+        for (const el of innermost(classCandidates)) {
+          if (heuristicCount >= 12) break;
+          add(el, 'class-hint', 'heuristic:class-name');
+          heuristicCount++;
+        }
+        // 第三轮:几何兜底。可见 + 面积够大 + (position:fixed 或 z-index 高于阈值)
+        const Z_THRESHOLD = 50;
+        const MIN_W = 150;
+        const MIN_H = 60;
+        const geo = Array.from(document.querySelectorAll('div,section,aside,dialog'))
+          .filter(el => {
+            if (el.id === 'playwright-highlight-container') return false;
+            const cs = getComputedStyle(el);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < MIN_W || r.height < MIN_H) return false;
+            const z = parseInt(cs.zIndex, 10);
+            return cs.position === 'fixed' || (!isNaN(z) && z > Z_THRESHOLD);
+          });
+        for (const el of innermost(geo)) {
+          if (heuristicCount >= 24) break;
+          add(el, 'heuristic', 'heuristic:fixed-overlay');
+          heuristicCount++;
+        }
         // 后出现的通常是后弹出来的,排在最后当作「最顶层」
         return {
           count: modals.length,
           modals: modals,
           top: modals.length ? modals[modals.length - 1] : null,
+          scannedBy: ['selector', 'heuristic:class-name', 'heuristic:fixed-overlay'],
           note: modals.length
             ? 'modals 按 DOM 顺序排列,最后一个是最后弹出来的(通常就是最顶层);关它用 close_modal'
-            : '当前没有可见的 DOM 弹窗(get_dialog 看的是原生 alert/confirm,两者不同)'
+              + '每条都带 matchedBy 说明命中来源:selector:… 置信度最高,heuristic:… 是启发式兜底'
+            : '当前没有可见的 DOM 弹窗(已跑过框架选择器 + 类名线索 + 几何兜底三轮扫描;'
+              + 'get_dialog 看的是原生 alert/confirm,两者不同)'
         };
       }
       """;
 
+  /**
+   * 读弹窗:主 frame 与每个 iframe 各扫一遍,iframe 里的坐标换算到主页面视口
+   *
+   * <p>
+   * <b>为什么必须扫 iframe</b>:主站把第三方控制台套在 iframe 里时,控制台自己的弹窗(确认框、协议层)
+   * 也在那个 frame 的文档里。只扫顶层文档同样会得到 {@code count:0} 的假阴性,而那个弹窗照样挡着点击。
+   *
+   * <p>
+   * 坐标换算:{@code getBoundingClientRect} 在 frame 里给的是**相对该 frame 视口**的坐标,而
+   * {@code ElementHandle.boundingBox()} 给的是 iframe 元素**相对主 frame 视口**的位置(嵌套也已经是累加的),
+   * 两者相加就是可以直接喂给 {@code mouse_click} 的主页面坐标。
+   */
   private static Kv modalProbe(BrowserInstance inst) {
+    Kv merged = new Kv();
+    List<Kv> modals = new ArrayList<>();
+    List<String> errors = new ArrayList<>();
+    boolean any = false;
+    List<DomService.FrameNode> nodes;
     try {
-      Object raw = inst.page.evaluate(MODALS_PROBE);
-      if (!(raw instanceof Map)) {
-        return null;
-      }
-      Kv probe = new Kv();
-      probe.putAll((Map<?, ?>) raw);
-      return probe;
+      nodes = DomService.frameTree(inst.page);
     } catch (PlaywrightException e) {
       return null;
     }
+    for (int ordinal = 0; ordinal < nodes.size(); ordinal++) {
+      DomService.FrameNode node = nodes.get(ordinal);
+      Kv probe;
+      try {
+        Object raw = node.frame.evaluate(MODALS_PROBE);
+        if (!(raw instanceof Map)) {
+          continue;
+        }
+        probe = new Kv();
+      probe.putAll((Map<?, ?>) raw);
+      } catch (PlaywrightException e) {
+        errors.add("frame[" + ordinal + "]: " + briefMessage(e.getMessage()));
+        continue;
+      }
+      any = true;
+      double[] offset = ordinal == 0 ? new double[] {0, 0} : frameOffset(node.frame);
+      Object rawModals = probe.get("modals");
+      if (!(rawModals instanceof List)) {
+        continue;
+      }
+      for (Object item : (List<?>) rawModals) {
+        if (!(item instanceof Map)) {
+          continue;
+        }
+        Kv modal = new Kv();
+          modal.putAll((Map<?, ?>) item);
+        if (ordinal > 0) {
+          shiftPoints(modal, offset);
+          modal.set("frameIndex", ordinal).set("frameUrl", safeFrameUrl(node.frame));
+        } else {
+          modal.set("frameIndex", 0);
+        }
+        modals.add(modal);
+      }
+      if (ordinal == 0) {
+        merged.set("note", probe.get("note")).set("scannedBy", probe.get("scannedBy"));
+      }
+    }
+    if (!any) {
+      return null;
+    }
+    merged.set("count", modals.size()).set("modals", modals)
+        .set("top", modals.isEmpty() ? null : modals.get(modals.size() - 1));
+    if (!errors.isEmpty()) {
+      merged.set("frameErrors", errors);
+    }
+    return merged;
+  }
+
+  /** iframe 元素在主 frame 视口里的位置;取不到时按 0 处理 */
+  private static double[] frameOffset(Frame frame) {
+    try {
+      com.microsoft.playwright.ElementHandle handle = frame.frameElement();
+      if (handle == null) {
+        return new double[] {0, 0};
+      }
+      BoundingBox box = handle.boundingBox();
+      return box == null ? new double[] {0, 0} : new double[] {box.x, box.y};
+    } catch (PlaywrightException e) {
+      return new double[] {0, 0};
+    }
+  }
+
+  /** 把 frame 内坐标平移到主页面视口坐标:rect / closePoint / buttonPoints[].point */
+  @SuppressWarnings("unchecked")
+  private static void shiftPoints(Kv modal, double[] offset) {
+    Object rect = modal.get("rect");
+    if (rect instanceof List && ((List<Object>) rect).size() >= 2) {
+      List<Object> values = (List<Object>) rect;
+      values.set(0, asInt(values.get(0)) + (int) Math.round(offset[0]));
+      values.set(1, asInt(values.get(1)) + (int) Math.round(offset[1]));
+      modal.set("rect", values);
+    }
+    Object closePoint = modal.get("closePoint");
+    if (closePoint instanceof List) {
+      modal.set("closePoint", shiftPoint((List<Object>) closePoint, offset));
+    }
+    Object points = modal.get("buttonPoints");
+    if (points instanceof List) {
+      for (Object entry : (List<Object>) points) {
+        if (entry instanceof Map) {
+          Map<String, Object> map = (Map<String, Object>) entry;
+          Object point = map.get("point");
+          if (point instanceof List) {
+            map.put("point", shiftPoint((List<Object>) point, offset));
+          }
+        }
+      }
+    }
+  }
+
+  private static List<Object> shiftPoint(List<Object> point, double[] offset) {
+    if (point.size() < 2) {
+      return point;
+    }
+    List<Object> shifted = new ArrayList<>(point);
+    shifted.set(0, asInt(point.get(0)) + (int) Math.round(offset[0]));
+    shifted.set(1, asInt(point.get(1)) + (int) Math.round(offset[1]));
+    return shifted;
   }
 
   /**
@@ -5065,7 +6139,9 @@ public class PlaywrightService {
    * 弹窗数量是否真的减少了,把结果如实写进回执。
    *
    * @param which  选哪个弹窗:{@code top}(默认,最后一个弹出来的)、{@code first}(最早那个)、
-   *               {@code all}(依次关掉全部)
+   *               {@code all}(依次关掉全部)、{@code class:<子串>}(按 className 子串匹配,例如
+   *               {@code class:mall_invoice_dialog_container});很多站点的弹窗既没有标题、也没有
+   *               {@code role=dialog},只能靠类名认
    * @param title  按标题/文本子串匹配(给了就以它为准,忽略 which)
    * @param button 点哪个按钮:不给则优先右上角 ×,其次「取消/关闭/知道了/我接受」这类非提交按钮;
    *               要给就写按钮文本(空格会被忽略,如 {@code 确定}、{@code 我接受})
@@ -5088,8 +6164,10 @@ public class PlaywrightService {
     String mode = which == null || which.isBlank() ? "top" : which.trim().toLowerCase(java.util.Locale.ROOT);
     List<Kv> targets = pickModals(before, mode, title);
     if (targets.isEmpty()) {
-      return RespBodyVo.fail("close_modal 失败：没有匹配的弹窗（标题/文本含「" + title + "」的弹窗不存在,"
-          + "当前共 " + countBefore + " 个,用 get_modals 看清单）");
+      return RespBodyVo.fail("close_modal 失败：没有匹配的弹窗（" + (mode.startsWith("class:")
+          ? "className 含「" + mode.substring("class:".length()) + "」的弹窗不存在"
+          : "标题/文本含「" + title + "」的弹窗不存在")
+          + ",当前共 " + countBefore + " 个,用 get_modals 看清单（每项都有 className 与 matchedBy））");
     }
     List<Kv> clicked = new ArrayList<>();
     for (Kv target : targets) {
@@ -5141,6 +6219,22 @@ public class PlaywrightService {
       for (Kv modal : all) {
         String haystack = String.valueOf(modal.getStr("title")) + String.valueOf(modal.getStr("text"));
         if (haystack.replaceAll("\\s+", "").contains(needle)) {
+          matched.add(modal);
+        }
+      }
+      return matched;
+    }
+    // class:<子串>:很多站点的弹窗既没有标题也没有 role=dialog,只能靠类名认
+    // (企业微信/微信系用 qui_dialog / ww_dialog / xxx_dialog_container 这类自有类名)
+    if (which != null && which.startsWith("class:")) {
+      String needle = which.substring("class:".length()).trim().toLowerCase(java.util.Locale.ROOT);
+      if (needle.isEmpty()) {
+        return new ArrayList<>();
+      }
+      List<Kv> matched = new ArrayList<>();
+      for (Kv modal : all) {
+        String className = String.valueOf(modal.getStr("className")).toLowerCase(java.util.Locale.ROOT);
+        if (className.contains(needle)) {
           matched.add(modal);
         }
       }
@@ -5700,44 +6794,164 @@ public class PlaywrightService {
     }
     List<Integer> indices = new ArrayList<>(state.getSelectorMap().keySet());
     indices.sort(null);
-    List<String> xpaths = new ArrayList<>();
+
+    // 一批 xpath 一次求值(每个元素一次 evaluate 会把往返数乘以元素数)。带 frame 的快照必须**按 frame 分组**:
+    // xpath 只能在它自己的文档里求值,在主文档里 document.evaluate 找不到 iframe 内部的节点
+    Map<Integer, List<Integer>> byFrame = new LinkedHashMap<>();
+    for (Integer index : indices) {
+      FrameSnapshot snapshot = state.frameOf(index);
+      int ordinal = snapshot == null ? -1 : snapshot.index;
+      byFrame.computeIfAbsent(ordinal, key -> new ArrayList<>()).add(index);
+    }
+
+    Map<Integer, Object> resolved = new LinkedHashMap<>();
+    for (Map.Entry<Integer, List<Integer>> group : byFrame.entrySet()) {
+      List<Integer> groupIndices = group.getValue();
+      List<String> xpaths = new ArrayList<>(groupIndices.size());
+      for (Integer index : groupIndices) {
+        DOMElementNode node = state.getSelectorMap().get(index);
+      xpaths.add("/" + (node == null ? "" : node.getXpath()));
+      }
+      Frame root = null;
+      if (group.getKey() != null && group.getKey() >= 0) {
+        FrameSnapshot snapshot = state.getFrames().get(group.getKey());
+        root = findFrameByUrl(inst, snapshot.url, snapshot.name);
+        if (root == null && snapshot.frame != null && !snapshot.frame.isDetached()) {
+          root = snapshot.frame;
+        }
+      }
+      Object raw;
+      try {
+        raw = (root == null ? inst.page.mainFrame() : root).evaluate(ELEMENTS_PROBE, xpaths);
+      } catch (PlaywrightException e) {
+        continue;
+      }
+    List<?> list = raw instanceof List ? (List<?>) raw : new ArrayList<>();
+      for (int i = 0; i < groupIndices.size(); i++) {
+        resolved.put(groupIndices.get(i), i < list.size() ? list.get(i) : null);
+      }
+    }
+
     for (Integer index : indices) {
       DOMElementNode node = state.getSelectorMap().get(index);
-      xpaths.add("/" + (node == null ? "" : node.getXpath()));
-    }
-    Object raw;
-    try {
-      raw = inst.page.evaluate("(list) => list.map(xpath => {"
-          + " const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
-          + " const e = r.singleNodeValue; if (!e) return null;"
-          + " const rect = e.getBoundingClientRect();"
-          + " return { tag: e.tagName, id: e.id || null,"
-          + " className: typeof e.className === 'string' ? e.className : null,"
-          + " href: e.getAttribute ? e.getAttribute('href') : null,"
-          + " name: e.getAttribute ? e.getAttribute('name') : null,"
-          + " type: e.getAttribute ? e.getAttribute('type') : null,"
-          + " value: (e.value === undefined ? null : String(e.value).slice(0, 120)),"
-          + " checked: (e.checked === undefined ? null : !!e.checked),"
-          + " visible: rect.width > 0 && rect.height > 0,"
-          + " rect: [Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)],"
-          + " text: (e.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 120) }; })", xpaths);
-    } catch (PlaywrightException e) {
-      return items;
-    }
-    List<?> list = raw instanceof List ? (List<?>) raw : new ArrayList<>();
-    for (int i = 0; i < indices.size(); i++) {
-      DOMElementNode node = state.getSelectorMap().get(indices.get(i));
-      Kv item = Kv.by("index", indices.get(i));
-      Object entry = i < list.size() ? list.get(i) : null;
+      Kv item = Kv.by("index", index);
+      Object entry = resolved.get(index);
       if (entry instanceof Map) {
         item.set((Map<?, ?>) entry);
       }
       if (node != null) {
         item.set("xpath", node.getXpath());
       }
+      FrameSnapshot snapshot = state.frameOf(index);
+      if (snapshot != null) {
+        item.set("frameIndex", snapshot.index).set("frameUrl", snapshot.url);
+      }
       items.add(item);
     }
     return items;
+  }
+
+  /**
+   * 一次回查一批元素的属性 + 监听器情况
+   *
+   * <p>
+   * 顺手把「这个元素有没有挂事件监听器」带上(见 {@link ListenerProbe#probe}):成本只是一次 evaluate 里的几行
+   * 属性检查,却能让「哪些元素是死的」一眼可见 —— 实测最贵的那个坑(upload_file 报成功、页面没生效)就卡在
+   * 「这个 input 根本没人监听」上,而当时只能靠手写 execute_js 一点点摸。
+   */
+  private static final String ELEMENTS_PROBE = "(list) => {"
+      + " const probe = " + ListenerProbe.FRAMEWORK_TRACES + ";"
+      + " return list.map(xpath => {"
+      + " const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);"
+      + " const e = r.singleNodeValue; if (!e) return null;"
+      + " const rect = e.getBoundingClientRect();"
+      + " const info = probe(e);"
+      + " const traces = info && info.traces ? info.traces : [];"
+      + " return { tag: e.tagName, id: e.id || null,"
+      + " className: typeof e.className === 'string' ? e.className : null,"
+      + " href: e.getAttribute ? e.getAttribute('href') : null,"
+      + " name: e.getAttribute ? e.getAttribute('name') : null,"
+      + " type: e.getAttribute ? e.getAttribute('type') : null,"
+      + " value: (e.value === undefined ? null : String(e.value).slice(0, 120)),"
+      + " checked: (e.checked === undefined ? null : !!e.checked),"
+      // 批量路径上不能对每个元素都开一次 CDP 会话,所以只能说「有痕迹」或「未知」——
+      // 绝不把「没探到」写成 false(那是假阴性,正是这个坑最危险的地方)
+      + " hasListeners: traces.length > 0 ? true : null,"
+      + " listeners: traces,"
+      + " listenerDetection: 'heuristic',"
+      + " visible: rect.width > 0 && rect.height > 0,"
+      + " rect: [Math.round(rect.left), Math.round(rect.top), Math.round(rect.width), Math.round(rect.height)],"
+      + " text: (e.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 120) }; }); }";
+
+  // ==================== 读图(OCR) ====================
+
+  /**
+   * 用本机 OCR 读图上的文字
+   *
+   * <p>
+   * <b>为什么要有这条命令</b>:有些模型不支持图片输入({@code read_image} 直接报「does not declare image
+   * input」),于是「必须看图」的环节(验证码、二维码、公告维护图)全都断了。以前只能靠一句
+   * 「用 Windows 自带 OCR」在每个任务 skill 里各写一遍,换个人写就重踩一遍。这里把它固化下来:
+   *
+   * <ul>
+   * <li>{@code path}:直接读服务端上已有的一张图(截图、上传的图样都行);</li>
+   * <li>{@code index} / {@code selector}:先在页面上截这个元素,再读它(验证码最常用)。</li>
+   * </ul>
+   *
+   * <p>
+   * 走的是 Windows 自带的 {@code Windows.Media.Ocr},不需要装任何东西,也不需要联网。识别中文需要系统装了
+   * 对应语言包;没装时会明确说「本机没有可用的 OCR 语言包」并列出已装的语言,而不是给一段乱码。
+   *
+   * @param path     图片路径(服务端本地路径);与 index/selector 三选一
+   * @param index    元素索引
+   * @param selector 元素选择器
+   * @param frame    元素在跨域 iframe 里时传
+   * @param language OCR 语言,默认 {@code zh-Hans-CN}
+   */
+  public RespBodyVo ocrImage(Long browserId, String path, Integer index, String selector, String frame,
+      String language) {
+    Path image = null;
+    String imageUrl = null;
+    String target;
+    if (path != null && !path.isBlank()) {
+      image = Paths.get(path).toAbsolutePath().normalize();
+      target = "path=" + path;
+      BrowserInstance inst = INSTANCES.get(browserId);
+      if (inst != null) {
+        // 落盘在 data/<id>/ 下的图可以直接 GET,贴给用户看
+        imageUrl = shotUrl(inst, image.toString());
+      }
+    } else if (index != null || (selector != null && !selector.isBlank())) {
+      BrowserInstance inst = INSTANCES.get(browserId);
+      if (inst == null) {
+        return notFound(browserId);
+      }
+      String shotPath = defaultShotPath(inst);
+      RespBodyVo shot = elementScreenshot(inst, index, selector, shotPath, Boolean.FALSE, frame);
+      if (!shot.isOk()) {
+        return shot;
+      }
+      Kv shotData = shot.getData() instanceof Kv ? (Kv) shot.getData() : new Kv();
+      image = shotData.getStr("path") == null ? null : Paths.get(shotData.getStr("path"));
+      imageUrl = shotData.getStr("url");
+      target = String.valueOf(shotData.get("target"));
+    } else {
+      return RespBodyVo.fail("ocr_image 需要 path,或 index / selector 之一");
+    }
+    if (image == null || !Files.isRegularFile(image)) {
+      return RespBodyVo.fail("ocr_image 找不到图片：" + image);
+    }
+    Kv read = WindowsOcr.read(image, language);
+    Kv data = new Kv();
+    data.putAll(read);
+    data.set("target", target).set("imagePath", image.toAbsolutePath().toString());
+    if (imageUrl != null) {
+      data.set("imageUrl", imageUrl);
+    }
+    if (!Boolean.TRUE.equals(read.get("ok"))) {
+      data.set("ocrSupported", WindowsOcr.available());
+    }
+    return RespBodyVo.ok(data);
   }
 
   // ==================== 人机协同 ====================
@@ -5749,40 +6963,126 @@ public class PlaywrightService {
    * 验证码、短信码、人工登录这类环节,智能体既读不了图也拿不到凭证,只能请人来做。这个接口 把「请人」这件事固定下来:
    *
    * <ol>
-   * <li>request_human_input 建一个待办,可选把某个元素(验证码图)截成 base64 一起返回,并把当前页签带到最前</li>
+   * <li>request_human_input 建一个待办,可选把某个元素(验证码图)截成 base64 + 落盘路径一起返回,并把当前页签带到最前</li>
    * <li>人看到图和页面后,把答案用 submit_human_input 提交(或者直接在有头浏览器里自己操作完)</li>
    * <li>智能体用 get_human_input 取答案;带 timeoutSeconds 时可以当长轮询用</li>
    * </ol>
    *
    * <p>
-   * 返回 data.requestId、data.prompt、data.expiresAt、data.url,以及传了 index/selector 时的
-   * data.imageBase64 与 data.imageSize。
+   * <b>读不了图的模型怎么办</b>:只回 {@code imageBase64} 对「不支持图片输入」的模型仍然没用。所以这里同时回
+   * {@code imagePath}(服务端本地路径)与 {@code imageUrl}(可直接 GET 的地址,能贴给用户),并在 {@code ocr:true}
+   * 时用**本机 OCR**(Windows 自带 {@code Windows.Media.Ocr})把图上的文字一并读出来 —— 「验证码是什么」
+   * 这类问题读不了图的模型也能自己答一部分。
+   *
+   * @param prompt         要人做什么(不传 steps 时必填)
+   * @param index          要截图的元素索引(可选)
+   * @param selector       要截图的元素选择器(可选)
+   * @param timeoutSeconds 等待时长(秒),默认 300
+   * @param steps          一次带多个待办:{@code [{prompt, index?, selector?}, ...]},人一次做完,少几次往返
+   * @param expiresAt      绝对过期时刻(毫秒时间戳):二维码这类**有短时效**的场景用它,比 timeoutSeconds 直白,
+   *                       并且过期后会明确回 {@code status:"expired"} 而不是让人干等
+   * @param ocr            是否用本机 OCR 读图上的文字,默认 false
+   * @param ocrLanguage    OCR 语言,默认 {@code zh-Hans-CN}
+   * @param inline         是否内联 base64,默认 true(要省 token 可以关掉,只用 imagePath/imageUrl)
    */
   public RespBodyVo requestHumanInput(Long browserId, String prompt, Integer index, String selector,
-      Integer timeoutSeconds) {
+      Integer timeoutSeconds, List<Kv> steps, Long expiresAt, Boolean ocr, String ocrLanguage, Boolean inline) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
+    if ((prompt == null || prompt.isBlank()) && (steps == null || steps.isEmpty())) {
+      return RespBodyVo.fail("request_human_input 需要 prompt,或用 steps 给出待办清单");
+    }
+    long now = System.currentTimeMillis();
+    long deadline;
+    if (expiresAt != null && expiresAt > 0) {
+      deadline = expiresAt;
+    } else {
     int ttl = timeoutSeconds == null || timeoutSeconds <= 0 ? DEFAULT_HUMAN_TIMEOUT_SECONDS : timeoutSeconds;
-    long expiresAt = System.currentTimeMillis() + ttl * 1_000L;
+      deadline = now + ttl * 1_000L;
+    }
     String requestId = "hr-" + inst.humanSeq.incrementAndGet() + "-" + SnowflakeIdUtils.id();
     Kv request = Kv.by("requestId", requestId).set("prompt", prompt).set("status", "pending").set("answer", null)
-        .set("createdAt", System.currentTimeMillis()).set("expiresAt", expiresAt);
+        .set("createdAt", now).set("expiresAt", deadline);
     inst.humanRequests.put(requestId, request);
     // 需要人工介入时把页面带到最前,人才能直接看到验证码/表单
     activate(inst.page);
-    Kv data = Kv.by("requestId", requestId).set("prompt", prompt).set("expiresAt", expiresAt).set("url",
-        inst.page.url());
-    if (index != null || (selector != null && !selector.isEmpty())) {
-      // 请人看验证码/二维码是「确实必须看图」的场景,这里显式要内联图片
-      RespBodyVo shot = elementScreenshot(inst, index, selector, null, Boolean.TRUE);
+    Kv data = Kv.by("requestId", requestId).set("prompt", prompt).set("expiresAt", deadline)
+        .set("expiresInSeconds", Math.max(0, (deadline - now) / 1000)).set("url", inst.page.url());
+    if (deadline <= now) {
+      // 过期时刻已经过去了:直接说清楚,别让人等一个永远不会来的答复
+      request.set("status", "expired");
+      data.set("status", "expired").set("note", "expiresAt 已经过去了,这个请求没有生效;请重新发起");
+      return RespBodyVo.ok(data);
+    }
+
+    boolean wantOcr = Boolean.TRUE.equals(ocr);
+    boolean wantInline = inline == null || inline;
+    // 第一个要看图的目标:老写法(index/selector)或 steps 里第一个带目标的步骤
+    Integer shotIndex = index;
+    String shotSelector = selector;
+    String shotPrompt = prompt;
+    if (steps != null && !steps.isEmpty()) {
+      List<Kv> items = new ArrayList<>();
+      int seq = 0;
+      for (Kv step : steps) {
+        String stepId = "s" + (++seq);
+        Kv item = Kv.by("stepId", stepId).set("prompt", step.getStr("prompt")).set("status", "pending")
+            .set("answer", null);
+        if (step.get("index") != null) {
+          item.set("index", step.get("index"));
+        }
+        if (step.getStr("selector") != null) {
+          item.set("selector", step.getStr("selector"));
+        }
+        items.add(item);
+      }
+      request.set("steps", items).set("status", "pending");
+      data.set("steps", items).set("stepCount", items.size());
+      if (shotPrompt == null || shotPrompt.isBlank()) {
+        shotPrompt = steps.get(0).getStr("prompt");
+      }
+      if (shotIndex == null && (shotSelector == null || shotSelector.isBlank())) {
+        Object stepIndex = steps.get(0).get("index");
+        String stepSelector = steps.get(0).getStr("selector");
+        shotIndex = stepIndex instanceof Number ? ((Number) stepIndex).intValue() : null;
+        shotSelector = stepSelector;
+      }
+      data.set("note", "这是一次带多步待办的请求:让人一次做完,再用 submit_human_input 按 stepId 逐个回填;"
+          + "全部回填后 get_human_input 的 status 会变成 answered");
+    }
+
+    if (shotIndex != null || (shotSelector != null && !shotSelector.isEmpty())) {
+      // 请人看验证码/二维码是「确实必须看图」的场景:落盘 + 内联 + 可 GET 的 URL 一起给,
+      // 读不了图的模型至少还能把 imageUrl 贴给用户,或走 OCR
+      String path = defaultShotPath(inst);
+      RespBodyVo shot = elementScreenshot(inst, shotIndex, shotSelector, path, wantInline);
       if (shot.isOk() && shot.getData() instanceof Kv) {
         Kv shotData = (Kv) shot.getData();
-        data.set("imageBase64", shotData.getStr("base64"));
-        data.set("imageSize", shotData.get("size"));
+        if (wantInline) {
+          data.set("imageBase64", shotData.getStr("base64"));
+        }
+        data.set("imageSize", shotData.get("size"))
+            .set("imagePath", shotData.getStr("path"))
+            .set("imageUrl", shotData.getStr("url"));
       } else {
         data.set("imageError", shot.getMsg());
+      }
+    }
+
+    if (wantOcr) {
+      String imagePath = data.getStr("imagePath");
+      if (imagePath == null || imagePath.isEmpty()) {
+        data.set("ocrError", "ocr:true 需要 index / selector(或 steps 里的第一个带目标的步骤)来指定要读的图");
+      } else {
+        Kv read = WindowsOcr.read(Paths.get(imagePath), ocrLanguage);
+        data.set("ocr", read);
+        if (Boolean.TRUE.equals(read.get("ok"))) {
+          data.set("ocrText", read.getStr("text"));
+        } else {
+          data.set("ocrError", read.getStr("error"));
+        }
       }
     }
     return RespBodyVo.ok(data);
@@ -5790,6 +7090,17 @@ public class PlaywrightService {
 
   /** 提交人工答复,返回 data.status 与 data.answer */
   public RespBodyVo submitHumanInput(Long browserId, String requestId, String answer) {
+    return submitHumanInput(browserId, requestId, answer, null, null);
+  }
+
+  /**
+   * 同上,支持按 {@code stepId} 逐个回填多步待办
+   *
+   * @param stepId  只回填某一步;为空时回填整条请求(answers 优先)
+   * @param answers {@code {stepId: answer}} 一次回填多步
+   */
+  public RespBodyVo submitHumanInput(Long browserId, String requestId, String answer, String stepId,
+      JSONObject answers) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -5798,8 +7109,90 @@ public class PlaywrightService {
     if (request == null) {
       return RespBodyVo.fail("submit_human_input 没有这个请求: " + requestId);
     }
-    request.set("answer", answer).set("status", "answered").set("answeredAt", System.currentTimeMillis());
+    long now = System.currentTimeMillis();
+    List<Kv> steps = stepList(request);
+    // 多步待办:必须按 stepId / answers 逐条回填 —— 直接给一个 answer 说不清它对应哪一步,静默接受
+    // 只会让剩下的步骤一直挂在 pending 上,所以这里明确报错并给出待办清单
+    if (!steps.isEmpty()) {
+      Map<String, String> filled = new LinkedHashMap<>();
+      if (answers != null) {
+        for (String key : answers.keySet()) {
+          filled.put(key, answers.getString(key));
+        }
+      }
+      if (stepId != null) {
+        filled.put(stepId, answer);
+      }
+      if (filled.isEmpty()) {
+        List<String> pendingIds = new ArrayList<>();
+        for (Kv step : steps) {
+          pendingIds.add(step.getStr("stepId") + "(" + step.getStr("prompt") + ")");
+        }
+        return RespBodyVo.fail("submit_human_input 这条请求有 " + steps.size() + " 个待办步骤,"
+            + "请用 stepId 指定回填哪一步,或用 answers 一次回填多步。待办:" + String.join(" / ", pendingIds));
+      }
+      List<String> unknown = new ArrayList<>();
+      for (Map.Entry<String, String> entry : filled.entrySet()) {
+        Kv target = null;
+        for (Kv step : steps) {
+          if (entry.getKey().equals(step.getStr("stepId"))) {
+            target = step;
+            break;
+          }
+        }
+        if (target == null) {
+          unknown.add(entry.getKey());
+          continue;
+        }
+        target.set("answer", entry.getValue()).set("status", "answered").set("answeredAt", now);
+      }
+      if (!unknown.isEmpty()) {
+        return RespBodyVo.fail("submit_human_input 不认识的 stepId: " + String.join(" / ", unknown));
+      }
+      boolean allDone = true;
+      List<Kv> pendingSteps = new ArrayList<>();
+      for (Kv step : steps) {
+        if (!"answered".equals(step.getStr("status"))) {
+          allDone = false;
+          pendingSteps.add(Kv.by("stepId", step.getStr("stepId")).set("prompt", step.getStr("prompt")));
+        }
+      }
+      if (allDone) {
+        request.set("status", "answered").set("answeredAt", now);
+      }
+      Kv data = Kv.by("requestId", requestId)
+          .set("status", allDone ? "answered" : "partial").set("steps", steps);
+      if (!allDone) {
+        data.set("pendingSteps", pendingSteps)
+            .set("note", "还有 " + pendingSteps.size() + " 步没回填;全部回填后 status 才是 answered");
+      }
+      return RespBodyVo.ok(data);
+    }
+    if (answer == null) {
+      return RespBodyVo.fail("submit_human_input 需要 answer(或用 stepId / answers 逐条回填)");
+    }
+    request.set("answer", answer).set("status", "answered").set("answeredAt", now);
     return RespBodyVo.ok(Kv.by("requestId", requestId).set("status", "answered").set("answer", answer));
+  }
+
+  /** 把 Kv 里存的 steps 读成 List<Kv>(存进去的是 Kv,取出来还是 Kv) */
+  @SuppressWarnings("unchecked")
+  private static List<Kv> stepList(Kv request) {
+    Object raw = request.get("steps");
+    if (!(raw instanceof List)) {
+      return new ArrayList<>();
+    }
+    List<Kv> steps = new ArrayList<>();
+    for (Object item : (List<Object>) raw) {
+      if (item instanceof Kv) {
+        steps.add((Kv) item);
+      } else if (item instanceof Map) {
+        Kv step = new Kv();
+        step.putAll((Map<?, ?>) item);
+        steps.add(step);
+      }
+    }
+    return steps;
   }
 
   /**
@@ -5808,6 +7201,10 @@ public class PlaywrightService {
    * <p>
    * data.status 为 pending / answered / expired。传 timeoutSeconds 时长轮询等待答复,到时间
    * 还没答复就返回当前状态(不算失败)。人在浏览器里自己把事情做完了、始终没提交答复时,这里 会一直是 pending 直到过期,智能体可以直接继续后续步骤。
+   *
+   * <p>
+   * <b>过期是显式的</b>:二维码这类有短时效的场景,等到超时才知道「早就过期了」是纯浪费。所以过期时回执里
+   * 直接给 {@code expired:true} 与一句可操作的提示,而不是让人继续等。
    */
   public RespBodyVo getHumanInput(Long browserId, String requestId, Integer timeoutSeconds) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -5823,8 +7220,30 @@ public class PlaywrightService {
     while ("pending".equals(humanStatus(request)) && System.currentTimeMillis() < deadline) {
       sleepQuietly(500);
     }
-    return RespBodyVo.ok(Kv.by("requestId", requestId).set("status", humanStatus(request))
-        .set("answer", request.get("answer")).set("prompt", request.get("prompt")));
+    String status = humanStatus(request);
+    Kv data = Kv.by("requestId", requestId).set("status", status).set("answer", request.get("answer"))
+        .set("prompt", request.get("prompt")).set("expiresAt", request.get("expiresAt"));
+    List<Kv> steps = stepList(request);
+    if (!steps.isEmpty()) {
+      data.set("steps", steps);
+      boolean anyAnswered = false;
+      for (Kv step : steps) {
+        if ("answered".equals(step.getStr("status"))) {
+          anyAnswered = true;
+          break;
+        }
+      }
+      if (anyAnswered && "pending".equals(status)) {
+        data.set("status", "partial");
+        status = "partial";
+      }
+    }
+    if ("expired".equals(status)) {
+      data.set("expired", true)
+          .set("hint", "这个人工请求已经过期:二维码/短信码这类有短时效的凭证通常也已经失效,"
+              + "请重新发起 request_human_input(可以用 expiresAt 明确告诉它什么时候过期)");
+    }
+    return RespBodyVo.ok(data);
   }
 
   /** pending 且已过 expiresAt 时算 expired */

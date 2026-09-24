@@ -423,6 +423,69 @@ const heuristic = [...document.querySelectorAll('div,section,aside')].filter(el 
 
 ---
 
+### B11 `SkillDocConsistencyTest` 对站点 skill 有系统性误报
+
+**这是本次写 skill 时踩到的、很具体的一个工程问题。**
+
+`SkillDocConsistencyTest.everySkillDocOnlyMentionsRealCommands()`（`docs/SkillDocConsistencyTest.java:149`）
+会遍历 `skills/` 下**每一份** SKILL.md，用这个正则把反引号里的内容当命令名抓出来：
+
+```java
+Pattern DOC_COMMAND = Pattern.compile("`([a-z][a-z0-9_]{2,})`");
+```
+
+只要抓出来的名字**含下划线**、且不在 `NOT_COMMANDS` 里、又不在命令表中，就判定失败。
+
+**问题**：站点操作手册**必然**会大量提到 snake_case 的**非命令标识符**——
+Vue 表单字段、CSS 类名、HTML id、URL 查询参数、接口响应字段。
+本次四个新 skill 第一次检查就命中 **22 处**：
+
+| 类别 | 例子 | 数量 |
+| --- | --- | --- |
+| Vue 表单字段 | `business_license_stuff`、`subject_name`、`socialcredit_code`、`mp_operator_phone`、`verify_result` | 6 |
+| CSS 类名 | `mall_invoice_dialog_container`、`qui_dialog`、`ww_dialog`、`form_err` | 4 |
+| HTML id | `dsh_up_0`、`dsh_up_1` | 2 |
+| URL 查询参数 | `order_id` | 1 |
+| 接口响应字段 | `has_cname_record` | 1 |
+| **「这些方法不存在」的反例** | `get_frames`、`list_frames`、`switch_frame`、`execute_js_in_frame` | 4 |
+| 其它 | `wwmng_authcode` | 1 |
+
+**最讽刺的一类**：文档里**明确写「这些方法不存在」**时（`get_frames()` 全返回「不支持的方法」），
+测试反而会因为它「不在命令表里」而报错——**把「记录一个已知缺失的能力」判成了错误**。
+
+**我这次的临时解法**（不改测试）：把这些标识符改成**不像命令名**的写法，各自还更贴合语境：
+
+| 类别 | 改法 | 例 |
+| --- | --- | --- |
+| CSS 类名 | 加 CSS 点号 | `` `.mall_invoice_dialog_container` `` |
+| HTML id | 加 `#` | `` `#dsh_up_0` `` |
+| Vue/接口字段 | 加所属对象前缀 | `` `formData.subject_name` `` |
+| URL 参数 | 带上 `?` 与 `=` | `` `?order_id=` `` |
+| 「不存在的方法」 | 加调用括号 | `` `get_frames()` `` |
+
+改完 22 处全消，`mvn test -Dtest=SkillDocConsistencyTest` **6 项全绿**。
+
+**但这是「让文档迁就测试」，不是好设计。** 每加一个站点 skill 都要重复一遍这个动作，
+而且「CSS 类名必须加点号、字段必须加前缀」这条规则**没有任何地方写明**——
+下一个人写站点 skill 时还会踩，然后在 CI 上看到一个莫名其妙的失败。
+
+**建议（三选一，推荐第一个）**：
+
+1. **给文档一个显式的「非命令」标记**，让作者自己声明，而不是靠词形猜。例如：
+   - 用**双反引号**包住非命令标识符（`` ``subject_name`` ``），测试只检查单反引号；或
+   - 支持一个 frontmatter 字段 `nonCommands: [subject_name, dsh_up_0, ...]`，测试把它并入 `NOT_COMMANDS`。
+   - 推荐前者：**零配置、词法可判、不需要维护列表**，而且视觉上也能区分「这是命令」与「这是页面里的名字」。
+2. **放宽启发式**：只检查「出现在动词/调用语境里」的反引号名字（例如后面紧跟 `(`、或前面有
+   `调用`/`方法`/`命令` 字样）。误报会少很多，但规则变复杂。
+3. **保留现状，但把规则写进文档**：在 `skills/` 下加一个 `README.md` 或 `CONTRIBUTING`，
+   明确写「站点 skill 里非命令的 snake_case 标识符不要用单反引号」，并给出上面那张对照表。
+   成本最低，但靠人自觉。
+
+**顺带一个建议**：这个测试目前只覆盖 `skills/`。`recipes/` 里的 JSON 也会写命令名，
+建议同样过一遍（`RecipeStore` 已经有加载校验，可以复用）。
+
+---
+
 ## 三、我自己的操作失误（诚实记录，供文档参考）
 
 1. **没用 `viewportExpansion`**：见 B9。文档里有，我没找到。

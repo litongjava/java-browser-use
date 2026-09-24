@@ -1,7 +1,7 @@
 """dsb 客户端的脱敏规则自测(不连服务,纯本地)
 
 为什么单独写一个文件:PowerShell 5.1 把 `python -c "…"` 里的双引号吃掉,测试用例没法直接内联,
-所以固定成文件跑:`python scripts/client/test_dsb.py`。
+所以固定成文件跑:`python client/test_dsb.py`。
 """
 import sys
 from pathlib import Path

@@ -4,7 +4,7 @@
 PowerShell 那份是 `scripts/trace/browse.ps1`,这个 `dsb.py` 是给「跨平台、要写进脚本、要跟 Python 生态配合」的场景准备的。
 
 ```
-scripts/client/
+client/
 ├── dsb.py          客户端本体(单文件,标准库)
 ├── dsb.cmd         Windows 包装:直接敲 dsb 就行
 ├── dsb             Linux/macOS 包装(chmod +x 后可直接 ./dsb)
@@ -16,25 +16,33 @@ scripts/client/
 
 ```bash
 # 服务端在哪:命令行 > 环境变量 > 默认(localhost:10049)
-python scripts/client/dsb.py --port 10049 health
+python client/dsb.py --port 10049 health
 
 # 起一个 Firefox 任务(默认无头),看回执里的 engineHonored 确认引擎真的换了
-python scripts/client/dsb.py start --browser firefox --id 1001
+python client/dsb.py start --browser firefox --id 1001
 
 # 发一条命令
-python scripts/client/dsb.py --id 1001 run go_to_url -p url=https://example.com
+python client/dsb.py --id 1001 run go_to_url -p url=https://example.com
 
 # 看页面状态(标题/URL/元素数)
-python scripts/client/dsb.py --id 1001 state
+python client/dsb.py --id 1001 state
 
 # 长批次:后台跑 + 轮询,不受 HTTP 超时限制
-python scripts/client/dsb.py --id 1001 batch cmds.json --async --wait
+python client/dsb.py --id 1001 batch cmds.json --async --wait
 
 # 关掉任务
-python scripts/client/dsb.py --id 1001 close
+python client/dsb.py --id 1001 close
 ```
 
-Windows 下把 `python scripts/client/dsb.py` 换成 `scripts\client\dsb.cmd`(或先把 `scripts\client` 加进 `PATH`,直接敲 `dsb`)。
+Windows 下把 `python client/dsb.py` 换成 `client\dsb.cmd`(或先把 `client` 加进 `PATH`,直接敲 `dsb`)。
+
+三点 Windows 上的注意:
+
+- `dsb.cmd` 只做两件事:找 `python`(取不到退回 `py`)、把 `%~dp0dsb.py` 连同全部参数交出去,退出码照样透传 ——
+  所以它和 `python client/dsb.py` **完全等价**,不必为了「稳一点」去写 python 前缀。
+- 在 **PowerShell** 里当前目录不在 `PATH`,要写 `.\client\dsb.cmd ...`;在 **cmd.exe** 里 `client\dsb.cmd ...` 就行。
+- `dsb.cmd` 中间隔着一层 cmd.exe,参数里的 `&`、`^`、`%` 可能被提前吃掉(中文与引号不受影响)。这类参数不要走
+  命令行,挪进文件:`--params @文件.json`、`batch cmds.json`、`js @脚本.js`。
 
 ## 子命令
 
@@ -91,13 +99,13 @@ logs/agent/dsb/steps.log       一行一次调用:时间 #序号 id 方法 OK/FA
 
 **默认脱敏**:落盘与终端输出都会把手机号、身份证、统一社会信用代码、邮箱、长号码打码
 (`***手机号***` 之类),`--no-redact` 关掉,`--redact-pattern 某某公司` / `DSB_REDACT=a,b` 追加要打码的词。
-脱敏规则本身有本地自测:`python scripts/client/test_dsb.py`。
+脱敏规则本身有本地自测:`python client/test_dsb.py`。
 
 ## 当库用
 
 ```python
 import sys
-sys.path.insert(0, "scripts/client")
+sys.path.insert(0, "client")
 from dsb import Client, TransportError
 
 c = Client(host="10.0.0.5", port=10049, task_id=2001, session="my-task")  # session=None 则不记录
@@ -125,7 +133,7 @@ c.close()
 ## 自检
 
 ```bash
-python scripts/client/dsb.py --port 10049 selftest --browser firefox
+python client/dsb.py --port 10049 selftest --browser firefox
 ```
 
 它用自己的任务 id(`990001`,不会撞上业务任务)起一个浏览器,依次验证:健康检查、命令清单里新命令是否都在、

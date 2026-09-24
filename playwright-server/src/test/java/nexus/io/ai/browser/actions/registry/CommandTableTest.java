@@ -167,7 +167,12 @@ public class CommandTableTest {
         "wait_for_idle", "get_form_state",
         // 新增的自省/弹窗/任务类命令:参数全可选,或压根不需要参数
         "wait_for_stable", "get_modals", "close_modal", "list_methods", "get_config", "list_tasks",
-        "shutdown", "list_recipes", "list_jobs", "get_js_dialog", "clear_js_dialog", "cleanup"));
+        "shutdown", "list_recipes", "list_jobs", "get_js_dialog", "clear_js_dialog", "cleanup",
+        // frame 相关:list_frames 参数全可选;get_element_listeners 是 index/selector 二选一,
+        // 两个都没传时由服务层给出「需要 index 或 selector 之一」
+        "list_frames", "get_element_listeners",
+        // ocr_image 同理:path 或 index/selector 三选一,服务层报「需要 path,或 index / selector 之一」
+        "ocr_image"));
     assertTrue("这些命令没有缺参数用例:" + uncovered, uncovered.isEmpty());
   }
 

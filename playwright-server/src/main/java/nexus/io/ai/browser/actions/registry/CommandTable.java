@@ -53,6 +53,14 @@ public class CommandTable {
         boolean honored = engineHonored(requested, effective);
         data.set("requestedBrowser", requested == null || requested.isBlank() ? null : requested)
             .set("effectiveBrowser", effective).set("engineHonored", honored);
+        // engineHonored:true 只说明「参数被采纳了」,不说明「这份 profile 里有登录态」——这两件事必须分开说,
+        // 否则换引擎之后「所有站点都退登录了」会完全没有线索(见技能手册里「换引擎等于换一套登录态」)
+        if (browser.get("profileSeenBefore") != null) {
+          data.set("profileSeenBefore", browser.get("profileSeenBefore"));
+        }
+        if (browser.getStr("profileNote") != null) {
+          data.set("profileNote", browser.getStr("profileNote"));
+        }
         if (!honored) {
           data.set("engineWarning", "请求的浏览器是 " + requested + ",实际用的是 " + effective
               + ":说明这个服务实例没有按 browser 参数切换浏览器(常见于旧版本发布包,它只认 headless)。"
@@ -75,7 +83,9 @@ public class CommandTable {
     put("get_title", (svc, id, a) -> svc.getTitle(id));
     put("get_browser_state",
         (svc, id, a) -> svc.getBrowserState(id, a.getBoolean("highlight"), a.getInteger("viewportExpansion"),
-            a.getBoolean("includeElements"), a.getInteger("maxElements")));
+            a.getBoolean("includeElements"), a.getInteger("maxElements"), a.getBoolean("includeFrames")));
+    // 页面上的 frame 清单(跨域 iframe 也能读到 URL):主站把第三方控制台套在 iframe 里时先看它
+    put("list_frames", (svc, id, a) -> svc.listFrames(id, a.getBoolean("refresh")));
     put("wait", (svc, id, a) -> svc.waitSeconds(id, reqInt(a, "seconds")));
 
     // ---------- 元素交互(按索引) ----------
@@ -100,10 +110,11 @@ public class CommandTable {
     put("upload_file", (svc, id, a) -> {
       if (optStr(a, "contentBase64") != null || optStr(a, "url") != null) {
         return svc.uploadFileInline(id, a.getInteger("index"), optStr(a, "selector"), optStr(a, "filename"),
-            optStr(a, "contentType"), optStr(a, "contentBase64"), optStr(a, "url"), a.getInteger("timeoutMs"));
+            optStr(a, "contentType"), optStr(a, "contentBase64"), optStr(a, "url"), a.getInteger("timeoutMs"),
+            optStr(a, "frame"));
       }
       return svc.uploadFile(id, a.getInteger("index"), optStr(a, "selector"), reqStr(a, "path"),
-          a.getInteger("timeoutMs"));
+          a.getInteger("timeoutMs"), optStr(a, "frame"));
     });
     put("drag_element_by_index",
         (svc, id, a) -> svc.dragElementByIndex(id, reqInt(a, "index"), reqInt(a, "targetIndex")));
@@ -120,18 +131,23 @@ public class CommandTable {
     put("get_element_html", (svc, id, a) -> svc.getElementHtml(id, reqInt(a, "index")));
     put("get_element_value", (svc, id, a) -> svc.getElementValue(id, reqInt(a, "index")));
     put("get_element_attribute", (svc, id, a) -> svc.getElementAttribute(id, reqInt(a, "index"), reqStr(a, "name")));
-    put("get_element_count", (svc, id, a) -> svc.getElementCount(id, reqStr(a, "selector")));
+    // 这个元素到底挂了哪些事件监听器:SPA 自动化的基础诊断信息(全为 false 就是「这个 input 没人监听」)
+    put("get_element_listeners", (svc, id, a) -> svc.getElementListeners(id, a.getInteger("index"),
+        optStr(a, "selector"), optStr(a, "frame")));
+    put("get_element_count", (svc, id, a) -> svc.getElementCount(id, reqStr(a, "selector"), optStr(a, "frame")));
     put("get_element_box", (svc, id, a) -> svc.getElementBox(id, reqInt(a, "index")));
     put("is_visible", (svc, id, a) -> svc.isVisible(id, reqInt(a, "index")));
     put("is_enabled", (svc, id, a) -> svc.isEnabled(id, reqInt(a, "index")));
     put("is_checked", (svc, id, a) -> svc.isChecked(id, reqInt(a, "index")));
 
     // ---------- 选择器与语义定位 ----------
+    // frame:目标在跨域 iframe 里时必传(序号见 list_frames,或写 URL/name 子串);
+    // 按索引的命令不需要它 —— 索引里已经带了 frame 信息,服务端自动路由
     put("click_element_by_selector",
         (svc, id, a) -> svc.clickElementBySelector(id, reqStr(a, "selector"), optStr(a, "mode"),
-            a.getInteger("timeoutMs")));
+            a.getInteger("timeoutMs"), optStr(a, "frame")));
     put("input_text_by_selector", (svc, id, a) -> svc.inputTextBySelector(id, reqStr(a, "selector"),
-        reqStr(a, "text"), optStr(a, "mode")));
+        reqStr(a, "text"), optStr(a, "mode"), optStr(a, "frame")));
     put("click_element_by_text", (svc, id, a) -> svc.clickElementByText(id, reqStr(a, "text"), optStr(a, "mode")));
     put("click_element_by_role",
         (svc, id, a) -> svc.clickElementByRole(id, reqStr(a, "role"), optStr(a, "name"), optStr(a, "mode")));
@@ -152,7 +168,8 @@ public class CommandTable {
 
     // ---------- 等待 ----------
     put("wait_for_element",
-        (svc, id, a) -> svc.waitForElement(id, reqStr(a, "selector"), a.getDouble("timeoutSeconds")));
+        (svc, id, a) -> svc.waitForElement(id, reqStr(a, "selector"), a.getDouble("timeoutSeconds"),
+            optStr(a, "frame")));
     put("wait_for_text", (svc, id, a) -> svc.waitForText(id, reqStr(a, "text"), a.getDouble("timeoutSeconds")));
     put("wait_for_url", (svc, id, a) -> svc.waitForUrl(id, reqStr(a, "url"), a.getDouble("timeoutSeconds")));
     put("wait_for_load", (svc, id, a) -> svc.waitForLoad(id, optStr(a, "state"), a.getDouble("timeoutSeconds")));
@@ -257,7 +274,8 @@ public class CommandTable {
         // 两个都没给:报「缺少参数 body」,与老版本的行为一致(老版本只认 body)
         throw new IllegalArgumentException("缺少参数 body");
       }
-      return svc.executeJs(id, a.getString("body"), optStr(a, "bodyFile"), a.getJSONObject("vars"));
+      return svc.executeJs(id, a.getString("body"), optStr(a, "bodyFile"), a.getJSONObject("vars"),
+          optStr(a, "frame"));
     });
 
     // ---------- 服务自省与配方 ----------
@@ -327,11 +345,41 @@ public class CommandTable {
     });
 
     // ---------- 人机协同 ----------
-    put("request_human_input", (svc, id, a) -> svc.requestHumanInput(id, reqStr(a, "prompt"), a.getInteger("index"),
-        optStr(a, "selector"), a.getInteger("timeoutSeconds")));
-    put("submit_human_input", (svc, id, a) -> svc.submitHumanInput(id, reqStr(a, "requestId"), optStr(a, "answer")));
+    // 一次请求可以带多个待办(steps):扫码 + 输码 + 支付确认是**一串**动作,人一次做完比来回多次往返省事
+    put("request_human_input", (svc, id, a) -> {
+      // prompt 与 steps 二选一:两个都没给时在**碰浏览器对象之前**就说清楚是缺哪个参数
+      if (a.getJSONArray("steps") == null && optStrRaw(a, "prompt") == null) {
+        throw new IllegalArgumentException("缺少参数 prompt");
+      }
+      return svc.requestHumanInput(id, optStrRaw(a, "prompt"), a.getInteger("index"), optStr(a, "selector"),
+          a.getInteger("timeoutSeconds"), stepListOf(a.getJSONArray("steps")), a.getLong("expiresAt"),
+          a.getBoolean("ocr"), optStr(a, "ocrLanguage"), a.getBoolean("inline"));
+    });
+    put("submit_human_input", (svc, id, a) -> svc.submitHumanInput(id, reqStr(a, "requestId"),
+        optStrRaw(a, "answer"), optStr(a, "stepId"), a.getJSONObject("answers")));
     put("get_human_input",
         (svc, id, a) -> svc.getHumanInput(id, reqStr(a, "requestId"), a.getInteger("timeoutSeconds")));
+    // 读图上的文字(Windows 自带 OCR):读不了图的模型也能答「验证码是什么」
+    put("ocr_image", (svc, id, a) -> svc.ocrImage(id, optStr(a, "path"), a.getInteger("index"),
+        optStr(a, "selector"), optStr(a, "frame"), optStr(a, "language")));
+  }
+
+  /** steps: [{prompt, index?, selector?}, ...] → List&lt;Kv&gt; */
+  private static java.util.List<Kv> stepListOf(com.alibaba.fastjson2.JSONArray steps) {
+    java.util.List<Kv> list = new java.util.ArrayList<>();
+    if (steps == null) {
+      return list;
+    }
+    for (int i = 0; i < steps.size(); i++) {
+      JSONObject item = steps.getJSONObject(i);
+      if (item == null) {
+        continue;
+      }
+      Kv step = new Kv();
+      step.putAll(item);
+      list.add(step);
+    }
+    return list;
   }
 
   private CommandTable() {
@@ -512,6 +560,17 @@ public class CommandTable {
   private static String optStr(JSONObject args, String key) {
     String value = args.getString(key);
     return value == null || value.isEmpty() ? null : value;
+  }
+
+  /**
+   * 取值但不把空串当成缺失
+   *
+   * <p>
+   * 人工答复与 prompt 都可能合法地是空串(「我什么都没填」也是一种答复),用 {@link #optStr} 会把它们
+   * 悄悄变成 null,让调用方以为参数没传。
+   */
+  private static String optStrRaw(JSONObject args, String key) {
+    return args.getString(key);
   }
 
   private static boolean optBool(JSONObject args, String key) {

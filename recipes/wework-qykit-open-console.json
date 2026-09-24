@@ -1,0 +1,36 @@
+{
+  "name": "wework-qykit-open-console",
+  "description": "企业微信后台（work.weixin.qq.com）的「邮件 / 微盘 / 文档 / 会议」是把 exmail.qq.com 等第三方控制台套在跨域 iframe 里。这个配方把绕过步骤固化下来：① list_frames 认 frame；② 从 get_requests 里找主站发 token 的接口（qykit/token）；③ 用同源 execute_js 现取一个未被消费的新 token；④ 用它把控制台当顶层页面打开，之后就能当普通页面读写。**前提是当前页面上那个 qykit 应用入口已经点开过一次**（这样 token 接口才在请求记录里）",
+  "params": {
+    "appPath": "应用入口的路径子串，用于从请求记录里筛出 token 接口，默认 qykit",
+    "consoleHost": "第三方控制台的域名，默认 exmail.qq.com"
+  },
+  "defaults": {
+    "appPath": "qykit",
+    "consoleHost": "exmail.qq.com"
+  },
+  "commands": [
+    {
+      "list_frames": {}
+    },
+    {
+      "get_requests": {
+        "filter": "{{appPath}}",
+        "resourceType": "xhr",
+        "limit": 50
+      }
+    },
+    {
+      "get_browser_state": {
+        "includeFrames": true,
+        "highlight": false,
+        "maxElements": 80
+      }
+    },
+    {
+      "execute_js": {
+        "body": "async () => { const r = await fetch('/wework_admin/apps/qykit/login/tokenAndOAuthCode', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: '' }); const j = await r.json(); const data = j && (j.data || j); const token = data && (data.access_token || data.token || (data.data && data.data.access_token)); return { status: r.status, token: token || null, keys: data ? Object.keys(data) : [] }; }"
+      }
+    }
+  ]
+}

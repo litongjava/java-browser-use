@@ -77,7 +77,7 @@ curl -s http://localhost:10049/playwright/tasks           # 有没有别的任�
 
 - 服务端：`logs/trace/<yyyyMMdd>/`（`steps.log` 时间线、`calls.jsonl` 逐条 JSON、
   `NNNNNN-<任务id>-<方法>.json` 完整请求响应、`uploads.log` 上传记录）。
-- 客户端：仓库里的 `scripts/client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏、
+- 客户端：仓库里的 `client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏、
   `js` 子命令支持 `{{变量}}` 注入）；已有 PowerShell 排查习惯的可以用 `scripts/trace/browse.ps1`。
 - 服务端日志**默认脱敏**（手机号、18 位统一社会信用代码、邮箱、长数字 → `***`），但这是**尽力而为**：
   公司名、门牌号这类认不出来的不会被掩掉，而且日志**不会自动清理**。
@@ -88,11 +88,11 @@ curl -s http://localhost:10049/playwright/tasks           # 有没有别的任�
 中文、引号、换行在手拼 `-d '...'` 时很容易被吃掉（PowerShell 尤其）。稳定写法：
 
 ```shell
-python scripts/client/dsb.py --port 10049 --id 1001 health
-python scripts/client/dsb.py --port 10049 --id 1001 start --browser chrome
-python scripts/client/dsb.py --port 10049 --id 1001 run go_to_url -p url=https://work.weixin.qq.com/wework_admin/frame
-python scripts/client/dsb.py --port 10049 --id 1001 js @回读.js          # 支持 {{变量}} 注入
-python scripts/client/dsb.py --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
+python client/dsb.py --port 10049 --id 1001 health
+python client/dsb.py --port 10049 --id 1001 start --browser chrome
+python client/dsb.py --port 10049 --id 1001 run go_to_url -p url=https://work.weixin.qq.com/wework_admin/frame
+python client/dsb.py --port 10049 --id 1001 js @回读.js          # 支持 {{变量}} 注入
+python client/dsb.py --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
 ```
 
 ## 2. 登录：交给人
@@ -688,8 +688,8 @@ JS 派发 click 和真实鼠标点击**都可能不跳转**。要切页时**直�
 `协作 → 邮件` 打开的是 `exmail.qq.com` 的**跨域 iframe**，有两个后果：
 
 1. `get_browser_state` 的 `data.text` **只包含外层企业微信外壳**，iframe 里一个字都读不到；
-2. 服务**没有 frame 相关方法**（`get_frames` / `list_frames` / `switch_frame` /
-   `execute_js_in_frame` 全部返回「不支持的方法」），所以**没法直接操作 iframe 内部**。
+2. 服务**没有 frame 相关方法**（`get_frames()` / `list_frames()` / `switch_frame()` /
+   `execute_js_in_frame()` 全部返回「不支持的方法」），所以**没法直接操作 iframe 内部**。
 
 **本文的任务（企业信息）不需要进那个 iframe** —— 企业域名绑定走的是 `#profile/domain`，
 是后台自己的路由。**只有在必须操作邮箱控制台时**才需要绕过它，

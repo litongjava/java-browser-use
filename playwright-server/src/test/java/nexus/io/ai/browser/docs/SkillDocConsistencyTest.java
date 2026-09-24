@@ -36,6 +36,10 @@ import nexus.io.ai.browser.actions.registry.CommandTable;
  * </ul>
  *
  * <p>文档不存在时跳过整个类,便于单独拷贝模块构建。
+ *
+ * <p><b>写站点 skill 时的约定</b>(见 {@code skills/README.md}):文档里**单反引号**包起来的东西被当作
+ * 命令名检查,**双反引号**包起来的当作「页面里的名字」不检查。所以 Vue 字段、CSS 类名、HTML id、URL 参数、
+ * 接口字段这些 snake_case 标识符请写成 `` 双反引号 `` 的形式。
  */
 public class SkillDocConsistencyTest {
 
@@ -59,7 +63,27 @@ public class SkillDocConsistencyTest {
   /** 文档里形如 `method_name` 的命令名 */
   private static final Pattern DOC_COMMAND = Pattern.compile("`([a-z][a-z0-9_]{2,})`");
 
-  /** 文档里出现这些词会被当成命令名来比对,但它们不是命令 */
+  /**
+   * 双反引号包住的内容:作者显式声明「这不是命令」
+   *
+   * <p>
+   * <b>为什么要有这个约定</b>:站点操作手册**必然**会大量提到 snake_case 的**非命令标识符** —— Vue 表单
+   * 字段({@code business_license_stuff})、CSS 类名({@code mall_invoice_dialog_container})、HTML
+   * id({@code dsh_up_0})、URL 查询参数({@code order_id})、接口响应字段({@code has_cname_record})。
+   * 而「文档里当作命令写的名字必须真实存在」这条检查靠词形猜,于是每写一个站点 skill 都要把这 20 多处
+   * 改成「加点号 / 加 # / 加对象前缀」的写法 —— **让文档迁就测试**,而且这条规则没有任何地方写明,
+   * 下一个人还会踩。
+   *
+   * <p>现在给作者一个显式标记:用**双反引号**包住的标识符一律不当命令检查,视觉上也能区分
+   * 「这是命令」(单反引号)与「这是页面里的名字」(双反引号)。
+   */
+  private static final Pattern DOUBLE_BACKTICK = Pattern.compile("``.+?``", Pattern.DOTALL);
+
+  /**
+   * 文档里出现这些词会被当成命令名来比对,但它们不是命令
+   *
+   * <p>名单越短越好:能用双反引号声明的,就不该往这里塞。
+   */
   private static final List<String> NOT_COMMANDS = List.of("true", "false", "null", "json", "get", "post", "put",
       "headless", "params", "method", "base64", "png", "txt", "http", "https", "localhost", "curl", "java", "jar",
       "data", "id", "url", "title", "text", "index", "selector", "path", "name", "value", "state", "tabs", "dom",
@@ -71,7 +95,15 @@ public class SkillDocConsistencyTest {
       "clipx", "clipy", "clipwidth", "clipheight", "role", "label", "expression", "seconds", "on",
       // get_browser_state 返回的字段名,不是命令
       "pixels_above", "pixels_below", "viewport_height", "page_height", "state_file", "screenshot_path",
-      "screenshot_error", "outerhtml");
+      "screenshot_error", "outerhtml",
+      // 后来补上的参数名与返回字段:词形像命令,但都是「参数/字段」,文档里必须用单反引号才读得通
+      "includeframes", "includeelements", "maxelements", "frame", "frameindex", "frameurl", "framecount",
+      "stepid", "steps", "expiresat", "ocrtext", "ocrlanguage", "imagebase64", "imagepath", "imageurl",
+      "imagesize", "listeners", "haslisteners", "fileslength", "matchedby", "classname", "previousengine",
+      "previousbrowser", "profileseenbefore", "profilenote", "consumed", "screenshotted");
+
+  /** 逐个技能文档里,作者用 frontmatter 的 nonCommands 声明的非命令名(并入 NOT_COMMANDS) */
+  private static final Pattern NON_COMMANDS_FRONTMATTER = Pattern.compile("(?m)^nonCommands:\\s*\\[(.*?)\\]\\s*$");
 
   private static String doc;
 
@@ -122,7 +154,7 @@ public class SkillDocConsistencyTest {
   @Test
   public void documentedCommandsExist() {
     List<String> unknown = new ArrayList<>();
-    Matcher matcher = DOC_COMMAND.matcher(doc);
+    Matcher matcher = DOC_COMMAND.matcher(stripNonCommands(doc, null));
     while (matcher.find()) {
       String name = matcher.group(1);
       if (NOT_COMMANDS.contains(name.toLowerCase())) {
@@ -140,6 +172,29 @@ public class SkillDocConsistencyTest {
   }
 
   /**
+   * 把「作者显式声明为非命令」的内容从待检查文本里去掉
+   *
+   * <p>两种声明方式(见 {@code DOC_CONVENTIONS}):
+   * <ul>
+   * <li>**双反引号**:``subject_name`` —— 零配置、词法可判,推荐;</li>
+   * <li>frontmatter 的 {@code nonCommands: [a, b]} —— 一份文档里要声明很多个时更整齐。</li>
+   * </ul>
+   */
+  private static String stripNonCommands(String text, Path path) {
+    String stripped = DOUBLE_BACKTICK.matcher(text).replaceAll(" ");
+    Matcher frontmatter = NON_COMMANDS_FRONTMATTER.matcher(stripped);
+    while (frontmatter.find()) {
+      for (String name : frontmatter.group(1).split(",")) {
+        String trimmed = name.trim().replace("`", "");
+        if (!trimmed.isEmpty()) {
+          stripped = stripped.replace("`" + trimmed + "`", " ");
+        }
+      }
+    }
+    return stripped;
+  }
+
+  /**
    * 每一份技能文档里当作命令写的名字都必须真实存在
    *
    * <p>站点操作手册会大量提到命令名,写错一个(例如把 {@code get_tabs} 写成 {@code list_tabs}),
@@ -150,7 +205,7 @@ public class SkillDocConsistencyTest {
     List<String> offenders = new ArrayList<>();
     for (Path path : allSkillDocs()) {
       String text = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
-      Matcher matcher = DOC_COMMAND.matcher(text);
+      Matcher matcher = DOC_COMMAND.matcher(stripNonCommands(text, path));
       while (matcher.find()) {
         String name = matcher.group(1);
         if (NOT_COMMANDS.contains(name.toLowerCase()) || !name.contains("_")) {
@@ -161,7 +216,70 @@ public class SkillDocConsistencyTest {
         }
       }
     }
-    assertTrue("技能文档里写了命令表里不存在的命令:" + offenders, offenders.isEmpty());
+    assertTrue("技能文档里写了命令表里不存在的命令:" + offenders
+        + "（页面里的 snake_case 标识符请用**双反引号**包起来,见 skills/README.md）", offenders.isEmpty());
+  }
+
+  /**
+   * 配方里的命令名也必须真实存在
+   *
+   * <p>{@code recipes/*.json} 里同样写着命令名,写错一个的话 {@code run_recipe} 要到运行时才报
+   * 「不支持的方法」。这里在构建阶段就过一遍 —— 命令表是唯一事实来源,文档与配方都不该各说各话。
+   */
+  @Test
+  public void everyRecipeOnlyMentionsRealCommands() throws IOException {
+    List<Path> recipes = new ArrayList<>();
+    for (Path root : SKILL_ROOTS) {
+      Path dir = root.resolve("recipes");
+      if (!Files.isDirectory(dir)) {
+        continue;
+      }
+      try (java.util.stream.Stream<Path> stream = Files.list(dir)) {
+        stream.filter(path -> path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".json"))
+            .filter(Files::isRegularFile).forEach(recipes::add);
+      }
+      if (!recipes.isEmpty()) {
+        break;
+      }
+    }
+    Assume.assumeTrue("没有找到 recipes/ 目录,跳过", !recipes.isEmpty());
+    List<String> offenders = new ArrayList<>();
+    for (Path path : recipes) {
+      String text = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
+      com.alibaba.fastjson2.JSONObject parsed;
+      try {
+        parsed = com.alibaba.fastjson2.JSON.parseObject(text);
+      } catch (RuntimeException e) {
+        offenders.add(path.getFileName() + " → 不是合法 JSON:" + e.getMessage());
+        continue;
+      }
+      if (parsed == null) {
+        offenders.add(path.getFileName() + " → 不是合法 JSON 对象");
+        continue;
+      }
+      com.alibaba.fastjson2.JSONArray commands = parsed.getJSONArray("commands");
+      if (commands == null) {
+        offenders.add(path.getFileName() + " → 缺少 commands 数组");
+        continue;
+      }
+      for (int i = 0; i < commands.size(); i++) {
+        com.alibaba.fastjson2.JSONObject entry = commands.getJSONObject(i);
+        if (entry == null) {
+          offenders.add(path.getFileName() + " 第 " + i + " 步不是对象");
+          continue;
+        }
+        for (String name : entry.keySet()) {
+          // 允许「一条命令 + 一个 expect 断言」的两键写法
+          if ("expect".equals(name)) {
+            continue;
+          }
+          if (CommandTable.get(name) == null) {
+            offenders.add(path.getFileName() + " 第 " + i + " 步 → " + name);
+          }
+        }
+      }
+    }
+    assertTrue("配方里写了命令表里不存在的命令:" + offenders, offenders.isEmpty());
   }
 
   /** 唯一的端点必须写清楚 */
@@ -187,6 +305,52 @@ public class SkillDocConsistencyTest {
     assertTrue("frontmatter 缺少 description", description != null && description.length() >= 10);
     assertTrue("name 必须是 kebab-case:" + name, name.matches("[a-z0-9]+(-[a-z0-9]+)*"));
     assertEquals("name 必须与技能名一致", SKILL_NAME, name);
+  }
+
+  /**
+   * 「非命令标识符」的声明方式必须真的生效
+   *
+   * <p>这是一种**词法约定**,不是靠维护名单:双反引号里的东西一律不当命令检查。所以这里用一个反例固定
+   * 住它 —— 把「一个并不存在的命令名」放进双反引号里,它就**不该**再被报错。约定一旦失效,下一个人写站点
+   * skill 时又会莫名其妙地失败。
+   */
+  @Test
+  public void doubleBacktickEscapesNonCommandIdentifiers() {
+    String sample = "单反引号是命令:`no_such_command_here`;双反引号是页面里的名字:``no_such_command_here``";
+    List<String> checked = new ArrayList<>();
+    Matcher matcher = DOC_COMMAND.matcher(stripNonCommands(sample, null));
+    while (matcher.find()) {
+      checked.add(matcher.group(1));
+    }
+    assertTrue("单反引号里的名字应当被检查,实际:" + checked, checked.contains("no_such_command_here"));
+    List<String> doubleBackticked = new ArrayList<>();
+    Matcher onlyDouble = DOC_COMMAND.matcher(stripNonCommands("``no_such_command_here``", null));
+    while (onlyDouble.find()) {
+      doubleBackticked.add(onlyDouble.group(1));
+    }
+    assertEquals("双反引号里的名字不该被当成命令,实际:" + doubleBackticked, 0, doubleBackticked.size());
+  }
+
+  /** 站点 skill 写作约定必须写下来,否则「双反引号」这条规则没人知道 */
+  @Test
+  public void skillAuthoringConventionsAreDocumented() {
+    Path readme = null;
+    for (Path root : SKILL_ROOTS) {
+      Path candidate = root.resolve("README.md");
+      if (Files.isRegularFile(candidate)) {
+        readme = candidate;
+        break;
+      }
+    }
+    Assume.assumeTrue("没有找到 skills/README.md,跳过", readme != null);
+    String text;
+    try {
+      text = new String(Files.readAllBytes(readme), StandardCharsets.UTF_8);
+    } catch (IOException e) {
+      throw new AssertionError("读不到 " + readme + ":" + e.getMessage(), e);
+    }
+    assertTrue("skills/README.md 没有写明「双反引号声明非命令」这条约定", text.contains("双反引号"));
+    assertTrue("skills/README.md 没有给出非命令标识符的例子", text.contains("非命令"));
   }
 
   @Test

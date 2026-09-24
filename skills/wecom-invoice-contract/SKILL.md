@@ -61,7 +61,7 @@ POST http://localhost:10049/playwright/command
 
 ```shell
 curl -s http://localhost:10049/playwright/health
-python scripts/client/dsb.py --port 10049 selftest
+python client/dsb.py --port 10049 selftest
 ```
 
 - 服务方法名拿不准就先问它（**别猜**，猜错只会拿到一句「不支持的方法」）：
@@ -92,7 +92,7 @@ python scripts/client/dsb.py --port 10049 selftest
 
 - 服务端：`logs/trace/<yyyyMMdd>/`（`steps.log` 时间线、`calls.jsonl` 逐条 JSON、`NNNNNN-<任务id>-<方法>.json`
   完整请求响应、`uploads.log` 上传记录）。
-- 客户端：`scripts/client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏），或
+- 客户端：`client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏），或
   `scripts/trace/browse.ps1`（PowerShell 习惯）。
 - 追踪日志**默认脱敏**（手机号、18 位证件号/统一社会信用代码、邮箱、长数字 → `***`），但这是**尽力而为**：
   企业名、姓名、门牌号这类认不出来的不会被掩掉。任务结束提醒用户清理（`cleanup`，**默认只预演**）。
@@ -179,7 +179,7 @@ python scripts/client/dsb.py --port 10049 selftest
 
 ### 2.4 两个 id 不是一回事（踩过）
 
-**订单详情页用 `order_id`，合同/签章页用另一个 id，别混用、别互推。**
+**订单详情页用 `?order_id=`，合同/签章页用另一个 id，别混用、别互推。**
 
 | 用途 | URL 形态 | 用哪个 id |
 | --- | --- | --- |
@@ -668,33 +668,50 @@ click_element_by_index 失败：元素不存在或页面已变化,请重新调�
 
 - **结论**：在这个站点上，**能用选择器就别用索引**。索引只适合「刚取完快照、立刻点」的场景。
 
-### 6.3 弹窗：`get_modals` 的选择器不一定命中企业微信自己的弹窗
+### 6.3 弹窗：企业微信自己的弹窗类名要靠启发式兜底才认得出来
 
 - `get_modals` / `close_modal` 是**弹窗的正确工具**（内部走**真实鼠标点击**，
   而 JS 派发在这些控件上常常完全无效）。
-- **但它识别弹窗用的是一套 ant/Element/vxe/layui 的类名规则，企业微信自己的弹窗类名不一定命中。**
-  实测**返回 `data.count = 0` 不等于「没有弹窗」** —— 本次发票弹窗的类名是
-  **`.mall_invoice_dialog_container`**，`get_modals` 认不出来。
+- **这个站点是个很好的例子**：本次发票弹窗的类名是 **`.mall_invoice_dialog_container`**，
+  既不在 ant/Element/vxe/layui 那套类名规则里，也没有 `role=dialog`。
 
-**所以判断「弹窗还在不在」用直接查询更可靠**：
+**服务端现在有三轮扫描兜底**（框架选择器 → 类名线索 → 几何兜底），每条结果都带 `data.matchedBy`
+说明命中来源：
+
+| `matchedBy` | 含义 |
+| --- | --- |
+| `selector:.ant-modal-wrap, .ant-drawer-open` 等 | 框架专用选择器（置信度最高） |
+| `heuristic:class-name` | 类名里有 `dialog`/`modal`/`popup`/`overlay`/… —— **`.mall_invoice_dialog_container` 靠这一轮命中** |
+| `heuristic:fixed-overlay` | 可见 + 够大 + `position:fixed` 或 `z-index > 50` 的几何兜底 |
+
+所以：
+
+- `data.count = 0` 现在是**可信的**（三轮都跑过，`data.scannedBy` 会列出来），不必再怀疑「是不是漏检了」；
+- `data.count > 0` 时看 `matchedBy` 判断置信度：`selector:…` 最可信，`heuristic:…` 是兜底；
+- **弹窗没有标题、也没有 `role=dialog` 时按类名关**：
+  ```json
+  {"close_modal":{"which":"class:mall_invoice_dialog_container"}}
+  ```
+  `get_modals` 返回的每一项都带 `className`，照着填即可。
+
+**仍然建议保留的一手**：用直接查询确认弹窗在不在（它比任何启发式都确定）：
 
 ```js
 !!document.querySelector('.mall_invoice_dialog_container')
 ```
 
-**一套稳妥的组合**：先 `get_modals` 试（能命中就用它的真实鼠标点击），命中不了就自己按类名查 + `mouse_click`：
+**一套稳妥的组合**：先 `get_modals`（拿到 `closePoint`/`buttonPoints` 与 `matchedBy`），
+再用 `close_modal`（真实鼠标 + 关完校验数量）；启发式都命不中时才退回自己算坐标 + `mouse_click`：
 
 ```json
 {"method":"commands","params":{"stopOnError":false,"commands":[
   {"get_modals":{}},
-  {"execute_js":{"body":"(()=>{var d=document.querySelector('.mall_invoice_dialog_container');if(!d)return {none:true};var r=d.getBoundingClientRect();var b=[].slice.call(d.querySelectorAll('a,button')).filter(function(e){return e.innerText.trim()==='取消'})[0];var br=b.getBoundingClientRect();return {x:Math.round(br.left+br.width/2),y:Math.round(br.top+br.height/2)}})()"}},
-  {"mouse_click":{"x":0,"y":0}}
+  {"close_modal":{"which":"class:mall_invoice_dialog_container","button":"取消"}}
 ]}}
 ```
 
-> 上面 `mouse_click` 的坐标要**用上一步回读到的真实值替换**（`x` = `left+width/2`，`y` = `top+height/2`）。
-> **注意坐标顺序**：`mouse_click` 的参数是 `x`,`y`；而很多人在 JS 里会习惯性写成 `top,left`，
-> **别读错** —— `Math.round(r.top)+','+Math.round(r.left)` 是 **top,left**，不是 left,top。
+> 真要走 `mouse_click`：先自己按类名查、算中心坐标，再点。**注意坐标顺序**：`mouse_click` 的参数是
+> `x`,`y`；而很多人在 JS 里会习惯性写成 `top,left`，**别读错**。
 
 ### 6.4 radio 点了要重新读 DOM 才会看到展开的字段
 
@@ -893,7 +910,7 @@ click_element_by_index 失败：元素不存在或页面已变化,请重新调�
 | --- | --- |
 | `<企业全称>` | 认证主体企业名称 |
 | `<18 位统一社会信用代码>` | 纳税人识别号 |
-| `<订单号>` | 订单详情页的 `order_id`（长数字串） |
+| `<订单号>` | 订单详情页的 `?order_id=` 参数（长数字串） |
 | `<订单 id>` | 合同/签章 URL 里的那个 id（**与订单号不同**） |
 | `<管理员姓名>` | 申请人 / 实名认证人 |
 | `<管理员身份证号>` | 实名认证用 |

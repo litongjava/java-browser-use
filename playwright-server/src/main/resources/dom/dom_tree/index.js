@@ -4,10 +4,19 @@
     focusHighlightIndex: -1,
     viewportExpansion: 0,
     debugMode: false,
+    // 多 frame 快照时,每个 frame 单独求值,但索引必须**全局唯一**:调用方按 frame 顺序依次求值,
+    // 每次把「前面几个 frame 已经用掉了多少个索引」当起点传进来(见 DomService.getClickableElements)。
+    // 单 frame 时保持 0,行为与以前完全一致。
+    highlightIndexStart: 0,
+    // 要不要顺着 iframe 递归下去(同源 iframe 才能进)。默认 true,与以前完全一致;
+    // 多 frame 快照会把它设成 false,由调用方**逐个 frame** 求值 —— 否则同源 iframe 的元素会被数两遍
+    // (父 frame 递归一遍、iframe 自己再来一遍),索引也会撞车。
+    descendIframes: true,
   }
 ) => {
-  const { doHighlightElements, focusHighlightIndex, viewportExpansion, debugMode } = args;
-  let highlightIndex = 0; // Reset highlight index
+  const { doHighlightElements, focusHighlightIndex, viewportExpansion, debugMode, highlightIndexStart,
+    descendIframes } = args;
+  let highlightIndex = highlightIndexStart > 0 ? highlightIndexStart : 0; // 从调用方给的起点开始编号
 
   // Add caching mechanisms at the top level
   const DOM_CACHE = {
@@ -1330,16 +1339,22 @@
 
       // Handle iframes
       if (tagName === "iframe") {
-        try {
-          const iframeDoc = node.contentDocument || node.contentWindow?.document;
-          if (iframeDoc) {
-            for (const child of iframeDoc.childNodes) {
-              const domElement = buildDomTree(child, node, false);
-              if (domElement) nodeData.children.push(domElement);
+        // descendIframes=false 时只记下 iframe 本身,不递归进去(同源 iframe 的元素由调用方
+        // 按 frame 逐个求值,避免同一批元素被数两遍、索引撞车)
+        if (descendIframes === false) {
+          // 不递归
+        } else {
+          try {
+            const iframeDoc = node.contentDocument || node.contentWindow?.document;
+            if (iframeDoc) {
+              for (const child of iframeDoc.childNodes) {
+                const domElement = buildDomTree(child, node, false);
+                if (domElement) nodeData.children.push(domElement);
+              }
             }
+          } catch (e) {
+            console.warn("Unable to access iframe:", e);
           }
-        } catch (e) {
-          console.warn("Unable to access iframe:", e);
         }
       }
       // Handle rich text editors and contenteditable elements

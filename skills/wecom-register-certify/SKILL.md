@@ -64,7 +64,7 @@ POST http://localhost:10049/playwright/command
   `NNNNNN-<任务id>-<方法>.json` 完整请求响应、`uploads.log` 上传记录）。
 - 页面留档：`data/<id>/<seq>.png`（截图）与 `data/<id>/<seq>.txt`（同刻的页签 + 可交互结构化文本）。
   **事后复看某一步**直接 GET `http://localhost:10049/data/<id>/<seq>.txt`，比重新跑一遍便宜得多。
-- 客户端：`python scripts/client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏），
+- 客户端：`python client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏），
   写进脚本时用它，不要手拼 `-d '...'`（带中文和引号的 JSON 在 PowerShell 里很容易被吃掉引号，实测 `curl.exe` 会
   返回 `请求体不是合法 JSON：not allow unquoted fieldName`）。
 - **两份日志都默认脱敏但不会自动清理**：手机号、18 位身份证号/统一社会信用代码、邮箱、长数字会被掩成 `***`，
@@ -218,7 +218,7 @@ POST http://localhost:10049/playwright/command
 ```
 
 - **这是「填完对不对」的权威答案**：DOM 上有值、`formData` 里没有，就是没进模型（主技能第 30 条）。
-- `business_license_stuff` 是**数组**，空数组 = 营业执照没上传成功，哪怕页面上看着有图。
+- `formData.business_license_stuff` 是**数组**，空数组 = 营业执照没上传成功，哪怕页面上看着有图。
 
 ### 3.3 主体信息
 
@@ -296,7 +296,25 @@ POST http://localhost:10049/playwright/command
 这个上传用的是自研的 `ImageUploader` 组件，它的 `<input class="uploadInput">` **根本没有监听器**，
 所以任何 JS 派发的 `change` 事件都不会走到组件的 `upload()` 方法里去——文件"进"了 input，但没人读它。
 
-**诊断手法（值得单列，通用）**：Vue 2 把事件回调挂在元素的 `_vei`（invoker 表）上。
+> **现在不用自己摸 `_vei` 了**：服务端已经有 `get_element_listeners`，而且走的是 CDP 的
+> `DOMDebugger.getEventListeners`（浏览器自己报的清单，原生 `addEventListener` 也算），结论比手写
+> `execute_js` 探 `_vei` 可信：
+>
+> ```json
+> {"id":2001,"method":"get_element_listeners","params":{"selector":".uploadInput"}}
+> ```
+> ```json
+> {"ok":true,"data":{"found":true,"tag":"INPUT","hasListeners":false,"detection":"cdp",
+>   "listeners":[],"note":"这个元素**没有任何事件监听器**(浏览器自己报的监听器清单是空的)…"}}
+> ```
+>
+> `upload_file` 的回执里也会带 `data.consumed`（`listened`/`noListener`/`unknown`）与 `data.hint` ——
+> 看到 `noListener` 就**别再重试上传了**，直接跳到 4.2。
+>
+> 下面这段手写 `_vei` 探针保留下来，是因为它能一次把页面上**所有** file input 挨个探一遍（很实用），
+> 而 `get_element_listeners` 一次只探一个元素。
+
+**诊断手法（值得单列，通用）**：Vue 2 把事件回调挂在元素的 `` _vei ``（invoker 表）上。
 
 ```js
 // 判断这个元素到底有没有监听器：_vei 为 null 就说明「JS 派发事件没用」
@@ -403,16 +421,16 @@ POST http://localhost:10049/playwright/command
 ```
 
 - **`stillErr: true` 或 `keys: []` 就是没成**，别因为「页面上看着有图」就往下走。
-- 页面出现「请上传工商营业执照」这句红字，等价于 `form_err` 仍在。
+- 页面出现「请上传工商营业执照」这句红字，等价于 `.form_err` 仍在。
 
 ### 4.4 坑：选错上传输入框
 
-页面上**同时挂着多个 `input[type=file]`**，实测的 id 是 `dsh_up_0` / `dsh_up_1`：
+页面上**同时挂着多个 `input[type=file]`**，实测的 id 选择器是 `#dsh_up_0` / `#dsh_up_1`：
 
 | id | 用途 |
 | --- | --- |
-| `dsh_up_0` | **营业执照**（要的就是这个） |
-| `dsh_up_1` | 补充证明材料（传这里等于白传） |
+| `#dsh_up_0` | **营业执照**（要的就是这个） |
+| `#dsh_up_1` | 补充证明材料（传这里等于白传） |
 
 - 快照里它们都显示成 `<input type=file />`，**看不出区别**。用属性确认：
 
@@ -423,7 +441,7 @@ POST http://localhost:10049/playwright/command
 ]}}
 ```
 
-  实测 `get_element_attribute(index, "id")` 回 `dsh_up_1` —— 这就是传错了。
+  实测 `get_element_attribute(index, "id")` 回 `#dsh_up_1` —— 这就是传错了。
 - **更稳的做法：根本不要按索引传，直接用选择器**（主技能第七节第 7 条）：
   用 `document.querySelectorAll('input[type=file]')` 结合它在 DOM 里的位置/祖先类名挑出营业执照那个，
   给它一个临时 id 再 `upload_file` 传 `selector`。
@@ -431,7 +449,7 @@ POST http://localhost:10049/playwright/command
 
 ### 4.5 坑：目标输入框不在视口里、快照里没有它
 
-- 实测 `dsh_up_0` 一度在**视口上方**（`y = -192`），于是**它不在快照里、没有索引**，
+- 实测 `#dsh_up_0` 一度在**视口上方**（`y = -192`），于是**它不在快照里、没有索引**，
   按索引怎么都传不进去；直到页面布局变化后才出现索引 `[44]`。
 - **原因**：快照只覆盖当前视口，视口外的元素不进快照（主技能第三节的「元素在快照里找不到」）。
 - **应对顺序**：
@@ -497,7 +515,7 @@ POST http://localhost:10049/playwright/command
 | `vmFound: false` | 找不到组件实例 | 换找法：`$children` 递归找带 `upload` 的组件；或确认选择器 `.uploadInput` 是否改版（回读 `vmMethods` 看方法名） |
 | `listKeys` 非空但表单仍空 | 状态没写回 | 补 `vm.emitChange()`（4.2 第 4 点），或直接回读 `formData.business_license_stuff` 确认 |
 | `inputs[]` 里 `inViewport: false`（`y < 0`） | 元素在视口外、**快照里没有索引** | 改用 `selector` 定位（4.5），或 `viewportExpansion` 扩大快照 |
-| `fileCount > 0` 但传的是 `dsh_up_1` | **传错输入框** | 换到营业执照那个（4.4），用 `get_element_attribute(index,"id")` 确认 |
+| `fileCount > 0` 但传的是 `#dsh_up_1` | **传错输入框** | 换到营业执照那个（4.4），用 `get_element_attribute(index,"id")` 确认 |
 
 **纪律**：同一个动作失败两次就换判据、换手段，**不要第三次重试同一个调用**。
 这个站点上「`upload_file` 反复传同一张图」是最典型的无效重试——因为根因在组件监听器上，重试永远不成功。
@@ -558,11 +576,11 @@ POST http://localhost:10049/playwright/command
 逐条核对：
 
 1. `customer_type === "1"`（企业）；
-2. `subject_name` 与营业执照全称逐字一致；
-3. `socialcredit_code` 是 18 位且与营业执照一致；
-4. `business_license_stuff` **非空**（见 4.3）；
+2. `formData.subject_name` 与营业执照全称逐字一致；
+3. `formData.socialcredit_code` 是 18 位且与营业执照一致；
+4. `formData.business_license_stuff` **非空**（见 4.3）；
 5. `legalperson_face_info.verify_result === 1`（见 5.2）；
-6. `mp_operator_phone` / `mp_operator_email` 是用户给的；
+6. `formData.mp_operator_phone` / `formData.mp_operator_email` 是用户给的；
 7. 第 3 步的**企业简称 + 命名依据**已确认（见 3.4）。
 
 ### 6.2 用 `expect` 断言「动作真的生效了」
@@ -676,7 +694,7 @@ POST http://localhost:10049/playwright/command
 | --- | --- |
 | 营业执照不清晰 / 公章不可辨 / 传成了补充材料 | 4.3、4.4 |
 | 企业全称或信用代码与营业执照不一致 | 3.3 |
-| 法人扫脸未通过 / 非法人本人 | 5.2（回读 `verify_result`） |
+| 法人扫脸未通过 / 非法人本人 | 5.2（回读 `formData.legalperson_face_info.verify_result`） |
 | 企业简称不符合命名依据 | 3.4（`801` = 基于全称中的工商字号命名） |
 
 - **退回后一般可以「重新认证」**：订单详情页有 `重新认证` 入口。重新走一遍时，
@@ -722,8 +740,8 @@ POST http://localhost:10049/playwright/command
 
 | 弹窗 | 实际类名 |
 | --- | --- |
-| 发票申请弹窗 | `mall_invoice_dialog_container` |
-| 通用确认框 | `qui_dialog` / `ww_dialog` 之类 |
+| 发票申请弹窗 | `.mall_invoice_dialog_container` |
+| 通用确认框 | `.qui_dialog` / `.ww_dialog` 之类 |
 
 **所以 `get_modals` 返回 `count: 0` 不等于「没有弹窗」**——它只是没命中。这种情况自己扫可见浮层：
 

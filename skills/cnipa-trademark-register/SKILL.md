@@ -93,7 +93,7 @@ return { ua: navigator.userAgent, webdriver: navigator.webdriver,
 - 服务端：`logs/trace/<yyyyMMdd>/`（`steps.log` 时间线、`calls.jsonl` 逐条 JSON、`NNNNNN-<任务id>-<方法>.json` 完整请求响应、`uploads.log` 上传记录）。
 - 客户端：用仓库里的 `scripts/trace/browse.ps1` 按序号成对落盘 `NNN.req.json` / `NNN.res.json`，
   **请求在发出前就落盘**，连「服务没起来、请求没发出去」也看得见。跨平台或要写进脚本时用
-  `scripts/client/dsb.py`（同一套留档格式与脱敏规则，退出码区分传输错/业务失败/用法错）。
+  `client/dsb.py`（同一套留档格式与脱敏规则，退出码区分传输错/业务失败/用法错）。
 - 服务端日志**默认脱敏**（手机号、18 位证件号/统一社会信用代码、邮箱、长数字 → `***`，可用
   `browser.trace.redact` 追加公司名、商标名这类自定义规则），但这是**尽力而为**：姓名、门牌号这类
   认不出来的个人信息不会被掩掉，而且两份日志**都不会自动清理**。任务结束提醒用户清理。

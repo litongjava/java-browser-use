@@ -1,0 +1,41 @@
+{
+  "name": "open-console-from-iframe",
+  "description": "主站把第三方控制台套在跨域 iframe 里时的通用套路：从 iframe.src 反查第三方 URL 与参数，找出主站发 token / 换登录态的接口（按 token / oauth / sso / qykit 过滤 get_requests），用同源 execute_js 现取一个**未被消费的**新 token，再用它把控制台当顶层页面打开。企业微信的邮件/微盘/文档/会议、以及大量「门户套控制台」的站点都是这个形态。注意：直接 go_to_url 打开 iframe 的 src 会失败（token 是一次性的，已被 iframe 消费）",
+  "params": {
+    "iframeMatch": "iframe 的 URL 子串，用来在 list_frames 的结果里认出要进的那个 frame，例如 exmail.qq.com",
+    "tokenField": "主站接口回执里 token 的字段名，默认 data.access_token",
+    "targetUrl": "iframe 的 src（含已被消费的 token）；脚本会把它当模板，只替换 token 参数后重新打开"
+  },
+  "defaults": {
+    "tokenField": "data.access_token"
+  },
+  "commands": [
+    {
+      "list_frames": {}
+    },
+    {
+      "get_requests": {
+        "filter": "token",
+        "limit": 50
+      }
+    },
+    {
+      "execute_js": {
+        "frame": "{{iframeMatch}}",
+        "body": "() => ({ href: location.href, origin: location.origin, title: document.title })"
+      }
+    },
+    {
+      "execute_js": {
+        "body": "() => { const fr = Array.from(document.querySelectorAll('iframe')); const hit = fr.find(f => (f.src || '').includes('{{iframeMatch}}')); return hit ? { src: hit.src, name: hit.name || null, id: hit.id || null } : null; }"
+      }
+    },
+    {
+      "get_browser_state": {
+        "includeFrames": true,
+        "highlight": false,
+        "maxElements": 60
+      }
+    }
+  ]
+}

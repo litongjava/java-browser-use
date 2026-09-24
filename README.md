@@ -317,22 +317,23 @@ Chromium 会走到空白页或 HTTP 400；同一流程在 Firefox 139 下能正�
 配置项：`browser.trace.enabled`（默认开）、`browser.trace.dir`、`browser.trace.maxRecordChars`。
 写盘失败只留警告，不会影响浏览器命令；日志**不做脱敏、不会自动清理**，里面有敏感值时请自行清理。
 
-客户端这一侧还有两个把请求也留档的小脚本：PowerShell 的 `scripts/trace/browse.ps1` 与 Python 的
-`scripts/client/dsb.py`。它们都按序号把发出去的请求（`NNN.req.json`）与收回来的响应（`NNN.res.json`）
+客户端这一侧还有两个把请求也留档的客户端：PowerShell 的 `scripts/trace/browse.ps1` 与 Python 的
+`client/dsb.py`（Windows 上还有一层薄包装 `client/dsb.cmd`，直接敲 `client\dsb.cmd ...` 即可，不必写
+`python` 前缀）。它们都按序号把发出去的请求（`NNN.req.json`）与收回来的响应（`NNN.res.json`）
 成对存进 `logs/agent/<会话>/`，并维护一份 `steps.log`。好处是**请求在发送前就落盘**，连服务没起来、
 请求根本没发出去这种情况也能看出来。
 
-| | `scripts/trace/browse.ps1` | `scripts/client/dsb.py` |
+| | `scripts/trace/browse.ps1` | `client/dsb.py` / `client/dsb.cmd` |
 | --- | --- | --- |
-| 运行环境 | Windows PowerShell | 任意平台的 Python 3（只用标准库） |
+| 运行环境 | Windows PowerShell | 任意平台的 Python 3（只用标准库）；`dsb.cmd` 是 Windows 包装 |
 | 形态 | 传 `-PayloadFile` 发一次请求 | 子命令式 CLI（`start`/`run`/`batch`/`state`/`upload`/`selftest`…）+ 可 import 的库 |
 | 退出码 | 0 业务结果、1 传输失败 | 0 成功 / 1 传输错 / 2 业务失败 / 3 用法错（分得更细，便于写脚本） |
 | 适合 | 已有的 PowerShell 排查习惯、一次性排障 | 跨平台、写进 Python 流程、批量与异步任务 |
 
-`dsb.py` 的完整用法见 `scripts/client/README.md`，装完先跑一次端到端自检：
+`dsb.py` 的完整用法见 `client/README.md`，装完先跑一次端到端自检：
 
 ```bash
-python scripts/client/dsb.py --port 10049 selftest --browser firefox
+python client/dsb.py --port 10049 selftest --browser firefox
 ```
 
 ### driver 与自愈
@@ -536,8 +537,9 @@ deepseek-browser-use/
 │       └── dom/dom_tree/                  DOM 转结构化文本的 JS
 ├── scripts/package/build-release.mjs      发行版打包脚本
 ├── scripts/trace/browse.ps1               客户端侧调用留档脚本(与服务端同一套脱敏规则)
-├── scripts/client/dsb.py                  Python 客户端(CLI + 可 import,只用标准库)
-├── scripts/client/README.md                Python 客户端的用法与退出码约定
+├── client/dsb.py                           Python 客户端(CLI + 可 import,只用标准库)
+├── client/dsb.cmd                          Windows 薄包装(能直接敲 dsb,不必写 python 前缀)
+├── client/README.md                        Python 客户端的用法与退出码约定
 ├── recipes/*.json                          显式 opt-in 的站点配方(run_recipe 用)
 ├── skills/SKILL.md                        给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
 ├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register)

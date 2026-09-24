@@ -32,6 +32,22 @@ public class BrowserInstance {
   public DOMState domState;
 
   /**
+   * 这份快照是什么时候建的(毫秒时间戳)
+   *
+   * <p>
+   * 「索引越界 / 元素已脱离页面」这类报错以前只说现象,不说原因,调用方只能自己想到「是不是快照过期了」。
+   * 记下建快照的时刻,报错时就能直接给出「当前索引来自 12.3 秒前的快照」这种能立刻定位问题的线索。
+   */
+  public volatile long domStateAt;
+
+  /**
+   * 建快照时页面上的 DOM 变更计数
+   *
+   * <p>与 {@link #domStateAt} 配合,报错时能说出「这期间页面发生过 N 次 DOM 变更」——索引失效的真正原因。
+   */
+  public volatile int domStateMutations;
+
+  /**
    * 这个任务自己的页签
    *
    * <p>

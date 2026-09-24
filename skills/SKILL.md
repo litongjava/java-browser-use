@@ -12,7 +12,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 - 启动服务：`java -jar deepseek-browser-use-<版本>-<平台>.jar`（发行包），或开发态在 `playwright-server` 目录执行 `mvn spring-boot:run`
 - **只有一个业务端点**：`POST http://localhost:10049/playwright/command`
 - 另有 `GET /playwright/health`（健康检查）与 `GET /data/**`（读取截图与结构化文本）
-- 共 93 个方法，`get_browser_state` 是阅读页面的入口，其余方法负责操作与观测
+- 共 116 个方法（拿不准就先 `list_methods`），`get_browser_state` 是阅读页面的入口，其余方法负责操作与观测
 
 > ## 省 token 铁律：非必要不要读图
 >
@@ -23,6 +23,28 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 > - 判断「点击到底生效没有」不要靠看图：用点击回执里的 `data.changed`，或用 `diff_dom_text` 比文本差异，都比读图省得多。
 > - **只有文本根本表达不了的时候才看图**：验证码 / 二维码 / 扫码登录、图表与曲线、纯图片按钮或图标、以及文本与操作结果明显矛盾、必须肉眼确认的场合。这时优先用 `get_element_screenshot` **只截那一个元素**，而不是把整页大图读进来。
 > - 确实需要整页图时再用 `screenshot`（**默认落盘、只回路径**；要内联 base64 得显式传 `inline: true`），并且一次任务里尽量只读一张。
+> - **模型读不了图时不要硬撑**：用 `ocr_image` 让服务端用本机 OCR 把图上的文字读出来（见第九节），或 `request_human_input` 请人看一眼。
+
+### 症状 → 命令（先查这张表，别翻一千行）
+
+| 我遇到的情况 | 用哪个命令 / 参数 |
+| --- | --- |
+| **快照里找不到明明在页面上的元素** | 先看 `data.pixels_above` / `data.pixels_below` —— 非 0 就说明元素在视口外、**没有索引**。三条解法按优先级：① `get_browser_state` 传 `viewportExpansion`（例如 `1500`）；② 改用 `click_element_by_selector` / `input_text_by_selector`（不依赖索引）；③ 滚动到目标位置后重取快照 |
+| **整页读完还是空的、元素像不存在**（主站把第三方控制台套在 iframe 里） | `list_frames` 看有哪些 frame；再 `get_browser_state` 传 `includeFrames: true`。见第三节「跨域 iframe」 |
+| 点了没反应，但返回 `ok:true` | 看 `data.changed` / `data.effective`；看 `data.hit`（这次命中的元素）；改用 `click_element_by_text` 复核命中的是不是纯文本容器 |
+| 不确定页面到底动没动 | `diff_dom_text`（不落盘、比重读整页省） |
+| 表单填了但提交说为空 | 看 `data.mode` / `data.committed`；改用 `input_text_by_selector`（可见字段走真实输入，进框架模型） |
+| 上传了但页面没反应 | 看 `upload_file` 回执里的 `data.consumed`（`noListener` 就是这个坑）；用 `get_element_listeners` 复核 |
+| 有弹窗挡住点击 | `get_modals` + `close_modal`（现在有几何兜底，注意每条结果的 `matchedBy` 置信度） |
+| 某个元素到底有没有挂事件 | `get_element_listeners`；`get_interactive_map` 每条也带 `hasListeners` |
+| 需要人扫码 / 输验证码 / 支付确认 | `request_human_input`（一串动作用 `steps` 一次交办） |
+| 模型读不了图，但要读验证码 / 维护图 | `ocr_image`（Windows 自带 OCR，支持中文） |
+| 长批次怕 HTTP 超时 | `commands` 加 `async: true` + `get_job`；或客户端 `batch cmds.json --async --wait` |
+| 手拼 JSON 被引号 / 中文 / 编码坑了（Windows 尤其） | 别硬拼，用仓库里的 `dsb` 客户端：Windows 敲 `.\client\dsb.cmd`，参数进文件用 `batch cmds.json` / `js @脚本.js`，见第一节「也可以不手拼 JSON」 |
+| 索引老是失效 | 「一次快照只做一个动作」，或全程用选择器；报错里已经带上快照的年龄与元素范围 |
+| 换了浏览器之后所有站点都退登录了 | 看 `start` 回执里的 `data.profileSeenBefore` / `data.profileNote`（换引擎等于换一套登录态） |
+| 操作一个 id 得到「没有找到对应的浏览器实例」 | 看报错里的服务启动时间：实例只在内存里，**服务重启即失效**，`list_tasks` 确认后重新 `start` 即可（登录态在 profile 里，不会丢） |
+| 写了新站点 skill，`SkillDocConsistencyTest` 报「命令表里不存在」 | 页面里的 snake_case 标识符（Vue 字段 / CSS 类名 / id / URL 参数）请用**双反引号**包起来，见 `skills/README.md` |
 
 ## 一、请求与响应
 
@@ -73,35 +95,51 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
   -d '{"id":1001,"method":"close"}'
 ```
 
-### 也可以不手拼 JSON：用现成客户端
+### 也可以不手拼 JSON：用现成客户端（**首选**）
 
-手工拼 `-d '...'` 在参数带中文、引号、换行时很容易出错（PowerShell 尤其爱吃掉引号）。仓库里有两个客户端，
-都用**子命令/参数文件**的方式传参，并且都会把「请求 + 响应」留档到 `logs/agent/<会话>/`（默认脱敏）：
+手工拼 `-d '...'` 在参数带中文、引号、换行时很容易出错（PowerShell 尤其爱吃掉引号），返回体还得自己解析。
+仓库里的 `dsb` 客户端把这几件事都替你办了：**子命令式传参**、**批量与异步**、**每一步的请求与响应都留档**。
+凡是「发请求 → 读页面 → 再发请求」的任务，用它比手拼 JSON 少一大类无谓的失败。
 
-| 客户端 | 适合 | 例子 |
-| --- | --- | --- |
-| `scripts/client/dsb.py`（Python 3，只用标准库，跨平台，也可当库 import） | 写进脚本、批量、异步、跨平台 | `python scripts/client/dsb.py --port 10049 start --browser firefox` |
-| `scripts/trace/browse.ps1` | 已有的 PowerShell 排查习惯 | `browse.ps1 -PayloadFile req.json -Session t1` |
+三个客户端（都在仓库里，跟着仓库一起分发）：
 
-`dsb.py` 的要点（完整用法见 `scripts/client/README.md`）：
+| 客户端 | 位置 | 适合 | 例子 |
+| --- | --- | --- | --- |
+| `dsb.py`（Python 3，只用标准库，跨平台，也可当库 import） | 仓库根 `client/dsb.py` | 写进脚本、批量、异步、跨平台 | `python client/dsb.py --port 10049 start --browser chrome` |
+| `dsb.cmd`（Windows 薄包装，透传参数与退出码） | 仓库根 `client/dsb.cmd` | Windows 上少打一截前缀，直接敲就行 | `client\dsb.cmd --port 10049 health` |
+| `browse.ps1` | `scripts/trace/browse.ps1` | 已有的 PowerShell 排查习惯 | `browse.ps1 -PayloadFile req.json -Session t1` |
+
+**Windows 上直接用它，不必写 `python dsb.py`**：`dsb.cmd` 只做两件事 —— 找 `python`（取不到就退回 `py`），
+再把 `%~dp0dsb.py` 连同全部参数交出去，退出码原样 `exit /b` 透传。两点注意：
+
+- 在 **PowerShell** 里当前目录不在 `PATH`，要写成 `.\client\dsb.cmd ...`；在 **cmd.exe** 里 `client\dsb.cmd ...` 就行。
+- `dsb.cmd` 中间隔着一层 cmd.exe，参数里的 `&`、`^`、`%` 可能被提前吃掉（中文与引号不受影响，已验证）。
+  遇到这种参数不要换回别的发送方式，而是**把参数从命令行挪进文件**：`--params @文件.json`、`batch cmds.json`、
+  `js @脚本.js` —— 长脚本、带中文的 JSON、带引号的选择器都走这条路，连转义都不用想。
+
+`dsb` 的要点（完整用法与退出码见 `client/README.md`）：
 
 ```shell
 # 通用选项放子命令前后都行；退出码 0 成功 / 1 传输错 / 2 业务失败 / 3 用法错
-python scripts/client/dsb.py --port 10049 health
-python scripts/client/dsb.py --port 10049 --id 1001 start --browser firefox --headless
-python scripts/client/dsb.py --port 10049 --id 1001 run go_to_url -p url=https://example.com
-python scripts/client/dsb.py --port 10049 --id 1001 state --full          # 标题/URL/元素/结构化文本
-python scripts/client/dsb.py --port 10049 --id 1001 js @脚本.js --var who=dsb   # 支持 {{变量}} 注入
-python scripts/client/dsb.py --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
-python scripts/client/dsb.py --port 10049 --id 1001 recipes --run close-all-modals
-python scripts/client/dsb.py --port 10049 upload 图样.jpg                 # 送文件到服务端暂存区
-python scripts/client/dsb.py --port 10049 last                            # 重放最近一次响应
+python client/dsb.py --port 10049 health
+python client/dsb.py --port 10049 --id 1001 start --browser chrome --headful
+python client/dsb.py --port 10049 --id 1001 run go_to_url -p url=https://example.com
+python client/dsb.py --port 10049 --id 1001 state --full          # 标题/URL/元素/结构化文本
+python client/dsb.py --port 10049 --id 1001 js @脚本.js --var who=dsb   # 支持 {{变量}} 注入
+python client/dsb.py --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
+python client/dsb.py --port 10049 --id 1001 recipes --run close-all-modals
+python client/dsb.py --port 10049 upload 图样.jpg                 # 送文件到服务端暂存区
+python client/dsb.py --port 10049 last                            # 重放最近一次响应
 ```
+
+用它还有两个直接好处：**`steps.log` 一行一次调用**（时间、序号、任务 ID、方法、成败、耗时、摘要），第几步开始
+不对一眼就能看出来；**退出码把「服务没起」与「业务失败」分开**（`1` 与 `2`），写脚本时不用去解析 `msg` 猜。
+Windows 下把上面例子里的 `python client/dsb.py` 换成 `.\client\dsb.cmd` 即可，其余参数完全一致。
 
 不确定服务端现在是什么状态（引擎、profile 目录、命令数、配方数）时，先跑一次自检：
 
 ```shell
-python scripts/client/dsb.py --port 10049 selftest --browser firefox
+python client/dsb.py --port 10049 selftest --browser chrome
 ```
 
 ### 响应格式
@@ -224,6 +262,12 @@ python scripts/client/dsb.py --port 10049 selftest --browser firefox
 - `close` 只关掉这个任务的页签；**最后一个任务关闭时**浏览器才会一起退出（profile 的占用也随之释放）。
 - 实例本身只在内存里，服务重启后 id 失效（登录态在 profile 里，仍在）。
 - `start` 的返回里有 `data.browser`：`type`（这次实际用的浏览器：`chrome`／`edge`／`chromium`／`firefox`）、`chrome`（是否用上了本机 Chrome）、`userProfile`（是否用上了用户自己的 profile）、`engine`、`mode`（`managed` = Playwright 的托管 profile，`cdp` = 服务自己拉进程再接上：用户自己的 Chrome profile 与 `edge` 都是这条）、`executable`、`profileDir`、`profileDirectory`、`headless`，以及服务替你做了退让时的 `note`。**看到 `userProfile=false` 就说明这次不是用户日常那份登录态**，需要登录的站点要重新走登录流程或请人协助；**看到 `type` 不是你要的那个，先看 `note`**（见上节「用哪个浏览器」）。
+- **`data.profileSeenBefore` 与 `data.profileNote` 回答的是另一件事**：`engineHonored:true` 只说明「浏览器参数被采纳了」，**不说明「这份 profile 里有登录态」**。这两个字段直接说清：
+  - `profileSeenBefore:false` → 「该 profile 目录本次是**首次创建**，里面没有任何登录态：任何需要登录的站点都要重新登录一次」；
+  - `profileNote` 里出现「引擎从 X 切到 Y，登录态不通用」→ 换过引擎（Chromium ↔ Firefox 的 profile 格式不通用），需要重新登录；
+  - `profileNote` 里出现「这份 profile 之前用过（上次是 browser=…）」→ 已有登录态应该还在。
+
+  实测踩过：服务端默认引擎被配成 `firefox`，而企业微信 / DNSPod / 腾讯云的登录态都在 **Chromium profile** 里，不知情直接 `start`（不传 `browser`）会起 Firefox，然后「所有站点都退登录了」。看这两个字段就不用事后回想。
 - 服务没有鉴权，默认只监听本机；对外暴露前必须自行加访问控制。
 
 > 登录态不跟着任务 ID 走，而是跟着共享 profile 走：换任务、换 id 都不影响。`userProfile=false` 时用的是托管 profile（`~/.config/browseruse/profiles/shared`），那份 profile 里的登录态是 agent 自己养起来的 —— 第一次登录之后同样会长期保留。
@@ -237,6 +281,9 @@ python scripts/client/dsb.py --port 10049 selftest --browser firefox
 | `id` | 是 | 任务 ID |
 | `highlight` | 否 | 是否在页面上画高亮框，默认 `true`（便于人工观察，不影响返回文本） |
 | `viewportExpansion` | 否 | 视口外扩像素，默认 `0`；想一次拿到首屏之外的更多元素就调大（例如 `1000`） |
+| `includeElements` | 否 | 是否在 `data.elements` 里内联元素清单，默认 `true` |
+| `maxElements` | 否 | 内联条数上限，默认 200 |
+| `includeFrames` | 否 | 是否把**跨域 iframe** 里的元素也纳入快照，默认 `false`。见下面「跨域 iframe」 |
 
 返回字段：
 
@@ -248,7 +295,86 @@ python scripts/client/dsb.py --port 10049 selftest --browser firefox
 | `data.tabs` | 页签数组：`index`（**0 基**）、`url`、`title`、`current` |
 | `data.pixels_above` / `data.pixels_below` | 视口上方/下方还有多少像素没进快照 |
 | `data.viewport_height` / `data.page_height` | 视口高度与整页高度 |
+| `data.frames` / `data.frameCount` | 只有 `includeFrames: true` 时有：每个 frame 的 `index`/`url`/`name`/`isMain`/`depth`/`elementCount`/`indexRange` |
+| `data.frameHint` | 顶层一个可交互元素都没读到、而页面上确实有 iframe 时出现：提示下一步该用 `includeFrames` / `list_frames` |
 | `data.seq` / `data.screenshot` / `data.screenshot_path` / `data.state_file` | 本次落盘的截图与结构化文本，见第四节。**前三个只是截图地址：非必要不要读图**，见开头的省 token 铁律；真正要读的是 `data.text` |
+
+### 跨域 iframe（主站把第三方控制台套在 iframe 里）
+
+**这是最容易被误判成「页面没加载完」的一类站点。** 企业微信后台把「邮件」应用套在 `exmail.qq.com` 的跨域
+iframe 里（微盘 / 文档 / 会议同理），顶层 `document` 里**一个元素都没有**：
+
+| 手段 | 只看顶层文档时的结果 |
+| --- | --- |
+| `get_browser_state` | 只拿到主站外壳，iframe 内部一个元素都没有（`data.text` 几乎是空的） |
+| `execute_js` | 在顶层文档执行，`document.querySelector` 穿不透跨域 iframe |
+| `get_modals` / `get_interactive_map` | 同样只扫顶层 `document` |
+
+**但这不是浏览器能力的限制**：Playwright 本身能跨 frame（它走浏览器协议取内容，不依赖往页面里注入 JS）。
+服务端把 `page.frames()` 暴露出来之后，同一页就能完整读到：
+
+```json
+{"id":"1001","method":"list_frames","params":{}}
+```
+
+```json
+{"ok":true,"data":{"count":2,"frames":[
+  {"index":0,"url":"https://work.weixin.qq.com/wework_admin/frame","name":"","isMain":true,"depth":0,"elementCount":63,"indexRange":"0-62"},
+  {"index":1,"url":"https://exmail.qq.com/mail/mngpage?token=...","name":"","isMain":false,"depth":1,"elementCount":18,"indexRange":"63-80"}]}}
+```
+
+拿到 frame 之后有两种用法：
+
+1. **一次取全（推荐）**：`get_browser_state` 传 `includeFrames: true`。每个 frame 的元素都进**同一个索引空间**，
+   `data.text` 里用 `--- frame[i] <url> elements=N index=a..b ---` 标出边界，`data.elements[]` 每项带 `frameIndex`。
+
+   ```json
+   {"id":"1001","method":"get_browser_state","params":{"includeFrames":true,"highlight":false}}
+   ```
+
+   ```
+   --- frame[0] (main) https://work.weixin.qq.com/wework_admin/frame elements=63 index=0..62 ---
+   [0]<a >首页/>
+   ...
+   --- frame[1] https://exmail.qq.com/mail/mngpage?token=... elements=18 index=63..80 ---
+   [63]<a >概况/>
+   [64]<a >邮箱域名/>
+   [65]<a >邮箱账号/>
+   ```
+
+   > **不加 `includeFrames` 会怎样**：默认快照只纳入**同源** frame（与历史行为一致：以前的服务端脚本本来就会顺着同源 `iframe` 递归）。同源 iframe 里的元素照样有索引、也能被按索引命令点到（服务端会自动路由），只是**跨域** iframe 一个元素都读不到 —— 需要它就传 `includeFrames: true`。只有当页面里确实还有没纳入的跨域 frame 时，回执才会带 `data.frameHint` 指出这一点。只有一个 frame 的普通页面**不会**出现 `--- frame[0] ---` 这行，文本与以前完全一样。
+
+2. **按索引操作会自动路由**：`click_element_by_index` / `input_text` / `get_element_text` … **不需要**传 frame
+   参数——索引里已经带了 frame 信息，服务端会把动作发到索引所属的那个 frame 里。iframe 重新加载过时，服务
+   会按 URL 在当前 frame 树里把 frame 重新认一次，所以同一个快照里的索引不会因为 iframe 刷新就全废。
+
+   点 iframe 里的元素时，点击回执的探针（`data.changed` / `data.effective`）也取在**目标所在的 frame** 里
+   （回执里带 `data.probedFrameUrl`）—— 否则顶层文档一点都不会变，回执永远是 `changed:false`，把「生效了」
+   误报成「没生效」。
+
+3. **按选择器 / 执行 JS 要显式指 frame**：这类命令用的是 `page.locator(...)` / 顶层 `document`，够不着 iframe
+   内部。`click_element_by_selector`、`input_text_by_selector`、`get_element_count`、`wait_for_element`、
+   `upload_file`、`get_element_screenshot`（只接受 `selector` 形式）、`execute_js` 都接受一个可选的 `frame`
+   参数，取值是 frame 序号（0 是主 frame，见 `list_frames`）或 URL / name 子串：
+
+   ```json
+   {"id":"1001","method":"click_element_by_selector","params":{"selector":"a[href*=domain]","frame":"exmail.qq.com"}}
+   {"id":"1001","method":"execute_js","params":{"frame":1,"body":"() => location.href"}}
+   ```
+
+**要点与坑**：
+
+- `list_frames` 默认会顺手重建一次带全部 frame 的快照（`refresh: false` 关掉），所以它返回的 `elementCount` /
+  `indexRange` 就是当前页面的真实情况；`data.frames[]` 里带 `skipped: true` 的那些表示「这次快照没纳入它」，
+  `skipReason` 说明原因。
+- 某个 frame 读不出来（跨域被拒、正在销毁、还没有文档）**不会让整次快照失败**：那个 frame 的
+  `elementCount` 是 0、`readError` 说明原因，其余 frame 照常可用（主站外壳能读到总比整页读不到好）。
+- **`execute_js` 会 await Promise**：脚本返回 Promise（或返回函数）时 Playwright 会等它 settle，所以
+  `async () => { const r = await fetch(...); return r.json(); }` 直接就能拿到结果，**不需要**用已废弃的同步 XHR
+  绕（回执里的 `data.awaited` 恒为 true，说明这次确实等了）。
+- **直接打开 iframe 的 `src` 往往打不开**：很多第三方控制台的 URL 里带的是**一次性 token**，已经被 iframe
+  消费掉了，再 `go_to_url` 打开会 500 或回到登录页。要绕过的话得从主站的发 token 接口现取一个，见第十二节
+  的 `wework-qykit-open-console` 配方。
 
 ### 页签信息文本块
 
@@ -383,10 +509,11 @@ current tab is: 1
 | --- | --- | --- |
 | `navigate` | `id`, `url` | 返回 `data.status` |
 | `go_to_url` | `id`, `url` | 与 `navigate` 等价 |
-| `get_browser_state` | `id`, `highlight`, `viewportExpansion` | 见第三节 |
+| `get_browser_state` | `id`, `highlight`, `viewportExpansion`, `includeElements`, `maxElements`, `includeFrames` | 见第三节 |
+| `list_frames` | `id`, `refresh`(bool，默认 true) | 列出页面上的**全部 frame**（含跨域 iframe）：`data.frames[]`（`index`/`url`/`name`/`isMain`/`parentIndex`/`depth`/`elementCount`/`indexRange`；读不出来的 frame 另有 `readError`）。`index 0` 固定是主 frame，其余按 frame 树深度优先编号。**顶层读不到元素时先看它**，见第三节「跨域 iframe」 |
 | `get_page_snapshot` | `id`, `includeConsole`(bool), `includeRequests`(bool), `requestFilter` | 一次拿到页面状态：`data.url`、`data.title`、`data.tabs`、`data.dialog`、`data.loading`；`includeConsole=true` 再带 `data.logs`/`data.errors`，`includeRequests=true` 再带 `data.requests`（可用 `requestFilter` 按 URL 子串过滤）。替代六次单独调用，**不含 DOM 快照文本** |
 | `diff_dom_text` | `id`, `highlight`, `viewportExpansion` | 重新执行一次 buildDomTree，与上一次快照按行做差集：`data.changed`、`data.added`、`data.removed`（各最多 200 行）、`data.first`。判断「页面到底动没动」比重读整页省 token。**不产生新的截图/文本文件** |
-| `get_interactive_map` | `id` | 按当前快照的 xpath 回查全部元素，返回 `data.elements`：`index`、`tag`、`xpath`、`id`、`className`、`href`、`name`、`text`。补上快照里没有的 `id`/`class`/`href`；需要先有快照 |
+| `get_interactive_map` | `id` | 按当前快照的 xpath 回查全部元素，返回 `data.elements`：`index`、`tag`、`xpath`、`id`、`className`、`href`、`name`、`text`，以及 **`hasListeners`**（这个元素有没有挂事件监听器：`true`/`false`/`null`=未知）与 **`listeners`**（事件名数组）。带 frame 的快照里每项还有 `frameIndex`/`frameUrl`。补上快照里没有的 `id`/`class`/`href`；需要先有快照 |
 | `get_form_state` | `id`, `selector`(可选，默认整页), `includeHidden`(bool，默认 false), `max`(可选，默认 200) | 一次读回整张表单：`data.fields`（每项含 `label`/`id`/`name`/`type`/`value`/`checked`/`disabled`/`readOnly`/`required`/`visible`/`invalid`/`error`/`placeholder`）、`data.count`、`data.errorCount`、`data.errors`（`label`+`error` 清单）。**密码字段的值一律回 `[redacted]`** |
 
 `get_form_state` 是用来「填完一屏后对一遍」的：
@@ -416,7 +543,7 @@ current tab is: 1
 | `type_text` | `id`, `index`, `text` | 逐字输入，**不清空**原有内容 |
 | `input_text` | `id`, `index`, `text`, `mode`(可选) | 覆盖式填充（等价 `fill`，会清空）；`text` 必填，**清空请用 `clear_text`** |
 | `drag_element_by_index` | `id`, `index`, `targetIndex` | 把第 index 个元素拖到第 targetIndex 个元素 |
-| `upload_file` | `id`, `path`, `index` 或 `selector`(二选一), `timeoutMs`(可选) | `path` 是**服务器本地路径**：绝对路径直接用，相对路径按服务端暂存目录解析（见下面的「上传文件」） |
+| `upload_file` | `id`, `path`, `index` 或 `selector`(二选一), `timeoutMs`(可选), `frame`(可选) | `path` 是**服务器本地路径**：绝对路径或按服务端暂存目录解析的相对路径（见下面的「上传文件」）。**上传完会回读校验**，见下 |
 | `send_keys` | `id`, `keys` | 键盘按键：`Enter`、`Tab`、`Control+A`、`ArrowDown` |
 | `key_down` | `id`, `keys` | 按住不放（配合 `key_up`） |
 | `key_up` | `id`, `keys` | 松开按键 |
@@ -471,6 +598,30 @@ curl -H "Content-Type: application/json" \
 - 单文件上限默认 64MB（`browser.upload.maxBytes`），同名默认覆盖（`browser.upload.overwrite=false` 则自动改名 `a-1.jpg`）。暂存目录默认 `<启动目录>/upload`，`start` 的返回里能看到实际路径。
 - 文件不存在时错误信息会直接告诉你去 `POST /playwright/upload`，不要再去猜路径。
 - 上传动作也会写进追踪日志的 `uploads.log`（只记元数据，不记内容）。
+- file input 在跨域 iframe 里时传 `frame`（序号见 `list_frames`，或 URL/name 子串）。
+
+##### 上传回执会回读校验：`mode:"native"` **不等于**「页面处理了它」
+
+`setInputFiles` 的语义只是「把文件放进 input」，**页面有没有消费完全是另一回事**。实测企业微信后台的营业执照上传：`upload_file` 回 `ok:true`，页面却一直停在「请上传工商营业执照」——根因是那个 `<input class="uploadInput">` **没有挂任何事件监听器**（Vue 2 的 `` _vei `` 是空的），`setInputFiles` 把 `input.files` 设好了，但派发的 `change` 到不了框架的 handler，组件的 `upload()` 从来没被调用。
+
+这类「报成功但没生效」比报错危险得多——它会让人去错的方向排查（换选择器、换文件、怀疑上传接口）。所以回执里现在会一起回来：
+
+| 字段 | 含义 |
+| --- | --- |
+| `data.filesLength` | input 里现在有几个文件（正常应当是 1） |
+| `data.listeners` | `{vue2, vue3, react, inline, jquery, events}` —— 这个 input 挂了哪些事件；全为 `false` 就是「这个 input 没人监听」 |
+| `data.hasListeners` | 三态：`true` 有 / `false` 确认没有 / `null` 未知（见下面「hasListeners 的三态」） |
+| `data.listenerDetection` | `cdp`（浏览器自己报的清单，可信）/ `heuristic`（只探到框架痕迹） |
+| `data.consumed` | 启发式结论：`listened` / `noListener` / `unknown` |
+| `data.hint` | `noListener` / `unknown` 时给一句**可直接操作**的提示 |
+| `data.changed` / `data.changeStatus` | 上传前后页面有没有变化（探针取在 file input 所在的那个 frame 里） |
+| `data.effective` | `consumed=noListener` 且页面没变化时为 `false` —— 这次上传**没生效** |
+
+看到 `data.consumed: "noListener"`（或 `hasListeners: false`）就**不要再去调选择器**了，正解是：
+
+1. 用 `get_element_listeners` 复核一次（`selector` 或 `index` 都行）；
+2. 改用**组件方法直调**：`execute_js` 里拿到页面上的 Vue 实例，直接调它的 `upload()` / `emitChange()`（企业微信那个 `ImageUploader` 就是这么绕过去的，见 `skills/wecom-register-certify`）；
+3. 或先点它的可见父元素 / 触发框架自己的入口，再上传。
 
 ### 读取元素信息与状态（按索引）
 
@@ -480,18 +631,39 @@ curl -H "Content-Type: application/json" \
 | `get_element_html` | `id`, `index` | `data.html`（innerHTML） |
 | `get_element_value` | `id`, `index` | `data.value`（输入框的 value） |
 | `get_element_attribute` | `id`, `index`, `name` | `data.value`（属性值，可为 null） |
-| `get_element_count` | `id`, `selector` | `data.count`（CSS 选择器匹配数量，不需要索引） |
+| `get_element_listeners` | `id`, `index` 或 `selector`(二选一), `frame`(可选) | 这个元素挂了哪些事件监听器：`data.found`、`data.tag`/`className`/`type`、`data.vue2`/`vue3`/`react`/`inline`/`jquery`、`data.listeners`（事件名数组）、`data.hasListeners`、`data.detection`（`cdp` = 浏览器自己报的清单，可信；`heuristic` = 只探到框架痕迹）、`data.note`。**「有没有挂事件」是 SPA 自动化的基础诊断信息**，凡「设了值/派发了事件但页面没反应」先查它 |
+| `get_element_count` | `id`, `selector`, `frame`(可选) | `data.count`（CSS 选择器匹配数量，不需要索引） |
 | `get_element_box` | `id`, `index` | `data.x/y/width/height`；元素不可见时失败 |
 | `is_visible` | `id`, `index` | `data.visible` |
 | `is_enabled` | `id`, `index` | `data.enabled` |
 | `is_checked` | `id`, `index` | `data.checked` |
 
+##### `hasListeners` 的三态，以及它为什么不能瞎猜
+
+`hasListeners` 有三种取值，**别把 `null` 当成 `false`**：
+
+| 值 | 含义 | 怎么来的 |
+| --- | --- | --- |
+| `true` | 确认有监听器 | CDP 报的清单非空，或探到了框架痕迹（Vue `_vei` / React props / 内联 `on*` / jQuery） |
+| `false` | **确认没有**监听器 | 只有 CDP（`data.detection: "cdp"`，Chromium 系）才给得出这个结论：浏览器自己报的清单是空的 |
+| `null` | **未知** | 既没走 CDP、也没探到框架痕迹。原生 `addEventListener` 在元素上**不留任何可枚举痕迹**，所以「没探到」绝不等于「没有」 |
+
+所以：
+
+- **`get_element_listeners` 在 Chromium 系上走 CDP 的 `DOMDebugger.getEventListeners`**（`data.detection: "cdp"`），
+  这是浏览器自己报的清单，原生 `addEventListener` 也算，结论可信 —— P2 那个「input 没人监听」就是靠它一眼看出来的。
+- **Firefox / CDP 不可用时退回启发式**（`data.detection: "heuristic"`）：探到框架痕迹才敢说 `true`，
+  否则只能报 `null`（未知）并给一句提示。
+- **元素清单（`get_interactive_map` / `get_browser_state` 的 `data.elements`）里的 `hasListeners` 是启发式的**
+  —— 对每个元素都开一次 CDP 会话太贵。所以那里只会是 `true`（探到痕迹）或 `null`（未知），**永远不会是 `false`**；
+  要确认「确实没人监听」就单独对那个元素调一次 `get_element_listeners`。
+
 ### 按选择器 / 文本 / 语义定位（快照过期时的兜底）
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `click_element_by_selector` | `id`, `selector`, `mode`(可选), `timeoutMs`(可选) | CSS 选择器取第一个匹配并点击；**点完如果弹出新页签会自动切过去并带到最前**；返回点击回执 |
-| `input_text_by_selector` | `id`, `selector`, `text`, `mode`(可选) | 覆盖式填充。**可见字段默认走真实输入**（进框架模型），这是「值填了但预览/校验说为空」时的正解 |
+| `click_element_by_selector` | `id`, `selector`, `mode`(可选), `timeoutMs`(可选), `frame`(可选) | CSS 选择器取第一个匹配并点击；**点完如果弹出新页签会自动切过去并带到最前**；返回点击回执。目标在跨域 iframe 里时传 `frame` |
+| `input_text_by_selector` | `id`, `selector`, `text`, `mode`(可选), `frame`(可选) | 覆盖式填充。**可见字段默认走真实输入**（进框架模型），这是「值填了但预览/校验说为空」时的正解 |
 | `click_element_by_text` | `id`, `text`, `mode`(可选) | 按可见文本定位。**先向上找最近的可点击祖先**（`a`/`button`/`[role=button]`/`[onclick]`），找不到才点文本节点本身；返回真正命中的 `data.tag`/`data.outerHtml` 与点击回执 |
 | `click_element_by_role` | `id`, `role`, `name`(可选), `mode`(可选) | 无障碍角色，`role` 如 `button`、`link`、`textbox`、`checkbox`；返回命中的 `data.tag`/`data.outerHtml` 与点击回执 |
 | `input_text_by_label` | `id`, `label`, `text`, `mode`(可选) | 按表单标签 / `aria-label` 定位输入框 |
@@ -607,14 +779,27 @@ curl -H "Content-Type: application/json" \
 | `get_dialog` | `id`, `consume`(bool) | 返回 `data.dialog`（`type/message/defaultValue/seq/timestamp`）或 null。**记录不会自动清除**，可能是很早以前的弹窗；`consume=true` 读后即清。`get_js_dialog` 是它的同义名 |
 | `clear_dialog` | `id` | 清空弹窗记录，返回 `data.cleared`。`clear_js_dialog` 是它的同义名 |
 | `set_dialog_behavior` | `id`, `dismiss`(bool) | 弹窗**默认自动确认**；`dismiss=true` 改成自动取消 |
-| `get_modals` | `id` | 列出当前可见的 DOM 弹窗：`data.count`、`data.modals[]`（`kind`/`title`/`text`/`buttons`/`buttonPoints`/`hasClose`/`closePoint`/`rect`/`zIndex`）、`data.top`（最后弹出来的那个） |
+| `get_modals` | `id` | 列出当前可见的 DOM 弹窗：`data.count`、`data.modals[]`（`kind`/`matchedBy`/`className`/`id`/`title`/`text`/`buttons`/`buttonPoints`/`hasClose`/`closePoint`/`rect`/`zIndex`/`frameIndex`）、`data.top`（最后弹出来的那个）、`data.scannedBy`（跑了哪几轮扫描）。**主 frame 与每个 iframe 各扫一遍**，iframe 里的坐标已换算成主页面视口坐标 |
 | `close_modal` | `id`, `which`(可选，默认 `top`), `title`(可选), `button`(可选) | 关掉 DOM 弹窗。**一律用真实鼠标点**，并且点完**校验数量是否真的减少**，返回 `data.closed`、`data.countBefore`、`data.countAfter`、`data.clicked` |
 | `get_console_logs` | `id` | 返回 `data.logs` 与 `data.errors`，各最多 200 条 |
 | `clear_console_logs` | `id` | 清空 |
 
 **`get_dialog` 是「最近一次弹窗」而不是「当前这一步的结果」**：实测提交验证码失败过一次之后，后面查询明明成功了，`get_dialog` 仍然返回上一轮的「验证码输入错误」，很容易误判成这次也失败了。判断弹窗是不是新的看 `data.dialog.seq`/`timestamp`；稳妥做法是**每次提交动作前先 `get_dialog` 加 `consume: true` 清一次**，动作后再读。
 
-**DOM 弹窗用 `get_modals` / `close_modal`，不要自己写 JS 点它**：`close_modal` 的 `which` 取 `top`（默认）/ `first` / `all`，`title` 按标题或文本子串匹配（给了就以它为准），`button` 指定点哪个按钮（不给则优先右上角 ×，其次「取消/关闭/知道了/我接受」这类非提交按钮）。反复点一个关不掉的弹窗会把确认框**一层层叠起来**（实测叠到 16 个），之后所有「取第一个可见弹窗」的逻辑都在操作最老的那个——所以要看 `data.closed`：为 `false` 说明点了但数量没减少，这时用 `get_modals` 拿 `closePoint`/`buttonPoints`，再 `mouse_click` 那个坐标。
+**DOM 弹窗用 `get_modals` / `close_modal`，不要自己写 JS 点它**：`close_modal` 的 `which` 取 `top`（默认）/ `first` / `all` / `class:<子串>`，`title` 按标题或文本子串匹配（给了就以它为准），`button` 指定点哪个按钮（不给则优先右上角 ×，其次「取消/关闭/知道了/我接受」这类非提交按钮）。反复点一个关不掉的弹窗会把确认框**一层层叠起来**（实测叠到 16 个），之后所有「取第一个可见弹窗」的逻辑都在操作最老的那个——所以要看 `data.closed`：为 `false` 说明点了但数量没减少，这时用 `get_modals` 拿 `closePoint`/`buttonPoints`，再 `mouse_click` 那个坐标。
+
+**`get_modals` 有通用兜底，不会再漏检自定义类名的弹窗。** 它按三轮扫描，每条结果的 `matchedBy` 说明命中来源：
+
+| `matchedBy` | 怎么命中的 | 置信度 |
+| --- | --- | --- |
+| `selector:.ant-modal-wrap, .ant-drawer-open` 等 | 框架专用选择器（ant-design / element-ui / vxe / layui / 协议层） | 最高 |
+| `heuristic:class-name` | 类名里有 `dialog`/`modal`/`popup`/`overlay`/`mask`/`confirm`… 这类词 | 较高：企业微信 / 微信系的自有类名（``qui_dialog``、``ww_dialog``、``mall_invoice_dialog_container``）靠它命中 |
+| `heuristic:fixed-overlay` | 可见 + 面积够大 + `position:fixed` 或 `z-index > 50` 的几何兜底 | 一般：只用来兜底，可能多列出一条整页遮罩 |
+
+- 启发式扫描只保留**最内层**的候选：包住另一个候选的元素通常是整页遮罩，真正带标题和按钮的是它里面那个。
+- 所以 `data.count: 0` 现在是可信的（三种扫描都跑过，`data.scannedBy` 会告诉你跑了哪几种）；但 `count > 0` 时要看 `matchedBy` 判断是不是真弹窗。
+- **弹窗没有标题、也没有 `role=dialog` 时**用类名关：`{"close_modal":{"which":"class:mall_invoice_dialog_container"}}`。`get_modals` 的每项都带 `className`，照着填即可。
+- 弹窗在 iframe 里也能被找到（每项带 `frameIndex`），坐标已经换算成主页面视口坐标，`close_modal` 的鼠标点击因此仍然有效。
 
 ### 网络
 
@@ -656,9 +841,10 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `request_human_input` | `id`, `prompt`, `index`(可选), `selector`(可选), `timeoutSeconds`(可选) | 发起一个人工介入请求。传 `index` 或 `selector` 时把该元素（通常是验证码图）截成 `data.imageBase64` 一起返回，并把当前页签带到最前。返回 `data.requestId`、`data.prompt`、`data.expiresAt`（默认 300 秒）、`data.url` |
-| `submit_human_input` | `id`, `requestId`, `answer` | 提交人工答复，返回 `data.status` 与 `data.answer` |
-| `get_human_input` | `id`, `requestId`, `timeoutSeconds`(可选) | 取人工答复，返回 `data.status`（`pending`/`answered`/`expired`）、`data.answer`、`data.prompt`。传 `timeoutSeconds` 时长轮询等待，到时间还没答复就返回当前状态（**不算失败**） |
+| `request_human_input` | `id`, `prompt`, `index`(可选), `selector`(可选), `timeoutSeconds`(可选), `steps`(可选), `expiresAt`(可选), `ocr`(可选), `ocrLanguage`(可选), `inline`(可选) | 发起一个人工介入请求。传 `index`/`selector` 时把该元素（通常是验证码图）截下来，并**同时**回 `data.imageBase64`、`data.imagePath`（服务端本地路径）、`data.imageUrl`（可直接 GET 的地址，能贴给用户）；还把当前页签带到最前。返回 `data.requestId`、`data.prompt`、`data.expiresAt`、`data.expiresInSeconds`、`data.url` |
+| `submit_human_input` | `id`, `requestId`, `answer`, `stepId`(可选), `answers`(可选) | 提交人工答复。单步请求直接给 `answer`；多步请求（`steps`）用 `stepId` 逐条回填，或 `answers: {"s1":"...","s2":"..."}` 一次回填多步 |
+| `get_human_input` | `id`, `requestId`, `timeoutSeconds`(可选) | 取人工答复，返回 `data.status`（`pending`/`partial`/`answered`/`expired`）、`data.answer`、`data.steps`、`data.prompt`。传 `timeoutSeconds` 时长轮询等待，到时间还没答复就返回当前状态（**不算失败**）。过期时另给 `data.expired:true` 与提示 |
+| `ocr_image` | `id`, `path`(可选), `index`/`selector`(可选), `frame`(可选), `language`(可选) | 用**本机 OCR**（Windows 自带 `Windows.Media.Ocr`）把图上的文字读出来：`data.ok`、`data.text`、`data.lineCount`、`data.imagePath`/`data.imageUrl`。给 `path` 读服务端已有的一张图；给 `index`/`selector` 则先截这个元素再读。默认语言 `zh-Hans-CN`。**模型读不了图时的兜底**，见第九节 |
 
 完整流程见第九节。
 
@@ -667,7 +853,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
 | `extract_structured_data` | `id`, `query`, `extractLinks`(bool) | 返回 `data.text`（正文，最多 20000 字符，读取时会临时隐藏高亮层）与 `data.links` |
-| `execute_js` | `id`, `body` 或 `bodyFile`, `vars`(可选) | 返回 `data.result`，见第八节 |
+| `execute_js` | `id`, `body` 或 `bodyFile`, `vars`(可选), `frame`(可选) | 返回 `data.result`，见第八节。**会 await Promise**；在跨域 iframe 里执行要传 `frame` |
 | `commands` | `id`, `params.stopOnError`, `params.commands`, `params.async`(可选) | 批量指令，是 `method` 的一个取值，见第七节 |
 
 ### 服务自省（不知道有什么能力时先问它）
@@ -796,6 +982,14 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 - 返回值必须是 JSON 可序列化的；DOM 元素不报错，但只会得到 `ref: <Node>`，请先转成 `textContent`、`outerHTML`、`value`。
 - 脚本报错时返回 `code:0`，`msg` 形如 `execute_js 失败：执行 JavaScript 失败：TypeError: Cannot read properties of null (reading 'click')`（只有异常首行，没有堆栈）。
 - `body` 长度上限 100000 字符；脚本**没有超时**。
+- **`execute_js` 一定会 await Promise**（回执里的 `data.awaited` 恒为 `true`）：脚本返回 Promise 时会等它 settle，返回函数时会先调用再等。所以需要现取一个接口值时直接写 `async () => { const r = await fetch(url, {credentials:'same-origin'}); return r.json(); }`，**不要**再用已废弃的同步 XHR（`x.open(..., false)`）去绕——它会阻塞渲染线程，而且没有理由。
+- **在跨域 iframe 里执行要传 `frame`**：不传时脚本跑在顶层文档，`document.querySelector` 穿不透 iframe。取值是 frame 序号（0 是主 frame，见 `list_frames`）或 URL / name 子串：
+
+  ```json
+  {"id":1001,"method":"execute_js","params":{"frame":"exmail.qq.com","body":"async () => (await fetch('/cgi-bin/x',{credentials:'same-origin'})).json()"}}
+  ```
+
+  回执里会带上 `data.frame` 与 `data.frameUrl`，便于确认这次到底在哪个文档里跑的。
 - 与 `get_browser_state` 的分工：**读页面优先用 `get_browser_state`**（结构化、带索引、token 可控）；`execute_js` 用于取快照里没有的东西（`id`/`class`/`href`、滚动位置、localStorage 原始值）或做特殊交互。
 
 ### 用 `bodyFile` + `vars` 传长脚本（客户端-服务器模式下必看）
@@ -834,16 +1028,53 @@ document.querySelector('#kw').value = 'x'                     // 直接赋值
 
 | 步骤 | 调用 | 做什么 |
 | --- | --- | --- |
-| 1 | `request_human_input`，`prompt=请输入图片验证码`，`index=7`，`timeoutSeconds=300` | 建一个待办；`index`/`selector` 指向验证码图时把图截成 `data.imageBase64` 返回，同时把页签带到窗口最前 |
+| 1 | `request_human_input`，`prompt=请输入图片验证码`，`index=7`，`timeoutSeconds=300` | 建一个待办；`index`/`selector` 指向验证码图时把图截下来，回 `data.imageBase64`、`data.imagePath`、`data.imageUrl` 三份，同时把页签带到窗口最前 |
 | 2 | 人看图 → 把答案回填 | 通过 `submit_human_input`（`requestId` + `answer`）提交；**或者**直接在有头浏览器里自己把这一步操作完 |
-| 3 | `get_human_input`，`requestId=hr-1-xxx`，`timeoutSeconds=60` | 取答复。`data.status` 为 `pending` / `answered` / `expired` |
+| 3 | `get_human_input`，`requestId=hr-1-xxx`，`timeoutSeconds=60` | 取答复。`data.status` 为 `pending` / `partial` / `answered` / `expired` |
+
+**模型读不了图怎么办**（``read_image`` 报 ``model ... does not declare image input`` 时）：这是「必须看图」环节最容易卡住的地方。三条路，按顺序试：
+
+1. **先让服务端自己读**：`ocr_image`（或 `request_human_input` 加 `ocr: true`）用本机 OCR（Windows 自带 `Windows.Media.Ocr`）直接把图上的文字返回，识别中文需要系统装了对应语言包。验证码这类印刷体字符识别率不错，能自己答就直接答，省掉一次人工往返：
+
+   ```json
+   {"id":1001,"method":"ocr_image","params":{"selector":"#imgVerify","language":"zh-Hans-CN"}}
+   # {"ok":true,"data":{"ok":true,"text":"8f3k","lineCount":1,"imagePath":"...","imageUrl":"/data/1001/shot-3.png"}}
+   ```
+
+   回执里 `data.ok:false` 且带 `data.engineMissing:true` 时说明这台机器没装 OCR 语言包（会列出已装的），这时才走下一步。
+2. **把 `data.imageUrl` 贴给用户**（比本地路径好用：用户自己就能打开），让用户在对话里告诉你内容。
+3. **请人直接在有头浏览器里操作**（扫码、滑块这类本来也只能人做）。
+
+**多步人机协同用 `steps` 一次交办**：扫码 + 输码 + 支付确认是**一串**动作，每次单独发起「请求 + 等待 + 取答复」要来回好几趟，中间还容易超时。用 `steps` 把待办列出来，人一次做完：
+
+```json
+{"id":1001,"method":"request_human_input","params":{
+  "prompt":"需要你完成三步：扫码登录、输入短信码、确认支付",
+  "steps":[
+    {"prompt":"用微信扫码登录","selector":"#qrcode"},
+    {"prompt":"输入收到的 6 位短信码","selector":"#smsCode"},
+    {"prompt":"在浏览器里确认支付 ¥300"}]}}
+# 回执：data.steps = [{stepId:"s1",prompt:"...",status:"pending",selector:"#qrcode"}, ...]
+
+# 人做完一步就回填一步（也可以一次回填多步）
+{"id":1001,"method":"submit_human_input","params":{"requestId":"hr-1-xxx","stepId":"s1","answer":"已扫码"}}
+{"id":1001,"method":"submit_human_input","params":{"requestId":"hr-1-xxx","answers":{"s2":"582913","s3":"已支付"}}}
+# 还有步骤没回填时 data.status 是 partial（并给出 data.pendingSteps）；全部回填后才是 answered
+```
+
+**短时效凭证用 `expiresAt` 明说**：二维码、短信码的有效期常常只有一两分钟，默认的 300 秒等待纯属浪费，事后也无从判断「是不是等的时候早就过期了」。传绝对过期时刻，过期后 `get_human_input` 会直接回 `data.status:"expired"` 与 `data.expired:true`，附带一句「重新发起」的提示，而不是让人干等：
+
+```json
+{"id":1001,"method":"request_human_input","params":{
+  "prompt":"请扫码登录","selector":"#qrcode","expiresAt":1750000000000}}
+```
 
 要点：
 
 - **`get_element_screenshot` 是这套流程的地基**：没有它，`request_human_input` 也没东西可以给人看。要单独把图拿出来（不发起人工请求）就直接调它。
-- `data.imageBase64` 是 PNG 的 base64，需要向用户展示验证图片时可以使用；取到图片不代表验证已完成。
+- `data.imageBase64` 是 PNG 的 base64，需要向用户展示验证图片时可以使用；`data.imagePath` 是服务端本地路径，`data.imageUrl` 是可以直接 GET 的地址（贴给用户最方便）。取到图片不代表验证已完成。
 - 用户直接在浏览器里操作不会自动更新人工请求记录，`get_human_input` 可能仍为 `pending`。不要只等该字段，也不能直接跳过验证：重新读取页面，确认登录或验证已成功后才继续后续步骤；一般页面变化本身不足以证明验证成功。
-- **验证码有时效**：实测税务系统的图片验证码约 **120 秒**过期，而且**一次性**（用过的码再提交必然失败）。所以拿到答复后要**立刻**提交，不要攒着；提交失败先换一张新图再让人看，别拿旧码重试。
+- **验证码有时效**：实测税务系统的图片验证码约 **120 秒**过期，而且**一次性**（用过的码再提交必然失败）。所以拿到答复后要**立刻**提交，不要攒着；提交失败先换一张新图再让人看，别拿旧码重试。用 `expiresAt` 把这件事写进请求里。
 - **登录态跟着共享 profile 走，不跟任务 ID 走**：所有任务用的是同一份 profile（`data.browser.profileDir`），换任务、换 id 都不影响；是否仍有效由网站决定，登录过期时再次请求用户协助。若 `data.browser.userProfile=false`（退回托管 profile，例如 Chrome 正在运行）或 `chrome=false`（没装 Chrome），说明这次不是用户日常那份登录态，需要重新走登录流程。
 - 有头模式（`headless=false`）下配合 `bring_to_front` / `request_human_input`，人工能直接看到智能体停在哪一页，接力最顺。
 
@@ -852,7 +1083,13 @@ document.querySelector('#kw').value = 'x'                     // 直接赋值
 curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
   "id":1001,"method":"request_human_input",
   "params":{"prompt":"请输入图片验证码","index":7}}'
-# {"data":{"requestId":"hr-1001-3001","prompt":"请输入图片验证码","imageBase64":"iVBORw0...","expiresAt":1750000000000},...}
+# {"data":{"requestId":"hr-1001-3001","prompt":"请输入图片验证码","imageBase64":"iVBORw0...",
+#          "imagePath":"data/1001/shot-3.png","imageUrl":"/data/1001/shot-3.png","expiresAt":1750000000000},...}
+
+# 1'. 读不了图的模型：先让服务端用本机 OCR 读一遍
+curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
+  "id":1001,"method":"ocr_image","params":{"index":7}}'
+# {"data":{"ok":true,"text":"8f3k","lineCount":1}} → 直接拿去填，人工都不用叫
 
 # 2. 人给出答案后立刻回填
 curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
@@ -914,9 +1151,9 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 ## 十一、坑与限制
 
 1. **只有一个端点，只支持 POST + JSON 请求体**：`{"id":...,"method":...,"params":{...}}`。参数不放查询串、不放表单，也不需要 URL 编码。
-2. **参数问题不再返回 HTTP 500**：缺参数得到 `xxx 失败：缺少参数 name`，实例不存在得到 `没有找到对应的浏览器实例：<id>`。**方法名写错会顺带给近似建议**：`不支持的方法：list_tabs，你是不是想用 get_tabs / new_tab / get_tabs？`（按编辑距离与分词近似挑候选），照着改一次就能过，不用再猜。运行期错误也是 `code:0`，例如 `go_to_url 失败：net::ERR_CONNECTION_REFUSED at ...`、`send_keys 失败：Unknown key: "NotAKey"`。
+2. **参数问题不再返回 HTTP 500**：缺参数得到 `xxx 失败：缺少参数 name`。**方法名写错会顺带给近似建议**：`不支持的方法：list_tabs，你是不是想用 get_tabs / new_tab / get_tabs？`（按编辑距离与分词近似挑候选），照着改一次就能过，不用再猜。运行期错误也是 `code:0`，例如 `go_to_url 失败：net::ERR_CONNECTION_REFUSED at ...`、`send_keys 失败：Unknown key: "NotAKey"`。
 3. **页面变化后索引全部重算**：点击、跳转、异步渲染之后必须重新 `get_browser_state`；沿用旧索引会得到 `索引越界` 或 5 秒超时后提示重新取快照。
-4. **快照里没有 `id`/`class`/`href`**：按 id/class 定位用 `click_element_by_selector`，取 href 用 `execute_js`，批量看属性用 `get_interactive_map`。
+4. **快照里没有 `id`/`class`/`href`**：按 id/class 定位用 `click_element_by_selector`，取 href 用 `execute_js`，批量看属性用 `get_interactive_map`（它现在还带 `hasListeners`/`listeners`）。
 5. **纯文本容器（`div`/`span`/`li`）没有索引**：这类元素用 `click_element_by_selector` 或 `execute_js` 调 `.click()`；但带 `onclick`/`cursor:pointer` 的 `div`/`span` 会有索引，别一概而论。
 6. `wait` 的 `seconds` 必填；要等页面就绪请用 `wait_for_load` / `wait_for_element`。
 7. `upload_file` 的 `path` 是**服务器**能打开的路径（绝对路径直接用，相对路径按服务端暂存目录解析），不是 URL；文件不存在时错误信息会告诉你去 `POST /playwright/upload` 把文件送上来。传 `selector` 可以操作隐藏的 file input（比 `index` 更好用，见第四节的「上传文件」）。
@@ -992,6 +1229,27 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 
 34. **截图与日志不会自动清理**：一次完整的站点操作能攒下上百个追踪文件与几十张截图。定期用 `cleanup` 清理（**默认只预演**，`dryRun:false` 才真删），或用 `browser.capture.enabled=false` 关掉「每次页面变化都自动截图」（显式调 `screenshot` 不受影响）。
 
+35. **报错信息里现在带「下一步」**，不用再自己想到要去查什么：
+
+    - **实例不存在**：`没有找到对应的浏览器实例：2002（本服务进程启动于 2026-09-24 12:09:33,任务实例只存在内存里、重启即失效。先用 list_tasks 看现存任务;确认是重启导致的话重新 start 一个即可——登录态在 profile 里,不会因为这个丢）`。**别被 `retryable:false` 误导**：它不是「这个 id 不存在」，而是「这个进程里没有这个 id」。
+    - **索引越界**：形如 `xxx 索引越界: 44,当前索引来自快照(12.3 秒前),共 38 个可交互元素(合法区间 0-37),这期间页面发生过 3 次 DOM 变更。页面变化后索引会全部重算,请重新调用 get_browser_state,或改用 *_by_selector 这类不依赖索引的命令`。有了这些数字就能立刻判断是「索引取错了」还是「页面早就变了」，不必再取一次快照对比。
+    - **元素操作失败**：同样附上快照的来历；`data.errorCode` 给机器可读的分类（`STALE_ELEMENT` / `ACTION_TIMEOUT` / `ELEMENT_OBSCURED`…）与 `data.retryable`。
+    - **点击没变化**：回执里的 `data.hit` 给出这次真正命中的 `tag`/`text`/`outerHtml` —— 「拿到 `changed:false` 之后毫无线索」这件事没有了。
+
+36. **快照里找不到明明在页面上的元素**：先看 `data.pixels_above` / `data.pixels_below` 是不是非 0 —— 非 0 就说明元素在视口外、**没有索引**。三条解法按优先级：① `get_browser_state` 传 `viewportExpansion`（例如 `1500`）一次拿到首屏之外的元素；② 改用 `click_element_by_selector` / `input_text_by_selector`（不依赖索引）；③ 滚动到目标位置后重新取快照。
+
+    > 这一条以前只写在 `get_browser_state` 的参数表里，症状导向搜不到，于是实测时整场任务都退回手写 JS 扫 DOM。**「元素在视口外所以没索引」与「用 `viewportExpansion` 解决」必须连在一起说。**
+
+37. **整页读不到元素、而页面上确实有内容 → 内容在跨域 iframe 里**：`get_browser_state` 传 `includeFrames: true`（或先 `list_frames`）。这类站点的症状很有迷惑性：回执里只有一个空壳，看起来像「页面还没加载完」或「选择器写错了」，于是反复重取快照。服务现在会在这种情况下主动给 `data.frameHint` 指出下一步。企业微信的**邮件 / 微盘 / 文档 / 会议**四个应用全是这个形态，所以这不是个例。详见第三节「跨域 iframe」。
+
+38. **「设了值 / 上传了文件 / 派发了事件，但页面没反应」先查监听器**：`get_element_listeners`（或在 `get_interactive_map` 里看 `hasListeners`）。实测企业微信的 `<input class="uploadInput">` 上**一个监听器都没有**，`setInputFiles` 把文件放进去了，但框架的 `change` handler 不存在，组件的 `upload()` 从来没被调用——页面一直提示「请上传工商营业执照」，而 `upload_file` 回的是 `ok:true`。`upload_file` 的回执现在会直接给 `data.consumed`（`listened`/`noListener`/`unknown`）与 `data.hint`；看到 `noListener` 就**别再换选择器了**，改用组件方法直调。
+
+39. **「点了返回 ok 但弹窗还在」先看 `get_modals` 的 `matchedBy`**：`count:0` 现在可信（跑了三轮扫描：框架选择器 / 类名线索 / 几何兜底，`data.scannedBy` 会列出来）；`count>0` 时按 `matchedBy` 判断置信度。企业微信那种自有类名的弹窗（``qui_dialog``、``mall_invoice_dialog_container``）靠类名线索命中，关它用 `which:"class:<子串>"`。
+
+40. **`engineHonored:true` 不说明「这份 profile 里有登录态」**：这是两件事。`start` 的回执现在另外给 `data.profileSeenBefore`（这份 profile 之前用过吗）与 `data.profileNote`（例如「该 profile 目录本次是首次创建,任何站点都需要重新登录」/「引擎从 chromium 切到 firefox:两种引擎的 profile 格式不通用,登录态不通用,需要重新登录」）。看到引擎被换过、又碰上「所有站点都退登录了」，先看这两个字段。
+
+41. **站点 skill 里的非命令标识符请用双反引号**：`SkillDocConsistencyTest` 会把单反引号里的 snake_case 名字当命令名检查。Vue 字段、CSS 类名、HTML id、URL 参数、接口字段这些**页面里的名字**写成 `` ``subject_name`` `` 就不会被误判。完整约定见 `skills/README.md`。
+
 ## 十二、站点配方（`run_recipe`）
 
 配方是把「某个站点上必须这么点」的经验固化成服务端的 JSON 命令序列：文件放在配方目录（默认 `<启动目录>/recipes`，可用 `browser.recipes.dir` 改），文件名就是配方名，内容形如：
@@ -1019,4 +1277,40 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 - 配方里的每一步都走同一套命令分发，所以**单步手跑与整段跑行为完全一致**，排障时可以把配方里的命令一条条贴出来单独执行。
 - 回执里带 `data.recipe` 与 `data.recipeDescription`，其余字段与 `commands` 批量完全一致（`count`/`succeeded`/`failed`/`results`）。
 - **配方不会自动生效**：必须显式点名 `run_recipe` 才执行，不做任何「看到这个域名就自动套用」的隐式推断。引擎选择同理，始终由调用方在 `start` 时决定。
+- **配方里的命令名会被构建期检查**：写错一个不会等到运行时才发现（见 `skills/README.md`）。
+
+### 现成配方
+
+| 配方 | 用途 |
+| --- | --- |
+| `close-all-modals` | 清掉页面上所有可见的 DOM 弹窗（ant 确认框、用户服务协议层、抽屉）。这类按钮只认真实鼠标事件 |
+| `query-and-read-table` | 点「查询」→ 等表格内容稳定 → 读表格。搜索结果是异步刷新的，点完立刻读会读到上一次的结果 |
+| `cnipa-list-drafts` | 中国商标网：「我的账户 → 申请管理 → 未提交」并把日期筛选切到「近三个月」再读列表 |
+| `open-console-from-iframe` | **主站把第三方控制台套在跨域 iframe 里**时的通用套路（反查 iframe.src → 找主站发 token 的接口 → 同源 execute_js 现取 → 顶层打开） |
+| `wework-qykit-open-console` | 企业微信后台的「邮件 / 微盘 / 文档 / 会议」：现取一个未被消费的 token，把 `exmail.qq.com` 控制台当顶层页面打开 |
+
+### 套路：主站套第三方控制台
+
+企业微信后台把「邮件」应用套在 `exmail.qq.com` 的跨域 iframe 里（微盘 / 文档 / 会议同理）——**这是一整类
+站点**，不是个例。
+
+**先用正规解法**：`get_browser_state` 传 `includeFrames: true`，或先 `list_frames`（见第三节）。
+
+**什么时候还要用这个套路**：iframe 里的控制台受主站外壳影响（iframe 太小把控件裁掉、主站轮询重置状态）时，
+把控制台当**顶层页面**打开更稳：
+
+1. 从 `iframe.src` 反查第三方 URL 与参数（`list_frames` 或 `execute_js` 读 `document.querySelectorAll('iframe')`）；
+2. 找主站发 token / 换登录态的接口：在 `get_requests` 里按 `token` / `oauth` / `sso` / `qykit` 过滤
+   （企业微信是 `POST /wework_admin/apps/qykit/login/tokenAndOAuthCode`）；
+3. 用 `execute_js` **同源**调它（`credentials:'same-origin'` 自动带登录 Cookie），拿一个**还没被消费的**新 token；
+4. 用新 token 顶层 `go_to_url` 打开，之后当普通页面处理。
+
+**两个容易踩的点**：
+
+- **token 是一次性的**：直接 `go_to_url` 打开 iframe 的 `src` 会 **HTTP 500**（那个 token 已经被 iframe 消费了）。
+  必须先现取一个新的。这个绕过方式依赖「主站恰好有一个可同源调用的 token 接口」，**不是通用解** —— 通用解是
+  第三步里的 `includeFrames`。
+- **进了控制台之后用改 hash 的方式跳页**：`location.hash = '#/domain'` 是**同文档跳转**，不会重新请求，也就
+  不会让 token 失效；而 `go_to_url` 到控制台里的另一个 URL 会重新走鉴权，多半失败。控制台内部导航优先用
+  `execute_js` 改 hash，或点页面上的导航项。
 

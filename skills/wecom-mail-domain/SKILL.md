@@ -54,7 +54,7 @@ whenToUse: 需要给企业微信 / 腾讯企业邮箱开通邮箱服务、绑定
 ### 1.3 留档
 
 - 服务端：`logs/trace/<yyyyMMdd>/`（`steps.log` 时间线、`calls.jsonl` 逐条 JSON、`NNNNNN-<任务id>-<方法>.json` 完整请求响应）。
-- 客户端：`scripts/client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏）或 `scripts/trace/browse.ps1`。
+- 客户端：`client/dsb.py`（跨平台、退出码区分传输错/业务失败/用法错、默认脱敏）或 `scripts/trace/browse.ps1`。
 - **DNS 变更证据要自己留**：把「加记录前」「加记录后」的 `get_requests` / 页面文本各存一份，别只靠口头说加好了。
 
 ## 2. 第一步：加 MX 记录（在 DNS 服务商那边）
@@ -167,22 +167,50 @@ foreach($s in @('8.8.8.8','1.1.1.1','119.29.29.29','223.5.5.5')){
 
 ### 3.1 为什么常规手段全都够不着
 
-实测结论（2026-09，服务端 113 个方法的新构建）：
+实测结论（2026-09，服务端 113 个方法的那次构建）：
 
 | 手段 | 结果 |
 | --- | --- |
 | `get_browser_state` | 只拿到企业微信后台外壳，**iframe 内部一个元素都没有** |
 | `execute_js` | 在**顶层文档**执行，`document.querySelector` 穿不透跨域 iframe |
 | `get_modals` / `get_interactive_map` | 都只扫顶层 `document`，同上 |
-| `list_methods` 里找 frame 相关命令 | **一个都没有**（`get_frames` / `switch_frame` / `execute_js_in_frame` 全返回「不支持的方法」） |
+| `list_methods` 里找 frame 相关命令 | 一个都没有（``get_frames()`` / ``switch_frame()`` / ``execute_js_in_frame()`` 全返回「不支持的方法」） |
 | 直接 `go_to_url` 打开 iframe 的 `src` | **`HTTP Error 500 内部服务器错误`** |
 
-**最后一条的原因**：iframe 的 URL 里带 `token` + `wwmng_authcode`，**是一次性的**。页面加载时 iframe
+**最后一条的原因**：iframe 的 URL 里带 `token` + ``wwmng_authcode``，**是一次性的**。页面加载时 iframe
 已经把 token 消费掉了，你再拿同一个 URL 去开就是无效 token → 500。
 
 > 顺带说明：Playwright 本身**是能跨 frame 的**（它走 CDP / juggler 协议，不依赖往页面里注入 JS），
-> 所以这不是浏览器能力的限制，而是服务端没有把 frame 能力暴露出来。等主技能补上 frame 支持后，
-> 本节的做法可以退化成「直接指定 frame」；在那之前，下面的 token 换法是最可靠的。
+> 所以这不是浏览器能力的限制，而是服务端当时没有把 frame 能力暴露出来。
+
+### 3.1′ 现在有两条路：直接读 iframe（正规解）还是换 token（兜底解）
+
+**服务端已经补上 frame 支持了**，所以先试正规解：
+
+```json
+{"id":2001,"method":"list_frames","params":{}}
+```
+```json
+{"id":2001,"method":"get_browser_state","params":{"includeFrames":true,"highlight":false}}
+```
+
+拿到之后：iframe 里的元素会以 `frameIndex > 0` 出现在**同一份索引清单**里，点它/填它**不用传 frame 参数**
+（索引里已经带了 frame 信息，服务端自动路由）；要按选择器或跑 `execute_js` 时再显式传 `frame`：
+
+```json
+{"id":2001,"method":"click_element_by_selector","params":{"selector":"a[href*=domain]","frame":"exmail.qq.com"}}
+{"id":2001,"method":"execute_js","params":{"frame":1,"body":"() => location.href"}}
+```
+
+**什么时候还要用下面 3.2 的换 token 法**：
+
+- iframe 太窄/太小，把控件裁掉了，点在 iframe 里根本点不到；
+- 主站有轮询会在你操作时把 iframe 状态重置回首页；
+- 需要在控制台里跨页面（iframe 内导航一换文档，之前的索引就全废了，得重新 `includeFrames` 取快照）；
+- 服务端版本较老、还没有 `list_frames` 这条命令时。
+
+> 一句话：**先试 `includeFrames`，不行再换 token 顶层直连。** 下面的换 token 法依赖「主站恰好有一个可同源
+> 调用的 token 接口」，**不是通用解**。
 
 ### 3.2 破解：从企业微信后台现取一个新 token
 
@@ -204,11 +232,20 @@ type=exmail&srcUrl=exmail.qq.com%2Fmail%2Fmngpage&noopentoken=1
 **关键点**：这个接口与企业微信后台**同源**，所以可以在后台页面上用 `execute_js` 直接调它，
 **拿一个全新的、还没被任何 iframe 消费过的 token**，然后立刻把顶层页签导航到控制台 URL。
 
-用**同步 XHR**（`execute_js` 不保证 await Promise，同步 XHR 最稳）：
+`execute_js` **会 await Promise**，所以直接写 `async` + `await fetch` 就行（不用再退回同步 XHR）：
+
+```json
+{"id":2001,"method":"execute_js","params":{"body":"async () => { const r = await fetch('/wework_admin/apps/qykit/login/tokenAndOAuthCode?lang=zh_CN&f=json&ajax=1', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'type=exmail&srcUrl=exmail.qq.com%2Fmail%2Fmngpage&noopentoken=1' }); return (await r.json()).data; }"}}
+```
+
+<details>
+<summary>老构建（`execute_js` 不 await Promise 时）的同步 XHR 写法，留作兜底</summary>
 
 ```json
 {"id":2001,"method":"execute_js","params":{"body":"(()=>{const x=new XMLHttpRequest();x.open('POST','/wework_admin/apps/qykit/login/tokenAndOAuthCode?lang=zh_CN&f=json&ajax=1',false);x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');x.send('type=exmail&srcUrl=exmail.qq.com%2Fmail%2Fmngpage&noopentoken=1');return JSON.parse(x.responseText).data})()"}}
 ```
+
+</details>
 
 拿到 token 后**立刻**顶层打开（不要先做别的事，token 有短时效）：
 
@@ -236,8 +273,10 @@ https://exmail.qq.com/mail/mngpage?qykit_goto=&locale=zh&token=<token>&wwmng_aut
 > `doc.weixin.qq.com`、会议 `wwmeeting.weixin.qq.com`）走的是**同一个接口**，只是
 > `type` / `srcUrl` 不同——它们都出现在同一个页面的 iframe 列表里，可以从 `iframe.src` 反查
 > 各自的 `type` 与 `srcUrl`（`srcUrl` 就是 iframe src 里 `mngpage` 那段路径去掉参数）。
-> 更一般地：**遇到「主站把第三方控制台套在 iframe 里」时，先去找主站发 token / 换登录态的接口，
-> 用同源 XHR 现取一份，再顶层直连第三方**——这比在 iframe 里盲点坐标可靠得多。
+> 更一般地：**遇到「主站把第三方控制台套在 iframe 里」时，先试 `get_browser_state` 的
+> `includeFrames:true`（正规解，见 3.1′）；确实不行再去找主站发 token / 换登录态的接口，
+> 用同源 XHR 现取一份、顶层直连第三方**。这条通用套路已经固化成配方
+> `open-console-from-iframe` / `wework-qykit-open-console`（见主技能第十二节）。
 
 ### 3.3 控制台是 hash 路由：直接改 hash 跳页
 
@@ -430,7 +469,7 @@ https://exmail.qq.com/mail/mngpage?qykit_goto=&locale=zh&token=<token>&wwmng_aut
 
 ### 5.6 企业微信侧的域名校验以 MX 为准
 
-`getdomainDNS` 这类接口会回 `nameserver` / `ns` / `has_cname_record` 等信息；企业微信校验 MX 时
+`getdomainDNS` 这类接口会回 `nameserver` / `ns` / **has_cname_record** 等信息；企业微信校验 MX 时
 看的是**该域名权威 NS 上的 MX 记录**。所以第 2.4 节的多解析器验证不是可选项——**先证明 DNS 对了，
 再去点验证按钮**，否则你会在按钮上反复点而不知道问题在 DNS 侧。
 
