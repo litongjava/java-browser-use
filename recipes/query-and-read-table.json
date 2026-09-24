@@ -1,0 +1,35 @@
+{
+  "name": "query-and-read-table",
+  "description": "点「查询」后等表格内容稳定再读：搜索结果异步刷新，点完立刻读会读到上一次的结果（表现成「明明有这一行却找不到」）。",
+  "params": {
+    "querySelector": "查询按钮的选择器，默认 button:has-text('查询')",
+    "table": "要读的表格容器选择器，默认 .vxe-table--body-wrapper"
+  },
+  "defaults": {
+    "querySelector": "button:has-text('查询')",
+    "table": ".vxe-table--body-wrapper"
+  },
+  "commands": [
+    {
+      "click_element_by_selector": {
+        "selector": "{{querySelector}}",
+        "mode": "mouse"
+      }
+    },
+    {
+      "wait_for_stable": {
+        "selector": "{{table}}",
+        "quietMs": 900,
+        "timeoutSeconds": 20
+      }
+    },
+    {
+      "execute_js": {
+        "body": "(sel) => { const t = document.querySelector(sel); if (!t) return { rows: 0, error: '没找到表格容器' }; const trs = Array.from(t.querySelectorAll('tbody tr')).filter(r => r.offsetParent !== null); return { rows: trs.length, text: trs.map(r => Array.from(r.querySelectorAll('td')).map(c => (c.innerText || '').trim().replace(/\\s+/g, ' ')).join(' | ')).join('\\n').slice(0, 4000) }; }",
+        "vars": {
+          "sel": "{{table}}"
+        }
+      }
+    }
+  ]
+}

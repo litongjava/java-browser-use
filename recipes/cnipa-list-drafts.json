@@ -1,0 +1,67 @@
+{
+  "name": "cnipa-list-drafts",
+  "description": "中国商标网：进「我的账户 → 申请管理 → 未提交」并把日期筛选切到「近三个月」再读列表。默认筛选是「今天」，昨天或更早的草稿在这个视图里看不到——只查默认视图很容易得出「没保存成功」的错误结论。菜单是纯 Vue 事件（没有 href），点不动时按技能手册 9.8 处理。",
+  "params": {
+    "entry": "申请管理入口的文本，默认 申请管理",
+    "months": "日期筛选文本，默认 近三个月"
+  },
+  "defaults": {
+    "entry": "申请管理",
+    "months": "近三个月"
+  },
+  "commands": [
+    {
+      "get_modals": {}
+    },
+    {
+      "close_modal": {
+        "which": "all",
+        "button": "取消"
+      }
+    },
+    {
+      "click_element_by_text": {
+        "text": "{{entry}}"
+      }
+    },
+    {
+      "wait": {
+        "seconds": 2
+      }
+    },
+    {
+      "click_element_by_text": {
+        "text": "未提交"
+      }
+    },
+    {
+      "wait_for_stable": {
+        "selector": ".vxe-table--body-wrapper",
+        "quietMs": 900,
+        "timeoutSeconds": 20
+      }
+    },
+    {
+      "click_element_by_text": {
+        "text": "{{months}}"
+      }
+    },
+    {
+      "wait": {
+        "seconds": 2
+      }
+    },
+    {
+      "wait_for_stable": {
+        "selector": ".vxe-table--body-wrapper",
+        "quietMs": 900,
+        "timeoutSeconds": 20
+      }
+    },
+    {
+      "execute_js": {
+        "body": "() => { const tables = Array.from(document.querySelectorAll('table')); const hit = tables.find(t => Array.from(t.querySelectorAll('tbody tr')).some(r => /注册申请|\\d{15,}/.test(r.innerText || ''))); if (!hit) return { rows: 0, error: '没找到业务表格（vxe-table 的表头与表体在两张 table 里，且右侧有固定列克隆表，不要按行数认表）' }; const trs = Array.from(hit.querySelectorAll('tbody tr')).filter(r => r.offsetParent !== null); return { rows: trs.length, text: trs.map(r => Array.from(r.querySelectorAll('td')).map(c => (c.innerText || '').trim().replace(/\\s+/g, ' ')).join(' | ')).join('\\n').slice(0, 4000) }; }"
+      }
+    }
+  ]
+}

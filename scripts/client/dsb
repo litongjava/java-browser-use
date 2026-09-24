@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# dsb —— Linux/macOS 下的薄包装(记得 chmod +x dsb)
+# 用法: ./dsb health / ./dsb start --browser firefox / ./dsb batch cmds.json --async --wait
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$here/dsb.py" "$@"

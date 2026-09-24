@@ -1,0 +1,32 @@
+{
+  "name": "close-all-modals",
+  "description": "清掉页面上所有可见的 DOM 弹窗（ant 确认框、用户服务协议层、抽屉）。这类按钮只认真实鼠标事件，JS 派发点了没反应；close_modal 一律用真实鼠标点，并且点完重新数一遍弹窗数量。最后一步的 get_modals 用来确认真的清干净了。",
+  "params": {
+    "note": "无需参数。用法：{\"method\":\"run_recipe\",\"params\":{\"name\":\"close-all-modals\"}}"
+  },
+  "commands": [
+    {
+      "get_modals": {}
+    },
+    {
+      "close_modal": {
+        "which": "all",
+        "button": "我接受"
+      }
+    },
+    {
+      "close_modal": {
+        "which": "all",
+        "button": "取消"
+      }
+    },
+    {
+      "close_modal": {
+        "which": "all"
+      }
+    },
+    {
+      "get_modals": {}
+    }
+  ]
+}
