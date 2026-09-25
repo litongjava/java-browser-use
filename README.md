@@ -5,6 +5,8 @@
 > **作者**：Tong Li（李通） · 邮箱 [litongjava@qq.com](mailto:litongjava@qq.com) · 微信 **jdk131219** · GitHub [@litongjava](https://github.com/litongjava)
 > · 仓库 <https://github.com/litongjava/deepseek-browser-use>（Gitee 镜像 <https://gitee.com/ppnt/deepseek-browser-use>） · 协议 MIT © 2016 Tong Li
 
+> 📺 **视频演示**：[AI 自己打开浏览器给 DeepSeek 账号充值 ¥10 并开发票（deepseek-browser-use 实录）](https://www.bilibili.com/video/BV1FAh262EXf/) —— B 站，11 分 24 秒。全程由智能体自己操作浏览器：选金额 → 微信扫码支付 → 回读余额确认到账 → 到账单页申请开发票，每一步都在页面与接口上回读验证。
+
 智能体自己读不了网页、点不了按钮。这个服务把一台真实的浏览器包成一个 HTTP 端点：智能体发一条 `{id, method, params}`，服务就去操作浏览器，然后把页面变成两样它能读懂的东西 ——
 
 - **可交互结构化文本**：整页 DOM 压成 `[index]<a >登录/>` 这样的行，`[index]` 就是可以点的元素编号；

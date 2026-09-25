@@ -120,6 +120,12 @@ client/dsb.cmd --id 3001 js "() => JSON.stringify({tasks:[...document.querySelec
 这是本页最阴的一个坑:**B 站会按标题自动改分区**。实测标题从草稿的「INMO Air 2开发指南」改成
 「使用 deepseek-browser-use 在腾讯云购买服务器」之后,分区被自动从「科技数码」改成了「**vlog**」。
 
+> **改分区不止发生在改标题那一下(2026-09-25 第二次投稿实测)**：那次填完标题回读仍是「科技数码」,
+> 等**简介、标签、封面都填完之后**再看,分区已经被自动改成了「人工智能」。
+> 所以「填完标题看一眼」是不够的——**提交前最后一次回读才算数**,最后对字段时务必再确认一次分区。
+> （顺带:自动改出来的分区不一定差,那次「人工智能」就比草稿里的「科技数码」更贴切;
+> 要采纳就采纳,要改回来才动下拉。）
+
 分区是自定义下拉,不是 `<select>`:
 
 ```bash
@@ -305,6 +311,63 @@ hint: …目标中心点上命中的是别的元素——很可能被遮挡物�
 一次会话里把「填值 + 回车」拼成 12 条命令的批量,跑在中途页面整页重建,客户端侧直接看不到结果。
 **小步走**:一个字段一次调用、加完回读;批量的条目越多,一次页面重渲染吞掉的越多。
 长批次用 `client/dsb.cmd --id <id> batch cmds.json --async --wait`,别让它撞 HTTP 超时。
+
+## 三·补、第二次投稿（2026-09-25）新增的实测结论
+
+这次发的是「使用deepseek-browser-use给deepseek账号充值.mp4」（93.7MB / 11分24秒 / 1080P / BV1FAh262EXf）。
+与上面那次相比有四处**不一样**，值得单独记：
+
+1. **视频没上传之前，投稿表单根本不渲染**。刚打开投稿页时 `tasks` / `files` / `tags` 都是空数组，
+   `input[placeholder='请输入稿件标题']`、`.desc-container .ql-editor`、`.video-human-type`、
+   `.bcc-select-input-inner` **全都读不到**（值是 undefined），页面上只有「点击上传或将视频拖拽到此区域」。
+   **先 `upload_file` 把视频交进去，表单才出现**，草稿的标题/简介/分区/标签也是这时候才被填上的。
+   所以第 3 步「先把草稿字段抄下来」要挪到第 4 步「上传视频」**之后**做，否则抄到的是一片空。
+2. **不一定要扫码登录**：这次直接 `go_to_url` 到投稿页就没被踢到 passport，共享 profile 里的登录态是长期的。
+   但**每次都要先 `get_url` 确认一次**，别假定它还在。
+3. **`wait_for_element` 不能用来判断封面对话框开没开**：对话框里的 file input 天生隐藏，
+   而 `wait_for_element` 等的是「可见」，于是必然等满超时——可对话框其实早就开了（`get_element_count` 数得到）。
+   判据用 `get_element_count`。
+4. **`wait_for_stable` 在这个页面会直接报「读不到内容指纹」**（不是 `stable:false`）。
+   这页上要等就用固定 `wait -p seconds=N`，或者轮询 `get_element_count`。
+
+### 模型读不了图时，怎么给投稿挑封面（实操）
+
+``read_image`` 报 `model … does not declare image input` 时，用 **ffmpeg 抽帧 + `ocr_image` 扫关键词**，
+就能在完全看不见画面的情况下选出封面帧：
+
+```bash
+# 1) 每 40 秒抽一帧(1080p PNG,文件名用 ASCII,省得跟 shell 打架)
+ffmpeg -y -v error -ss <秒> -i "<视频>.mp4" -frames:v 1 tmp\bili-frame-070.png
+# 2) 逐帧 OCR,只把命中的关键词打出来,不吃 token
+client/dsb.cmd --port 10049 --json run ocr_image -p path=<帧的绝对路径>
+```
+
+- **`--json` 是必须的**：不加它，dsb 会先打一行 `ocr_image OK 631ms`，`ConvertFrom-Json` 直接解析失败
+  （实测这一下白跑了 18 次）。
+- 实测用关键词 `Scan QR|Payment successful|Topped-up` 扫 18 帧，直接定位出：收银台二维码在 320s、
+  支付成功在 400s、账单页在 520s/560s —— 一次抽帧 + 一轮 OCR 就够选封面了。
+- OCR 会把中文按字拆开成「账 号 充 值」，所以**关键词优先用英文**，中文只作辅助。
+
+两个与封面有关的补充：
+
+- 封面 PNG 1920×1080（588KB）完全可用；上传后 B 站 CDN 上的地址变成 `.jpg` 结尾，
+  而且最先读到的背景图是**编辑器自动生成的 4:3 版本**（实测 1440×1080）——
+  别因为「我传的是 PNG/16:9，怎么变 JPG/4:3 了」就以为传错了。
+- 确认封面真的设上了：`!!document.querySelector('.cover .cover-empty')` 为 `false`，
+  且封面容器里能读到 `archive.biliimg.com` 的 `background-image`。
+
+### 标签：这次的观察
+
+上次记的「`deepseek` 会被静默丢掉」这次**没有复现**：同一个词写成 `DeepSeek` 一次就加上了。
+所以那不像是关键词黑名单，更像当时的偶发。**结论不变**：一条一条加、加完立刻回读，
+被吞了就换个词，别在同一个词上反复重试。
+
+### 动作类命令撞上伪故障时（`SPURIOUS_DISPATCH`）
+
+这次往标签框里填第一个标签时，`input_text_by_selector` 回的是
+`[SPURIOUS_DISPATCH] 底层对象已被释放…`——**动作类不会自动重发**，回执 `ok:false` 但「有没有生效」未知。
+正确姿势就是服务提示的那句：**先用只读命令确认页面状态**。这次回读标签列表，发现那个标签确实没加上、
+输入框也空了，**再重试**就成了。不要看到 `ok:false` 就重发（可能重复提交），也不要因为回执难看就改选择器。
 
 ## 四、收尾
 
