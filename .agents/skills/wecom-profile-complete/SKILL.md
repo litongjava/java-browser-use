@@ -1,6 +1,6 @@
 ---
 name: wecom-profile-complete
-description: 用 deepseek-browser-use 完善企业微信「企业信息」（work.weixin.qq.com/wework_admin/frame#profile）的实操手册：企业 logo、企业地址（三级区划级联）、企业简称（含简称命名依据，且简称只能免费改一次）、企业域名绑定、联系电话（可留空）、企业名片，以及每一步的回读确认写法。该后台是 Vue 单页应用 + hash 路由，内容区是内层滚动容器（window.scrollTo 无效），快照索引在任何点击或异步渲染后立即全部重算，视口外的元素既不进 data.text 也没有索引，所以定位一律优先用 CSS 选择器而不是索引；企业 logo 上传框是 opacity:0 且位置在视口外的隐藏 file input，正解是 upload_file 传 selector；企业微信自己的弹窗类名不一定命中 get_modals 的选择器（返回 0 不等于没有弹窗），这种情况要用 execute_js 自己扫 position:fixed 或高 z-index 的可见浮层；Vue 组件可能压根没挂事件监听器（el._vei 为 null），此时派发的 change/click 到不了框架 handler，只能直接调组件方法。企业域名绑定的前置条件是该域名已经能收信（企业微信会做 MX 校验），必须先按 skills/wecom-mail-domain 把邮箱域名绑好，绑好后本页填域名点「绑定域名」即完成，不需要再建验证邮箱。文内数据全部脱敏，替换占位符即可复用。
+description: 用 deepseek-browser-use 完善企业微信「企业信息」（work.weixin.qq.com/wework_admin/frame#profile）的实操手册：企业 logo、企业地址（三级区划级联）、企业简称（含简称命名依据，且简称只能免费改一次）、企业域名绑定、联系电话（可留空）、企业名片，以及每一步的回读确认写法。该后台是 Vue 单页应用 + hash 路由，内容区是内层滚动容器（window.scrollTo 无效），快照索引在任何点击或异步渲染后立即全部重算，视口外的元素既不进 data.text 也没有索引，所以定位一律优先用 CSS 选择器而不是索引；企业 logo 上传框是 opacity:0 且位置在视口外的隐藏 file input，正解是 upload_file 传 selector；企业微信自己的弹窗类名不一定命中 get_modals 的选择器（返回 0 不等于没有弹窗），这种情况要用 execute_js 自己扫 position:fixed 或高 z-index 的可见浮层；Vue 组件可能压根没挂事件监听器（el._vei 为 null），此时派发的 change/click 到不了框架 handler，只能直接调组件方法。企业域名绑定的前置条件是该域名已经能收信（企业微信会做 MX 校验），必须先按 .agents/skills/wecom-mail-domain 把邮箱域名绑好，绑好后本页填域名点「绑定域名」即完成，不需要再建验证邮箱。文内数据全部脱敏，替换占位符即可复用。
 whenToUse: 需要完善或修改企业微信管理后台「企业信息」里的资料（企业 logo、企业地址、企业简称、企业域名、联系电话、企业名片），或需要在 work.weixin.qq.com 这个 Vue SPA + hash 路由 + 内层滚动容器的后台上做「定位元素 → 填表 → 提交 → 回读确认」这类操作时。
 ---
 
@@ -433,7 +433,7 @@ return {shortName: row ? row.querySelector('.profile_enterprise_item_main').inne
      @ MX  mxbiz1.qq.com.  优先级 5
      @ MX  mxbiz2.qq.com.  优先级 10
 ② 在企业微信邮箱控制台把该域名开通、绑好，看到「<域名> — 使用中」
-     → 这一步见 skills/wecom-mail-domain
+     → 这一步见 .agents/skills/wecom-mail-domain
 ③ 回到本页（#profile/domain）填域名 → 点「绑定域名」
 ```
 
@@ -693,7 +693,7 @@ JS 派发 click 和真实鼠标点击**都可能不跳转**。要切页时**直�
 
 **本文的任务（企业信息）不需要进那个 iframe** —— 企业域名绑定走的是 `#profile/domain`，
 是后台自己的路由。**只有在必须操作邮箱控制台时**才需要绕过它，
-那属于 `skills/wecom-mail-domain` 的范围。
+那属于 `.agents/skills/wecom-mail-domain` 的范围。
 
 > 顺带记一条通用教训：**iframe 的 `src` 里的 token 常常是一次性的**。实测把 iframe 的
 > `src` 直接拿去顶层 `go_to_url` 会返回 `500 : HTTP Error 500`，因为 token 已经被 iframe 消费掉了。
@@ -800,4 +800,4 @@ curl -s http://localhost:10049/playwright/tasks
   管理员手机号、本机绝对路径）。
 - 给用户看的过程记录里，企业 ID、手机号、统一社会信用代码**只留后 4 位或直接省略**。
 - 截图与结构化文本落在服务端 `data/<id>/` 下，含企业信息，**任务结束记得清理**（见 11.5）。
-- 引用其它技能用**仓库相对路径**（如 `skills/wecom-mail-domain`），不要写本机绝对路径。
+- 引用其它技能用**仓库相对路径**（如 `.agents/skills/wecom-mail-domain`），不要写本机绝对路径。

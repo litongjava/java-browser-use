@@ -1,11 +1,24 @@
 # 写站点技能（skill）的约定
 
-`skills/` 下有两类文档：
+## 技能放在哪
+
+技能文档都放在仓库的 **`.agents/skills/`** 下 —— 这是 DSH 的**项目级技能根**（DSH 按
+`<项目根>/.dsh/skills` → `<项目根>/.agents/skills` → `customSkillDirs` → `~/.dsh/skills` →
+`~/.agents/skills` 的顺序扫描），而仓库根有 `.git`，所以**在仓库里启动 dsh 会话就能直接发现这 8 个技能**，
+不用再往 `.dsh/skills` 复制一份。发现规则只有两条：
+
+- 只认 `<根>/<技能名>/SKILL.md`（或 `<根>/<技能名>.md`）这一层，**不递归**；
+- frontmatter 必须有 `name` 与 `description`，且 `name` 是 kebab-case 且与目录名一致。
+
+换了装法（`git clone` 到别处用、装到用户级目录）不影响构建：`SkillDocConsistencyTest` 依次在
+`.agents/skills/`、`.dsh/skills/`、老的 `skills/` 与仓库根找主技能文档，能找到哪个就用哪个。
+
+`.agents/skills/` 下有两类文档：
 
 | 文档 | 作用 | 谁维护 |
 | --- | --- | --- |
-| `skills/SKILL.md` | **主技能**：服务端能力的唯一权威清单（命令表覆盖、端点、frontmatter、协议） | 跟着服务端一起改 |
-| `skills/<站点名>/SKILL.md` | **站点操作手册**：某个站点上「必须这么点」的经验（例如 `wecom-mail-domain`） | 跑完一次真实任务后补 |
+| `.agents/skills/deepseek-browser-use/SKILL.md` | **主技能**：服务端能力的唯一权威清单（命令表覆盖、端点、frontmatter、协议） | 跟着服务端一起改 |
+| `.agents/skills/<站点名>/SKILL.md` | **站点操作手册**：某个站点上「必须这么点」的经验（例如 `wecom-mail-domain`） | 跑完一次真实任务后补 |
 
 构建时会跑 `SkillDocConsistencyTest`（`playwright-server/src/test/java/nexus/io/ai/browser/docs/`）校验两者与服务端的一致性。
 
@@ -46,9 +59,9 @@ nonCommands: [subject_name, dsh_up_0, has_cname_record]
 
 ## 其余约定
 
-1. **命令名必须真实存在**：`skills/` 下每一份 SKILL.md 里的单反引号 snake_case 名字都会对着命令表查一遍。写错一个（例如把 `get_tabs` 写成 ``list_tabs``），模型照着发请求就会拿到「不支持的方法」。不知道有哪些命令时先 `list_methods`。
+1. **命令名必须真实存在**：`.agents/skills/` 下每一份 SKILL.md 里的单反引号 snake_case 名字都会对着命令表查一遍。写错一个（例如把 `get_tabs` 写成 ``list_tabs``），模型照着发请求就会拿到「不支持的方法」。不知道有哪些命令时先 `list_methods`。
 2. **`recipes/*.json` 里的命令名同样会被检查**：配方写错命令名要到 `run_recipe` 运行时才报错，所以构建阶段就过一遍。
-3. **主技能必须覆盖全部命令**：命令表里的每个方法都要在 `skills/SKILL.md` 里出现（`everyCommandIsDocumented`）。
+3. **主技能必须覆盖全部命令**：命令表里的每个方法都要在 `.agents/skills/deepseek-browser-use/SKILL.md` 里出现（`everyCommandIsDocumented`）。
 4. **不写本机绝对路径**：`E:\` / `D:\` 这类路径会让文档换台机器就失效。
 5. **不写旧名字**：``get_dom_text``、`/api/v1/playwright`、``PlaywrightController``、``com.litongjava``、``project-nexus`` 都已被拉黑。
 6. **症状导向**：写新坑的时候，尽量在主技能开头的「症状 → 命令」索引表里也加一行——那张表就是为了把「翻 1000 行找答案」变成「查一行表」。

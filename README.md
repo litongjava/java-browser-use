@@ -2,6 +2,9 @@
 
 **给 DeepSeek Harness（以及任何会调 HTTP 的智能体）用的浏览器中间件。**
 
+> **作者**：Tong Li（李通） · 邮箱 [litongjava@qq.com](mailto:litongjava@qq.com) · 微信 **jdk131219** · GitHub [@litongjava](https://github.com/litongjava)
+> · 仓库 <https://github.com/litongjava/deepseek-browser-use>（Gitee 镜像 <https://gitee.com/ppnt/deepseek-browser-use>） · 协议 MIT © 2016 Tong Li
+
 智能体自己读不了网页、点不了按钮。这个服务把一台真实的浏览器包成一个 HTTP 端点：智能体发一条 `{id, method, params}`，服务就去操作浏览器，然后把页面变成两样它能读懂的东西 ——
 
 - **可交互结构化文本**：整页 DOM 压成 `[index]<a >登录/>` 这样的行，`[index]` 就是可以点的元素编号；
@@ -90,7 +93,108 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 
 ---
 
-## 三、接口长什么样
+## 三、在 DeepSeek Harness（DSH）里怎么用
+
+在 DSH 里用这个工具就三步：**① 读技能文档（本仓库自带，就在 `.agents/skills/`） → ② 起服务、用 `dsb` 客户端发请求 → ③ 用一句话把任务交给智能体。**
+
+### 1. 读 skill 文件：技能就在 `.agents/skills/`
+
+**本仓库自带技能，不用再安装**：8 份技能文档（主技能 + 7 份站点手册）都在 `.agents/skills/` 下，而 `.agents/skills` 正是 DSH 的**项目级技能根**（仓库根有 `.git`），所以**在仓库里启动 dsh 会话，这些技能直接就在技能目录里**：智能体自己会按需加载（动作就是 `skill deepseek-browser-use`），人也可以直接让它读文件。
+
+DSH 按固定顺序扫描技能目录：
+
+| 顺序 | 目录 | 作用范围 |
+| --- | --- | --- |
+| 1 | `<项目根>/.dsh/skills/` | 只有这个项目（项目根 = 最近的含 `.git` 的上级目录） |
+| 2 | `<项目根>/.agents/skills/` | 同上，`.agents` 约定的等价位置 —— **本仓库用这个** |
+| 3 | DSH 配置里的 `customSkillDirs` | 安装级配置显式追加的目录 |
+| 4 | `~/.dsh/skills/` | 这台机器上当前用户的**所有**项目 |
+| 5 | `~/.agents/skills/` | 同上，`.agents` 约定的等价位置 |
+
+想搬到别处（或在别的项目、别的机器上用），照着两条规则来就行：**只认 `<根>/<技能名>/SKILL.md`（或 `<根>/<技能名>.md`）这一层，不递归**；frontmatter 必须有 `name` 与 `description`，且 `name` 是 kebab-case、与目录名一致。
+
+```powershell
+# 换一台机器 / 换个项目:把技能根整个复制过去(项目级)
+New-Item -ItemType Directory -Force <那个项目>\.agents\skills | Out-Null
+Copy-Item -Recurse .agents\skills\* <那个项目>\.agents\skills\
+```
+
+```bash
+# 或者装到用户级:这台机器上所有项目都能用(把 .agents 换成 .dsh 也一样认)
+mkdir -p ~/.dsh/skills
+cp -r .agents/skills/* ~/.dsh/skills/
+```
+
+**不用重启 DSH**：技能正文每次加载都重新读文件；frontmatter 里的 `name`/`description` 改了，DSH 的文件监听会自己刷新技能目录 —— 这次把技能从 `skills/` 挪到 `.agents/skills/`，同一个会话的技能目录立刻就出现了这 8 个技能。
+
+> **路径注意**：技能正文里的路径都是**相对仓库根**写的（`client/dsb.py`、`recipes/`、`logs/agent/` …）。技能待在仓库自己的 `.agents/skills/` 里、dsh 也在仓库根启动时，这些路径天然对得上；**复制到别的项目或用户级目录之后**，请让 cwd 留在本仓库，或在提示词里给出 dsb 客户端与仓库的绝对路径。
+
+站点手册（`.agents/skills/<站点名>/SKILL.md`，如 `cnipa-trademark-register`、`railway-12306-ticket`、`wecom-*`）就在同一个目录里，技能名取各自 frontmatter 里的 `name`。它和主技能分工不同：主技能讲「服务能做什么」，站点手册讲「这个站点必须怎么点」。
+
+### 2. 使用 dsb 客户端：起服务 + 发请求
+
+技能文档负责让智能体知道**有哪些命令、有哪些坑**；真正发请求推荐走仓库里的 `dsb` 客户端，而不是手拼 `curl -d '{...}'`。
+
+```shell
+# ① 先把服务起起来(发行版;开发态见第六节)
+java -jar deepseek-browser-use-1.0.0-windows-x64.jar
+
+# ② 确认服务活着
+client\dsb.cmd --port 10049 health
+
+# ③ 起任务 → 开页面 → 读页面 → 收工
+client\dsb.cmd --port 10049 --id 1001 start --browser chrome
+client\dsb.cmd --port 10049 --id 1001 run go_to_url -p url=https://example.com
+client\dsb.cmd --port 10049 --id 1001 state --full
+client\dsb.cmd --port 10049 --id 1001 close
+```
+
+非 Windows 把 `client\dsb.cmd` 换成 `python client/dsb.py`，参数完全一致（`dsb.cmd` 只是一层找 `python`、透传参数与退出码的包装）。完整子命令与退出码见 [`client/README.md`](client/README.md)。
+
+让智能体用 `dsb` 而不是手拼请求，省掉的是一整类无谓失败：
+
+| | 手拼 `curl -d '{...}'` | `dsb` 客户端 |
+| --- | --- | --- |
+| 中文 / 引号 / 换行 | shell 尤其 PowerShell 会吃掉引号，JSON 直接坏掉 | 参数走命令行或 `@文件.json`，序列化交给客户端 |
+| 每次调用留档 | 没有 | 请求与响应成对落盘 `logs/agent/<会话>/`，`steps.log` 一行一次调用 |
+| 失败怎么定位 | 只看得到一段文本 | 退出码分层：0 成功 / 1 传输错 / 2 业务失败 / 3 用法错 |
+| 长批次 | 撞 HTTP 超时，且「超时≠失败」说不清 | `batch cmds.json --async --wait`，服务端后台跑、客户端轮询 |
+| 多行 JS | 命令行截断 → `SyntaxError` | `js @脚本.js` |
+
+装完（或怀疑服务端有问题）想自查，跑一遍端到端自检（用自己的任务 ID `990001`，不会撞上业务任务）：
+
+```shell
+client\dsb.cmd --port 10049 selftest --browser chrome
+```
+
+### 3. 你的任务是"……"：三步式提示词
+
+最省事的用法是把下面这段直接粘进 DSH，只改最后一句：
+
+```text
+1. 工程代码目录是E:\code\java\project-litongjava\deepseek-browser-use
+2. 读取技能文件 .agents/skills/deepseek-browser-use/SKILL.md，按里面的命令与坑来操作，不要凭印象发命令；
+2. 使用 dsb 客户端发请求（Windows 用 client\dsb.cmd，其他平台用 python client/dsb.py），不要手拼 curl JSON；
+4. 你的任务是"到12306购买一张车票"。
+```
+
+三行各管一件事：
+
+| 行 | 它解决什么 |
+| --- | --- |
+| 1. 读取技能文件 | 把「有哪些命令、返回什么字段、哪些坑绕不开」一次性放进上下文；不读它，模型只能靠猜方法名（116 个方法里猜错就是一次失败调用） |
+| 2. 使用 dsb 客户端 | 定死发请求的方式，少掉引号/编码这一整类失败，并且每一步都有留档可回溯 |
+| 3. 你的任务是"…" | 只剩业务本身；站点类的活可以再点名一份站点手册 |
+
+几句值得一并写进任务里的话（都来自实际踩过的坑）：
+
+- **只看文本，不要读图**：`get_browser_state` 的 `data.text` 里有全部元素索引，去读 `data.screenshot` 那张 png 只会烧 token，不会多给一个索引；
+- **遇到登录 / 验证码 / 支付就停下来交给人**：用 `request_human_input`，别自己硬猜；
+- **一次快照只做一个动作**：点完再取一次状态，否则索引会失效；
+- **需要登录的站点先有头跑一次**（`start --headful`）：人登一次，登录态留在共享 profile 里，之后的任务不用再登；
+- **收工用 `close`**：别直接叉掉服务窗口 —— 强杀会留下孤儿浏览器，还会让 session cookie 型的登录态失效（见第八节）。
+
+## 四、接口长什么样
 
 **只有一个业务端点。**
 
@@ -143,9 +247,9 @@ curl -H "Content-Type: application/json" -d '{"filename":"图样.jpg","contentBa
 
 完整的方法清单、参数、返回字段、坑与限制都在技能文档里：
 
-> **[`skills/SKILL.md`](skills/SKILL.md)**（装进 DSH 时对应 `.dsh/skills/deepseek-browser-use/SKILL.md`）
+> **[`.agents/skills/deepseek-browser-use/SKILL.md`](.agents/skills/deepseek-browser-use/SKILL.md)**（DSH 的项目级技能根，在仓库里启动 dsh 会话就能直接用，见第三节）
 >
-> **[`skills/cnipa-trademark-register/SKILL.md`](skills/cnipa-trademark-register/SKILL.md)**（中国商标网注册申请的实操手册，数据已脱敏）
+> **[`.agents/skills/cnipa-trademark-register/SKILL.md`](.agents/skills/cnipa-trademark-register/SKILL.md)**（中国商标网注册申请的实操手册，数据已脱敏）
 
 那份文档是给智能体读的，也是给人读的参考手册，**以它为准**。
 
@@ -159,7 +263,7 @@ curl -H "Content-Type: application/json" -d '{"filename":"图样.jpg","contentBa
 
 网络请求及响应通过 requestId 关联，支持按 ID 回查特定响应，并明确报告请求体、响应体的截断状态。**响应体在收到的当下就被抄了一份**（只抄 `xhr`/`fetch`，单条上限 10 万字符）：浏览器只短暂保留响应体，实测一条 **7 秒前**的 XHR 再取 body 就已经是 `No resource with given identifier found`，一导航更是彻底没了——不抄的话「保留最近 100 个响应」在真实站点上等于「一个都读不到」。抄到的那份带 `bodyFromCache` / `bodyCapturedAt`，跳转之后照样读得到。业务查询返回空记录时，调用方需核实查询条件，不能直接推断金额为零。
 
-## 四、核心概念
+## 五、核心概念
 
 ### 一个浏览器，多个任务
 
@@ -489,7 +593,7 @@ current tab is: 1               		[12]<a name='tj_login'>登录/>
 
 ---
 
-## 五、从源码构建
+## 六、从源码构建
 
 ### 环境
 
@@ -575,7 +679,7 @@ node scripts/package/build-release.mjs --help
 
 ---
 
-## 六、目录结构
+## 七、目录结构
 
 ```
 deepseek-browser-use/
@@ -605,8 +709,10 @@ deepseek-browser-use/
 ├── client/dsb.cmd                          Windows 薄包装(能直接敲 dsb,不必写 python 前缀)
 ├── client/README.md                        Python 客户端的用法与退出码约定
 ├── recipes/*.json                          显式 opt-in 的站点配方(run_recipe 用)
-├── skills/SKILL.md                        给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
-├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register、railway-12306-ticket、aliyun-lightweight-server)
+├── .agents/skills/                        DSH 项目级技能根(在仓库里启动 dsh 会话就自动发现这 8 份技能)
+│   ├── deepseek-browser-use/SKILL.md      主技能:服务端能力的唯一权威清单(命令表覆盖、端点、协议)
+│   └── <站点名>/SKILL.md                   站点实操手册(cnipa-trademark-register、railway-12306-ticket、aliyun-lightweight-server、wecom-*)
+├── docs/SKILL-CONVENTIONS.md              写站点 skill 的约定(单反引号 vs 双反引号等)
 └── dist/                                  发行版产物(构建后生成)
 ```
 
@@ -622,7 +728,7 @@ deepseek-browser-use/
 
 ---
 
-## 七、安全提示
+## 八、安全提示
 
 - 服务**没有鉴权**，`execute_js` 能执行任意脚本，`/data/**` 能读到所有截图与页面文本，`POST /playwright/upload` 能往服务端磁盘写文件（只能写进暂存目录、文件名会被清洗，但文件内容不限；`browser.upload.enabled=false` 可关掉这个接口）。
 - 默认只监听本机。**对外暴露前必须自己加访问控制**，并且不要把 `/data/**` 直接放到公网。
@@ -708,3 +814,22 @@ java -Dbrowser.chromium.sandbox=false -jar deepseek-browser-use.jar
 `sandboxCanBeConfiguredBothWays`）盯着：平台默认值被改掉、或者配置项失效，构建就会失败。
 真实浏览器上还有两个冒烟测试兜着：`BrowserChoiceSmokeTest`（`-Dsmoke.chromium=true`，内置 Chromium +
 沙箱开启）与 `EdgeBrowserSmokeTest`（`-Dsmoke.edge=true`，Edge + CDP + 沙箱开启）。
+
+---
+
+## 九、作者与许可
+
+| | |
+| --- | --- |
+| 作者 | **Tong Li**（李通） |
+| 邮箱 | [litongjava@qq.com](mailto:litongjava@qq.com) |
+| 微信 | **jdk131219** |
+| GitHub | [@litongjava](https://github.com/litongjava) |
+| 仓库 | <https://github.com/litongjava/deepseek-browser-use> |
+| Gitee 镜像 | <https://gitee.com/ppnt/deepseek-browser-use> |
+| 协议 | MIT，Copyright © 2016 Tong Li，全文见 [`LICENSE`](LICENSE) |
+
+问题、建议、站点手册的补充都欢迎提到 [Issues](https://github.com/litongjava/deepseek-browser-use/issues)，
+也欢迎加微信 **jdk131219** 交流。
+新写站点 skill 之前先看 [`docs/SKILL-CONVENTIONS.md`](docs/SKILL-CONVENTIONS.md)（单反引号 vs 双反引号那条约定最容易踩）。
+

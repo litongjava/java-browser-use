@@ -28,7 +28,7 @@ import nexus.io.model.body.RespBodyVo;
  *
  * <p>
  * 两个坑都不是猜出来的,是 2026-09-24 在 12306 上买武汉→民权北的车票时真踩到的,原文记在
- * {@code skills/railway-12306-ticket/SKILL.md} 里:
+ * {@code .agents/skills/railway-12306-ticket/SKILL.md} 里:
  *
  * <ul>
  * <li><b>弹窗按钮只认框架类名</b>:12306 的「确认」是 {@code <a id="qr_submit_id" class="btn92s">确认</a>},

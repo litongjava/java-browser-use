@@ -50,7 +50,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | **报错说 `Object doesn't exist: response@…`，可这条命令根本没碰过什么 response**；而且换一条毫不相干的命令还是报同样的对象 | 这是 Playwright 事件泵投递过来的**伪故障**（见第十一节第 47 条），不是页面坏了：只读命令服务端**已自动重发**，回执里会多一个 `data.spuriousRetry`；`execute_js` 读页面时请传 `retryOnSpurious: true`；**点击/提交/支付类命令绝不要自动重发**，先读页面状态 |
 | **`get_element_screenshot` / `click_element_by_selector` 用 `[class*=xxx]` 报 `ACTION_TIMEOUT`（等元素可操作超时），可 `get_element_count` 明明说匹配到好几个** | 选择器命中了**隐藏**节点：Playwright 只对可见元素做可操作性检查，隐藏的那个会一直等到超时。先 `get_element_count` 看数量，再用更精确的选择器、或改用索引（快照里只有可见元素才有索引）。实测登录页的 `[class*=qrcode]` 命中 3 个，只有第一个是真二维码 |
 | **`get_modals` 回 `count=0`，但页面上确实有一层挡着点不动** | `count=0` 只说明「没有命中框架弹窗 / 类名线索 / 几何兜底」这三轮扫描，**不是「绝对没有遮挡」**：新版站点的「引导层 / 新手蒙层」常常既没有 `role=dialog`、类名也不含 dialog/modal。改用 `get_browser_state` 读文本找「暂不体验 / 我知道了 / 跳过」这类按钮，按索引点掉，元素数会立刻从个位数涨到几十上百 |
-| 写了新站点 skill，`SkillDocConsistencyTest` 报「命令表里不存在」 | 页面里的 snake_case 标识符（Vue 字段 / CSS 类名 / id / URL 参数）请用**双反引号**包起来，见 `skills/README.md` |
+| 写了新站点 skill，`SkillDocConsistencyTest` 报「命令表里不存在」 | 页面里的 snake_case 标识符（Vue 字段 / CSS 类名 / id / URL 参数）请用**双反引号**包起来，见 `docs/SKILL-CONVENTIONS.md` |
 
 ## 一、请求与响应
 
@@ -653,7 +653,7 @@ curl -H "Content-Type: application/json" \
 看到 `data.consumed: "noListener"`（或 `hasListeners: false`）就**不要再去调选择器**了，正解是：
 
 1. 用 `get_element_listeners` 复核一次（`selector` 或 `index` 都行）；
-2. 改用**组件方法直调**：`execute_js` 里拿到页面上的 Vue 实例，直接调它的 `upload()` / `emitChange()`（企业微信那个 `ImageUploader` 就是这么绕过去的，见 `skills/wecom-register-certify`）；
+2. 改用**组件方法直调**：`execute_js` 里拿到页面上的 Vue 实例，直接调它的 `upload()` / `emitChange()`（企业微信那个 `ImageUploader` 就是这么绕过去的，见 `.agents/skills/wecom-register-certify`）；
 3. 或先点它的可见父元素 / 触发框架自己的入口，再上传。
 
 ### 读取元素信息与状态（按索引）
@@ -1291,7 +1291,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 
 40. **`engineHonored:true` 不说明「这份 profile 里有登录态」**：这是两件事。`start` 的回执现在另外给 `data.profileSeenBefore`（这份 profile 之前用过吗）与 `data.profileNote`（例如「该 profile 目录本次是首次创建,任何站点都需要重新登录」/「引擎从 chromium 切到 firefox:两种引擎的 profile 格式不通用,登录态不通用,需要重新登录」）。看到引擎被换过、又碰上「所有站点都退登录了」，先看这两个字段。
 
-41. **站点 skill 里的非命令标识符请用双反引号**：`SkillDocConsistencyTest` 会把单反引号里的 snake_case 名字当命令名检查。Vue 字段、CSS 类名、HTML id、URL 参数、接口字段这些**页面里的名字**写成 `` ``subject_name`` `` 就不会被误判。完整约定见 `skills/README.md`。
+41. **站点 skill 里的非命令标识符请用双反引号**：`SkillDocConsistencyTest` 会把单反引号里的 snake_case 名字当命令名检查。Vue 字段、CSS 类名、HTML id、URL 参数、接口字段这些**页面里的名字**写成 `` ``subject_name`` `` 就不会被误判。完整约定见 `docs/SKILL-CONVENTIONS.md`。
 
 42. **`execute_js` 里的 `.click()` 触发不了「真点击才有的东西」**：JS 派发的 click 不是可信事件，`window.open` 会被浏览器拦掉，部分框架的提交按钮也不认它。实测 12306 结果页的「预订」（`<a class="btn72" onclick="checkG1234(...)">`）用 `.click()` 完全没反应，**而接口照样回 `ok:true`** —— 于是「点了没反应」被误判成页面问题。正解是 `click_element_by_selector` / `click_element_by_index`（真实鼠标事件）。判断有没有生效看回执里的 `data.mode`（`js` 就是没走真实交互）与 `data.changed`。
 
@@ -1409,7 +1409,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 - 配方里的每一步都走同一套命令分发，所以**单步手跑与整段跑行为完全一致**，排障时可以把配方里的命令一条条贴出来单独执行。
 - 回执里带 `data.recipe` 与 `data.recipeDescription`，其余字段与 `commands` 批量完全一致（`count`/`succeeded`/`failed`/`results`）。
 - **配方不会自动生效**：必须显式点名 `run_recipe` 才执行，不做任何「看到这个域名就自动套用」的隐式推断。引擎选择同理，始终由调用方在 `start` 时决定。
-- **配方里的命令名会被构建期检查**：写错一个不会等到运行时才发现（见 `skills/README.md`）。
+- **配方里的命令名会被构建期检查**：写错一个不会等到运行时才发现（见 `docs/SKILL-CONVENTIONS.md`）。
 
 ### 现成配方
 

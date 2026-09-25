@@ -1,7 +1,7 @@
 ﻿<#
   deepseek-browser-use 技能冒烟测试
 
-  用 HTTP 接口把技能文档（.dsh/skills/deepseek-browser-use/SKILL.md）里承诺的行为跑一遍：
+  用 HTTP 接口把技能文档（.agents/skills/deepseek-browser-use/SKILL.md）里承诺的行为跑一遍：
   端点形态、start 的「一任务一实例」、get_browser_state 的页签块、自动截图与结构化文本落盘、
   批量指令、以及几种错误响应。
 

@@ -1529,7 +1529,7 @@ public class PlaywrightService {
     // 下载刻意**不在这里注册 page.onDownload**:Playwright Java 的 Page 级事件在客户端是挂到
     // **上下文**上再按页过滤的,每个页签注册一次就会不断累积上下文级监听器;而上下文事件分发一旦碰到
     // 已经释放的对象就会抛 `Object doesn't exist: response@…`,并在**后续任意一次 API 调用**上重抛
-    // (这一族异常在本套测试里确实会稳定复现,详见 docs/FEEDBACK-2026-09-24-wecom-admin.md 的 F8)。
+    // (这一族异常在真实站点上会稳定复现:几条毫不相干的命令报同一个已释放的对象)。
     // 下载的判定改成纯服务端地数下载目录,见 countDownloadFiles —— 不碰 Playwright 对象,少一份分发面。
     // 这个页签弹出的新窗口归同一个任务,别人看不见
     page.onPopup(popup -> claimPage(inst, popup));
@@ -1585,8 +1585,7 @@ public class PlaywrightService {
    * API 调用上重抛。数目录不碰任何 Playwright 对象,也就不会增加那方面的分发面。
    *
    * <p>
-   * <b>说明</b>:这一族异常在本套测试里是**既有**问题(与本次改动无关,见
-   * {@code docs/FEEDBACK-2026-09-24-wecom-admin.md} 的 F8),所以换实现并不是「修好了它」,
+   * <b>说明</b>:这一族「已释放对象」异常是**既有**问题(与本次改动无关),所以换实现并不是「修好了它」,
    * 只是不去增加新的分发面。
    *
    * <p>

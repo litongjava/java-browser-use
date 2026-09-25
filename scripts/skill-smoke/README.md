@@ -1,6 +1,6 @@
 # skill-smoke：deepseek-browser-use 技能冒烟测试
 
-用 HTTP 接口把技能文档（`.dsh/skills/deepseek-browser-use/SKILL.md`）里承诺的**行为**跑一遍。
+用 HTTP 接口把技能文档（`.agents/skills/deepseek-browser-use/SKILL.md`）里承诺的**行为**跑一遍。
 
 职责分工很明确：
 

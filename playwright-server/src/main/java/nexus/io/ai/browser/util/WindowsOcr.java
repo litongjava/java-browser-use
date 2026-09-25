@@ -19,7 +19,7 @@ import lombok.extern.slf4j.Slf4j;
  * <p>
  * <b>为什么服务端要吸收这个能力</b>:验证码、二维码、公告维护图这类环节「必须看图」,而不少模型不支持
  * 图片输入({@code read_image} 直接报「does not declare image input」)。以前只能在每个任务 skill 里各写
- * 一遍「用 Windows 自带 OCR 读维护图」的做法(见 {@code skills/cnipa-trademark-register} 1.5 节),
+ * 一遍「用 Windows 自带 OCR 读维护图」的做法(见 {@code .agents/skills/cnipa-trademark-register} 1.5 节),
  * 换个人写 skill 就要重踩一遍。这里把它固化成一个命令({@code ocr_image}),读不了图的模型也能自己答出
  * 「验证码是什么」这类问题的一部分。
  *

@@ -23,11 +23,12 @@ import nexus.io.ai.browser.actions.registry.CommandTable;
 /**
  * 校验技能文档与命令表保持一致,避免文档漂移
  *
- * <p>技能文档现在放在仓库的 {@code skills/<技能名>/SKILL.md}(装进 DSH 时位于
- * {@code .dsh/skills/<技能名>/SKILL.md}),而 Maven 测试的工作目录是 playwright-server,所以用 ..
- * 回到仓库根。历史位置(仓库根的 SKILL.md、{@code .dsh/skills/...})也认,免得换个装法就失效。
+ * <p>技能文档现在放在仓库的 {@code .agents/skills/<技能名>/SKILL.md} —— 它是 DSH 的**项目级技能根**,
+ * 在仓库里启动 dsh 会话就能直接发现这些技能。Maven 测试的工作目录是 playwright-server,所以用 ..
+ * 回到仓库根。其它装法({@code .dsh/skills/<技能名>/SKILL.md}、老的 {@code skills/...}、仓库根的
+ * {@code SKILL.md})也认,免得换一次目录这个守卫就静默失效。
  *
- * <p><b>命令表只由主技能文档负责覆盖</b>:{@code skills/} 下还有别的技能(例如某个具体站点的操作手册),
+ * <p><b>命令表只由主技能文档负责覆盖</b>:{@code .agents/skills/} 下还有别的技能(例如某个具体站点的操作手册),
  * 它们讲的是「怎么把命令组合起来用」,不该被迫把 90 多个方法都列一遍。所以:
  * <ul>
  * <li>命令清单覆盖、端点、frontmatter、旧接口名 → 只查主技能({@code SKILL_NAME});</li>
@@ -37,7 +38,7 @@ import nexus.io.ai.browser.actions.registry.CommandTable;
  *
  * <p>文档不存在时跳过整个类,便于单独拷贝模块构建。
  *
- * <p><b>写站点 skill 时的约定</b>(见 {@code skills/README.md}):文档里**单反引号**包起来的东西被当作
+ * <p><b>写站点 skill 时的约定</b>(见 {@code docs/SKILL-CONVENTIONS.md}):文档里**单反引号**包起来的东西被当作
  * 命令名检查,**双反引号**包起来的当作「页面里的名字」不检查。所以 Vue 字段、CSS 类名、HTML id、URL 参数、
  * 接口字段这些 snake_case 标识符请写成 `` 双反引号 `` 的形式。
  */
@@ -46,19 +47,36 @@ public class SkillDocConsistencyTest {
   /** 技能名:frontmatter 的 name,也是装进 DSH 时用的目录名 */
   private static final String SKILL_NAME = "deepseek-browser-use";
 
+  /** 仓库根(测试的工作目录是 playwright-server,所以用 .. 回到仓库根) */
+  private static final Path REPO_ROOT = Paths.get("..");
+
   /**
    * 依次尝试的位置
    *
-   * <p>{@code skills/SKILL.md} 是当前的实际位置;{@code skills/<技能名>/SKILL.md} 与
-   * {@code .dsh/skills/<技能名>/SKILL.md} 是「一技能一目录」的装法;仓库根的 {@code SKILL.md}
+   * <p>{@code .agents/skills/<技能名>/SKILL.md} 是当前的实际位置 —— DSH 的项目级技能根,在仓库里
+   * 启动 dsh 会话就能直接发现;{@code .dsh/skills/<技能名>/SKILL.md} 是另一种项目级装法;
+   * 老的 {@code skills/SKILL.md} / {@code skills/<技能名>/SKILL.md} 与仓库根的 {@code SKILL.md}
    * 是历史位置。都认,免得挪一次目录这个守卫就静默失效(它跳过时只会报 Skipped,不会报错)。
    */
-  private static final List<Path> SKILL_PATHS = List.of(Paths.get("..", "skills", "SKILL.md"),
-      Paths.get("..", "skills", SKILL_NAME, "SKILL.md"), Paths.get("..", "SKILL.md"),
-      Paths.get("..", ".dsh", "skills", SKILL_NAME, "SKILL.md"));
+  private static final List<Path> SKILL_PATHS = List.of(
+      REPO_ROOT.resolve(".agents").resolve("skills").resolve(SKILL_NAME).resolve("SKILL.md"),
+      REPO_ROOT.resolve(".dsh").resolve("skills").resolve(SKILL_NAME).resolve("SKILL.md"),
+      REPO_ROOT.resolve("skills").resolve(SKILL_NAME).resolve("SKILL.md"),
+      REPO_ROOT.resolve("skills").resolve("SKILL.md"), REPO_ROOT.resolve("SKILL.md"));
 
-  /** 主技能文档的上一级目录:仓库根的 skills/(找不到时退回仓库根) */
-  private static final List<Path> SKILL_ROOTS = List.of(Paths.get("..", "skills"), Paths.get(".."));
+  /** 技能根目录:仓库自带的是 .agents/skills,换了装法就认 .dsh/skills 与老的 skills/ */
+  private static final List<Path> SKILL_ROOTS = List.of(REPO_ROOT.resolve(".agents").resolve("skills"),
+      REPO_ROOT.resolve(".dsh").resolve("skills"), REPO_ROOT.resolve("skills"));
+
+  /**
+   * 站点 skill 的写作约定文档
+   *
+   * <p>它跟着技能文档一起搬过位置(以前是 {@code skills/README.md},现在是 {@code docs/} 下),
+   * 所以历史位置也认,免得换个文件名这条约定就没人在守。
+   */
+  private static final List<Path> CONVENTION_DOCS = List.of(REPO_ROOT.resolve("docs").resolve("SKILL-CONVENTIONS.md"),
+      REPO_ROOT.resolve(".agents").resolve("skills").resolve("README.md"),
+      REPO_ROOT.resolve("skills").resolve("README.md"));
 
   /** 文档里形如 `method_name` 的命令名 */
   private static final Pattern DOC_COMMAND = Pattern.compile("`([a-z][a-z0-9_]{2,})`");
@@ -120,7 +138,7 @@ public class SkillDocConsistencyTest {
     doc = new String(Files.readAllBytes(found), StandardCharsets.UTF_8);
   }
 
-  /** skills/ 下的全部技能文档(主技能 + 各站点操作手册) */
+  /** 技能根下的全部技能文档(主技能 + 各站点操作手册) */
   private static List<Path> allSkillDocs() throws IOException {
     List<Path> docs = new ArrayList<>();
     for (Path root : SKILL_ROOTS) {
@@ -198,7 +216,7 @@ public class SkillDocConsistencyTest {
    * 每一份技能文档里当作命令写的名字都必须真实存在
    *
    * <p>站点操作手册会大量提到命令名,写错一个(例如把 {@code get_tabs} 写成 {@code list_tabs}),
-   * 模型照着发请求就会拿到「不支持的方法」。这一条把 skills/ 下的所有文档都过一遍。
+   * 模型照着发请求就会拿到「不支持的方法」。这一条把技能根下的所有文档都过一遍。
    */
   @Test
   public void everySkillDocOnlyMentionsRealCommands() throws IOException {
@@ -217,7 +235,7 @@ public class SkillDocConsistencyTest {
       }
     }
     assertTrue("技能文档里写了命令表里不存在的命令:" + offenders
-        + "（页面里的 snake_case 标识符请用**双反引号**包起来,见 skills/README.md）", offenders.isEmpty());
+        + "（页面里的 snake_case 标识符请用**双反引号**包起来,见 docs/SKILL-CONVENTIONS.md）", offenders.isEmpty());
   }
 
   /**
@@ -229,17 +247,11 @@ public class SkillDocConsistencyTest {
   @Test
   public void everyRecipeOnlyMentionsRealCommands() throws IOException {
     List<Path> recipes = new ArrayList<>();
-    for (Path root : SKILL_ROOTS) {
-      Path dir = root.resolve("recipes");
-      if (!Files.isDirectory(dir)) {
-        continue;
-      }
+    Path dir = REPO_ROOT.resolve("recipes");
+    if (Files.isDirectory(dir)) {
       try (java.util.stream.Stream<Path> stream = Files.list(dir)) {
         stream.filter(path -> path.getFileName().toString().toLowerCase(java.util.Locale.ROOT).endsWith(".json"))
             .filter(Files::isRegularFile).forEach(recipes::add);
-      }
-      if (!recipes.isEmpty()) {
-        break;
       }
     }
     Assume.assumeTrue("没有找到 recipes/ 目录,跳过", !recipes.isEmpty());
@@ -335,22 +347,21 @@ public class SkillDocConsistencyTest {
   @Test
   public void skillAuthoringConventionsAreDocumented() {
     Path readme = null;
-    for (Path root : SKILL_ROOTS) {
-      Path candidate = root.resolve("README.md");
+    for (Path candidate : CONVENTION_DOCS) {
       if (Files.isRegularFile(candidate)) {
         readme = candidate;
         break;
       }
     }
-    Assume.assumeTrue("没有找到 skills/README.md,跳过", readme != null);
+    Assume.assumeTrue("没有找到 docs/SKILL-CONVENTIONS.md,跳过", readme != null);
     String text;
     try {
       text = new String(Files.readAllBytes(readme), StandardCharsets.UTF_8);
     } catch (IOException e) {
       throw new AssertionError("读不到 " + readme + ":" + e.getMessage(), e);
     }
-    assertTrue("skills/README.md 没有写明「双反引号声明非命令」这条约定", text.contains("双反引号"));
-    assertTrue("skills/README.md 没有给出非命令标识符的例子", text.contains("非命令"));
+    assertTrue("SKILL-CONVENTIONS.md 没有写明「双反引号声明非命令」这条约定", text.contains("双反引号"));
+    assertTrue("SKILL-CONVENTIONS.md 没有给出非命令标识符的例子", text.contains("非命令"));
   }
 
   @Test
