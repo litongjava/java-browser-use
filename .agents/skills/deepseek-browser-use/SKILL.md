@@ -10,6 +10,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 
 - 默认地址：`http://localhost:10049`（端口来自 `playwright-server/src/main/resources/app.properties` 的 `server.port`）
 - 启动服务：`java -jar deepseek-browser-use-<版本>-<平台>.jar`（发行包），或开发态在 `playwright-server` 目录执行 `mvn spring-boot:run`
+- **发行包可能落后于源码**：`dist/` 下的 jar 是构建产物，实测有一版连 `list_methods` / `get_config` / `shutdown` 都不支持，拿它开工会在半路撞「不支持的方法」。**开工第一条命令永远是 `list_methods`**（连它都没有 = 这份包太旧），要跟源码一致就用开发态起（`scripts/run/start-server.cmd`）。
 - **只有一个业务端点**：`POST http://localhost:10049/playwright/command`
 - 另有 `GET /playwright/health`（健康检查）与 `GET /data/**`（读取截图与结构化文本）
 - 共 116 个方法（拿不准就先 `list_methods`），`get_browser_state` 是阅读页面的入口，其余方法负责操作与观测
@@ -25,7 +26,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | `references/batch-and-js.md` | `commands` 批量、`expect` 断言、`execute_js` / `bodyFile` / `vars` |
 | `references/human-in-loop.md` | 验证码 / 扫码 / 短信码 / 人工登录、`ocr_image`、多步 `steps` |
 | `references/browsers.md` | 选浏览器与引擎、profile 与登录态、实例生命周期、残留进程 |
-| `references/pitfalls.md` | 53 条坑与限制（下面「症状表」与「最常踩的坑」里说的「第 N 条」都指它） |
+| `references/pitfalls.md` | 57 条坑与限制（下面「症状表」与「最常踩的坑」里说的「第 N 条」都指它） |
 
 > ## 省 token 铁律：非必要不要读图
 >
@@ -71,6 +72,10 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | **报 `because "frame" is null`，可这条命令只是只读查询** | `PAGE_NAVIGATING`：页面正在刷新/重建，**可重试**（约 1 秒后重发），只读命令服务端已自己等过 |
 | **`send_keys` 回了 `ok:true` 但页面毫无反应** | 看回执里的 `focused`：焦点可能根本不在输入框上（`isBody:true` 时会给 `focusNote`）。先 `click` 目标输入框，再送键 |
 | **`go_to_url` 报失败，可地址栏其实已经跳过去了** | 幂等导航现在会读地址栏核对（忽略 `?vd_source=…` 这类会话参数），到达了就按成功返回并带 `data.warning` |
+| **把二维码/验证码图给人，人说"扫不出来 / 颜色太多了"** | 是 `get_browser_state` 画的**彩色高亮层被截进了图里**（第 54 条）。现在所有截图口都会自动隐藏它；旧构建用 `execute_js` 删掉 `#playwright-highlight-container` 再截。确认真干净了用**像素直方图**：正常二维码只有黑白灰 |
+| **按文本点了一下，回 `ok:true` 但页面毫无反应** | 看 `data.textMatch`：`contains` 说明点中的是"包含"这个词的**更长容器**（第 55 条）。现在按「完全相等 → 可点击 → 可见 → 文本短」打分，`data.hit.text` / `data.textClickable` 会告诉你到底点中了什么 |
+| **`get_form_state` 说某个必填项是空的，可页面上明明填好了**；或反过来：**报出来的值看着挺对，提交却说"必填"** | 都是**自定义下拉**（`ds-select` / `ant-select` 那类）：落库前 `input.value` 里是"你打的字"（看着像值、其实没落库），落库后它被清空、真值只在显示节点里。看 `valueFrom`：`display` 就是后者（第 56 条）。**判据要三样一起看**：值 / 显示节点文本 / 容器类名后缀（`--error` = 没落库） |
+| **`wait_for_idle` 等满超时（页面有轮询），而且批量里后面的步骤全没跑** | 改用 `wait_for_stable`；批量加 `--keep-going`（= `stopOnError:false`），否则一条等待超时会把后面全吃掉（第 57 条） |
 
 ## 一、最小可用：请求、客户端、自省
 
@@ -184,7 +189,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 | --- | --- |
 | `get_page_snapshot` | 想一次拿到 url / 标题 / 页签 / 弹窗 / 是否还在加载（可选带控制台与请求），替代五六次单独调用；**不含 DOM 快照文本** |
 | `diff_dom_text` | 判断「页面到底动没动」：重新执行一次 buildDomTree 与上次快照按行做差，返回 `data.changed`/`added`/`removed`。**不产生新的截图/文本文件** |
-| `get_form_state` | **填完一屏表单后对一遍**：一次读回每个控件的标签/当前值/是否可见/是否禁用/校验错误，比逐个 `get_element_value` 省调用，也更容易发现「值填了但没进模型」的字段（`data.errors` 直接给「哪个字段、错在哪」） |
+| `get_form_state` | **填完一屏表单后对一遍**：一次读回每个控件的标签/当前值/是否可见/是否禁用/校验错误，比逐个 `get_element_value` 省调用，也更容易发现「值填了但没进模型」的字段（`data.errors` 直接给「哪个字段、错在哪」）。每个字段还有一个 `valueFrom`：`dom` = 值取自控件本身，`display` = **值取自组件自己渲染的显示节点**（`ds-select` / `ant-select` 这类自定义下拉**落库之后** `input.value` 会被清空、真值只在显示节点里；别拿 `display` 的值去跟 DOM 的 `value` 比对） |
 | `get_interactive_map` | 补上快照里没有的 `id`/`class`/`href`，以及每个元素的 `hasListeners`（这个元素有没有挂事件监听器） |
 
 ### 一个浏览器，多个任务
@@ -288,7 +293,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 | --- | --- |
 | `click_element_by_selector` | CSS 选择器取第一个匹配并点击；**点完如果弹出新页签会自动切过去并带到最前**；目标在跨域 iframe 里时传 `frame` |
 | `input_text_by_selector` | 覆盖式填充。**可见字段默认走真实输入**（进框架模型），这是「值填了但预览/校验说为空」时的正解 |
-| `click_element_by_text` | 按可见文本定位，**先向上找最近的可点击祖先**（`a`/`button`/`[role=button]`/`[onclick]`），找不到才点文本节点本身；返回真正命中的 `data.tag`/`data.outerHtml` |
+| `click_element_by_text` | 按可见文本定位，**先向上找最近的可点击祖先**（`a`/`button`/`[role=button]`/`[onclick]`），找不到才点文本节点本身；返回真正命中的 `data.tag`/`data.outerHtml`，以及**这次是怎么匹配上的**：`data.textMatch`（`exact`/`contains`）、`data.textLength`、`data.textCandidates`、`data.textClickable`、`data.textMatchNote`。因为 `getByText` 传字符串是**包含匹配**，短文本（`Submit`）会被含它的长容器（"once **submit**ted"）抢先匹配——所以这条只当兜底，优先用索引或选择器 |
 | `click_element_by_role` | 无障碍角色：`role` 如 `button`、`link`、`textbox`、`checkbox`，可配 `name` |
 | `input_text_by_label` | 按表单标签 / `aria-label` 定位输入框 |
 | `hover_and_click` | 悬停后**立刻**点同一个元素（`hoverDelayMs` 默认 300 毫秒）。悬浮菜单专用：分两步调用中间隔着一次推理往返，菜单早收起来了 |
@@ -505,7 +510,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 | 判断点击到底生效没有 | 看点击回执里的 `data.changed`，或 `diff_dom_text` 确认快照有没有变。**不要为了这个去读 `data.screenshot`** |
 | 事后复看某一步的页面 | `GET http://localhost:10049/data/<id>/<seq>.png`（截图）与同序号的 `.txt`（页签 + 可交互结构化文本，两者序号相同表示同一时刻） |
 
-## 九、最常踩的 12 条坑（完整 53 条见 `references/pitfalls.md`）
+## 九、最常踩的 12 条坑（完整 57 条见 `references/pitfalls.md`）
 
 1. **页面变化后索引全部重算**：点击、跳转、异步渲染之后必须重新 `get_browser_state`；沿用旧索引会得到 `索引越界` 或超时（报错里带快照年龄与元素范围，照它判断就行）。
 2. **快照里没有 `id`/`class`/`href`**：按 id/class 定位用选择器类命令，取 href 用 `execute_js`，批量看属性用 `get_interactive_map`。
@@ -520,4 +525,4 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 11. **`send_keys` 回了 `ok:true` 但页面毫无反应**：看回执里的 `focused` —— 焦点可能根本不在输入框上（落在 `<body>` 上时会给 `focusNote`）。先 `click` 目标输入框再送键。
 12. **`go_to_url` 报失败、可地址栏其实已经跳过去了**：幂等导航会读一次地址栏核对（比较主机+路径，忽略 `?vd_source=…` 这类会话参数），到达了就按成功返回并带 `data.warning`。
 
-其余 41 条里最值得先翻的几类：跨域 iframe（第 37 条）、弹窗与遮挡（第 20 / 39 条）、网络响应体缓存（第 23 条）、`data/<id>/` 与日志不会自动清理（第 27 / 34 条）、强杀服务留下孤儿浏览器（第 32 条）、`get_dialog` 是「最近一次弹窗」（第 20 条）、`Object doesn't exist` 伪故障的机制（第 47 条）、整页截不出图的 ``capture_degraded``（第 48 条）、回读看不到 input 不等于上传失败（第 45 条）。
+其余 45 条里最值得先翻的几类：跨域 iframe（第 37 条）、弹窗与遮挡（第 20 / 39 条）、网络响应体缓存（第 23 条）、`data/<id>/` 与日志不会自动清理（第 27 / 34 条）、强杀服务留下孤儿浏览器（第 32 条）、`get_dialog` 是「最近一次弹窗」（第 20 条）、`Object doesn't exist` 伪故障的机制（第 47 条）、整页截不出图的 ``capture_degraded``（第 48 条）、回读看不到 input 不等于上传失败（第 45 条）、**截图里的彩色高亮层会让二维码扫不出来**（第 54 条）、**按文本点击点中了"包含"它的长容器**（第 55 条）、**`get_form_state` 对自定义下拉撒的两个谎**（第 56 条）、**`wait_for_idle` 在轮询页面上永远等不到**（第 57 条）。

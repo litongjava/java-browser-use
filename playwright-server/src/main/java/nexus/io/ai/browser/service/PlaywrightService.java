@@ -2213,8 +2213,9 @@ public class PlaywrightService {
     try {
       Files.createDirectories(dir);
       settle(inst);
-      spuriousRetry(() -> inst.page
-          .screenshot(new Page.ScreenshotOptions().setPath(png).setTimeout(captureTimeoutMs())));
+      // 高亮层必须挡在镜头外(见 withHighlightHidden):否则人工看到的二维码/验证码是被彩色框压住的
+      spuriousRetry(() -> withHighlightHidden(inst, () -> inst.page
+          .screenshot(new Page.ScreenshotOptions().setPath(png).setTimeout(captureTimeoutMs()))));
       kv.set("screenshot", "/" + DATA_DIR + "/" + inst.id + "/" + seq + ".png");
       kv.set("screenshot_path", png.toAbsolutePath().toString());
       inst.captureFailures.set(0);
@@ -2255,6 +2256,52 @@ public class PlaywrightService {
             + "需要确认画面请让人类看一眼浏览器窗口(request_human_input),或用 execute_js 读 DOM 自证。");
     return kv;
   }
+
+  /**
+   * 截图期间临时隐藏 get_browser_state 画的高亮层
+   *
+   * <p>
+   * 高亮层({@code #playwright-highlight-container})是给智能体「看索引」用的覆盖层,但它会**被截进图里**。
+   * 实测在 DeepSeek 平台的收银台上:微信支付二维码是 160×160 的 canvas,高亮层正好压在它上面,
+   * 截出来的二维码是彩色的(橙 {@code 255,165,0} / 钢蓝 {@code 70,130,180} / 绯红 {@code 220,20,60}),
+   * 人拿手机怎么都扫不出来;而图本身"有内容",只读文本完全发现不了这件事 —— 只有把图交给人才会暴露。
+   *
+   * <p>
+   * 所以这里在截图前把高亮层 {@code display:none}、截完还原,一次修掉「截验证码 / 二维码 / 图表 / 纯图片按钮」
+   * 这一整类场景。{@code extract_structured_data} 早就是这么干的(读正文前隐藏高亮层),这里是同一套做法。
+   *
+   * <p>
+   * 隐藏失败不阻断截图:量不到高亮层(页面正在导航、容器还没画)时照常截,总比一张图都拿不到强。
+   */
+  private static <T> T withHighlightHidden(BrowserInstance inst, java.util.function.Supplier<T> action) {
+    boolean hidden = false;
+    try {
+      hidden = Boolean.TRUE.equals(inst.page.evaluate(HIDE_HIGHLIGHT));
+    } catch (PlaywrightException e) {
+      log.debug("隐藏高亮层失败(照常截图):{}", briefMessage(e.getMessage()));
+    }
+    try {
+      return action.get();
+    } finally {
+      if (hidden) {
+        try {
+          inst.page.evaluate(SHOW_HIGHLIGHT);
+        } catch (PlaywrightException e) {
+          log.debug("还原高亮层失败:{}", briefMessage(e.getMessage()));
+        }
+      }
+    }
+  }
+
+  /** 隐藏高亮层:返回值表示「确实隐藏了」,截图后要按它决定是否还原 */
+  private static final String HIDE_HIGHLIGHT =
+      "() => { const c = document.getElementById('playwright-highlight-container');"
+          + " if (!c) return false; c.style.display = 'none'; return true; }";
+
+  /** 还原高亮层:置空 display 而不是写死一个值,免得覆盖页面自己设过的样式 */
+  private static final String SHOW_HIGHLIGHT =
+      "() => { const c = document.getElementById('playwright-highlight-container');"
+          + " if (c) c.style.display = ''; }";
 
   /** 自动截图单次超时(毫秒,{@code browser.capture.timeoutMs}) */
   static double captureTimeoutMs() {
@@ -5337,6 +5384,7 @@ public class PlaywrightService {
     }
     try {
       Kv info = describe(hit.locator, hit.marker);
+      info.set(hit.describeMatch());
       ActionOutcome outcome = new ActionOutcome();
       try {
         clickWithMode(hit.locator, mode, outcome, () -> hit.locator.click(clickOptions()));
@@ -5356,10 +5404,44 @@ public class PlaywrightService {
   private static final class TextHit {
     final Locator locator;
     final String marker;
+    /** exact=与查询完全相同,contains=只是包含(见 {@link #resolveByText} 的打分) */
+    final String how;
+    /** 命中元素的文本长度:contains 命中时这是判断「是不是点错了」的第一线索 */
+    final int textLength;
+    /** 这次查询一共有几个候选 */
+    final int candidates;
+    /** 命中元素本身(或它最近的可点击祖先)是不是可点击的 */
+    final boolean clickable;
 
     TextHit(Locator locator, String marker) {
+      this(locator, marker, null, -1, -1, false);
+    }
+
+    TextHit(Locator locator, String marker, String how, int textLength, int candidates, boolean clickable) {
       this.locator = locator;
       this.marker = marker;
+      this.how = how;
+      this.textLength = textLength;
+      this.candidates = candidates;
+      this.clickable = clickable;
+    }
+
+    /** 把「这次到底是怎么匹配上的」写进回执,点错元素时一眼可见 */
+    Kv describeMatch() {
+      Kv kv = new Kv();
+      if (how != null) {
+        kv.set("textMatch", how).set("textLength", textLength).set("textCandidates", candidates)
+            .set("textClickable", clickable);
+        if (!clickable) {
+          kv.set("textMatchNote", "命中元素本身不是可点击元素,也没有可点击祖先(a/button/[role=button]):"
+              + "点它很可能什么都不发生,请改用 click_element_by_selector 或按索引点");
+        } else if (!"exact".equals(how)) {
+          kv.set("textMatchNote", "这次是**包含**匹配(不是完全相等),命中元素文本长 " + textLength
+              + " 字符;若这不是你想点的那个,说明短文本被更长的容器抢先匹配了,"
+              + "请改用 click_element_by_selector 或先 get_browser_state 按索引点");
+        }
+      }
+      return kv;
     }
 
     void cleanup() {
@@ -5380,6 +5462,14 @@ public class PlaywrightService {
    * <p>
    * 给命中的元素打一个临时属性,再用属性选择器取回,这样拿到的定位器只指向这一个元素, 不受祖先/兄弟节点同名文本的影响。属性由调用方在动作完成后清理(见
    * {@link TextHit#cleanup()})。
+   *
+   * <p>
+   * <b>为什么要给候选打分</b>:{@code page.getByText} 传字符串时是**大小写不敏感的包含匹配**,
+   * 而这里原来取的是**文档顺序里的第一个**候选。实测在 DeepSeek 平台的开票表单上,{@code text=Submit}
+   * 命中的是「Invoice Rules」那段说明文字 —— 因为第 4 条写着 "cannot be changed once **submit**ted",
+   * 于是点了一个两千多字符的纯文本容器:回执 {@code ok:true},页面毫无反应,真正的 Submit 按钮一动没动。
+   * 现在按「完全相等 → 有可点击祖先 → 可见 → 文本短」的元组打分取最优,并把「这是包含命中」
+   * 一并写进回执({@link TextHit#describeMatch()}),点错元素时一眼可见。
    */
   private TextHit resolveByText(BrowserInstance inst, String text) {
     Locator candidates = inst.page.getByText(text);
@@ -5393,18 +5483,67 @@ public class PlaywrightService {
       return null;
     }
     String marker = "data-br-hit-" + System.nanoTime();
-    for (int i = 0; i < count; i++) {
-      Locator candidate = candidates.nth(i);
-      try {
-        candidate.evaluate("(e, m) => { const c = e.closest('a,button,[role=button],input[type=button],"
-            + "input[type=submit],[onclick]') || e; c.setAttribute(m, '1'); return c.tagName; }", marker);
-        return new TextHit(inst.page.locator("[" + marker + "='1']").first(), marker);
-      } catch (PlaywrightException e) {
-        log.debug("文本定位候选不可用:{}", briefMessage(e.getMessage()));
+    try {
+      JSONObject args = new JSONObject();
+      args.put("marker", marker);
+      args.put("query", text);
+      Object picked = candidates.evaluateAll(TEXT_HIT_SCRIPT, args);
+      if (picked instanceof Map) {
+        Map<?, ?> info = (Map<?, ?>) picked;
+        return new TextHit(inst.page.locator("[" + marker + "='1']").first(), marker,
+            info.get("how") == null ? null : String.valueOf(info.get("how")), asInt(info.get("length")),
+            asInt(info.get("candidates")), Boolean.TRUE.equals(info.get("clickable")));
       }
+    } catch (PlaywrightException e) {
+      log.debug("文本候选打分失败,退回第一个候选:{}", briefMessage(e.getMessage()));
     }
     return new TextHit(candidates.first(), null);
   }
+
+  /**
+   * 文本候选的打分脚本
+   *
+   * <p>
+   * 打分元组 {@code [是否完全相等, 是否有可点击祖先, 是否可见, 文本长度]},按字典序取最小。
+   * 把「文本长度」放在最后是兜底:即使两条都不完全相等,也该点那个短的(按钮上的标签),
+   * 而不是把整段正文都算进去的长容器。{@code closest} 命中自身,所以 {@code <div role="button">Submit</div>}
+   * 这类目标自己就算可点击。
+   */
+  private static final String TEXT_HIT_SCRIPT = """
+      (els, args) => {
+        const cmp = (a, b) => {
+          for (let i = 0; i < a.length; i++) { if (a[i] !== b[i]) return a[i] - b[i]; }
+          return 0;
+        };
+        const norm = (s) => String(s == null ? '' : s).replace(/\\s+/g, ' ').trim().toLowerCase();
+        const nq = norm(args.query);
+        const clickableSel = 'a,button,[role=button],input[type=button],input[type=submit],[onclick]';
+        let best = null, bestScore = null, bestHow = null, bestClickable = false;
+        for (const e of els) {
+          let t;
+          try { t = norm(e.innerText || e.textContent); } catch (err) { continue; }
+          const anc = e.closest(clickableSel);
+          const target = anc || e;
+          let visible = true;
+          try {
+            const r = target.getBoundingClientRect();
+            const st = window.getComputedStyle(target);
+            visible = r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none';
+          } catch (err) { /* 量不到几何就按可见处理,别因为取不到就把唯一候选排到最后 */ }
+          const score = [t === nq ? 0 : 1, anc ? 0 : 1, visible ? 0 : 1, t.length];
+          if (!bestScore || cmp(score, bestScore) < 0) {
+            bestScore = score;
+            best = target;
+            bestHow = t === nq ? 'exact' : 'contains';
+            bestClickable = !!anc;
+          }
+        }
+        if (!best) return null;
+        best.setAttribute(args.marker, '1');
+        return {tag: best.tagName, how: bestHow, length: bestScore[3], candidates: els.length,
+                clickable: bestClickable};
+      }
+      """;
 
   /** 命中元素的可读描述:tag、文本、outerHtml 片段,用来判断到底点中了什么 */
   private static Kv describe(Locator locator) {
@@ -6005,6 +6144,35 @@ public class PlaywrightService {
             return el.getAttribute('placeholder') || null;
           } catch (e) { return null; }
         };
+        // 校验态不能只看表单容器的类名:实测 DeepSeek 的 ds-select 把 ds-select--error 挂在**下拉组件自己**
+        // 身上(外层 form-item 的类名干干净净),于是 get_form_state 报 errorCount=0 而字段明明是红的。
+        // 只认「整词」形状的 error,免得把 errorBoundary 之类的类名当成校验失败。
+        const errCls = (n) => {
+          try {
+            return /(?:^|[\\s_-])(?:has-|is-)?error(?:$|[\\s_-])/i.test(String((n && n.className) || ''));
+          } catch (e) { return false; }
+        };
+        // 自定义下拉(antd / Element / ds-select)的真实取值在**显示节点**里,input 自己是空的:
+        // 只报 input.value 会让调用方以为「这个必填项还没填」——实测在 ds-select 上就是这么卡住提交的。
+        // 注意要从**父节点**往上找组件根:下拉自己的 input 类名(ds-select__input /
+        // ant-select-selection-search-input)本身就含 select,从自己开始 closest 会立刻命中自己,
+        // 然后一个显示节点都找不到(这条是被单元测试逼出来的)。
+        const displayOf = (el) => {
+          try {
+            const holder = el.parentElement;
+            const root = holder
+              ? holder.closest('[class*="select"],[class*="picker"],[class*="combobox"]') : null;
+            if (!root) return null;
+            const nodes = root.querySelectorAll('[class*="selection-item"],[class*="select__select"],'
+              + '[class*="select__value"],[class*="selected-item"],[class*="select-value"]');
+            for (const n of nodes) {
+              if (/placeholder/i.test(String(n.className || ''))) continue;
+              const t = (n.innerText || '').replace(/\\s+/g, ' ').trim();
+              if (t) return t;
+            }
+            return null;
+          } catch (e) { return null; }
+        };
         const fields = [];
         const controls = Array.from(scope.querySelectorAll('input,textarea,select'));
         for (const el of controls) {
@@ -6017,18 +6185,26 @@ public class PlaywrightService {
           if (!visible && !args.includeHidden) continue;
           const item = el.closest('.ant-form-item, .form-item, .el-form-item, [class*="form-item"]');
           let error = null;
-          let invalid = false;
           if (item) {
             const message = item.querySelector('.ant-form-item-explain-error, [class*="error-message"], .error');
             if (message && message.innerText && message.innerText.trim()) error = message.innerText.trim();
-            invalid = /has-error|is-error|error/.test(String(item.className || ''));
+          }
+          const invalid = errCls(item) || errCls(el) || errCls(el.parentElement);
+          let value = el.value === undefined ? null : el.value;
+          let valueFrom = 'dom';
+          if (type === 'password') {
+            value = '[redacted]';
+          } else if (!value) {
+            const shown = displayOf(el);
+            if (shown) { value = shown; valueFrom = 'display'; }
           }
           fields.push({
             label: labelOf(el),
             id: el.id || null,
             name: el.getAttribute('name') || null,
             type: type,
-            value: type === 'password' ? '[redacted]' : (el.value === undefined ? null : el.value),
+            value: value,
+            valueFrom: valueFrom,
             checked: typeof el.checked === 'boolean' ? el.checked : null,
             disabled: !!el.disabled,
             readOnly: !!el.readOnly,
@@ -6216,7 +6392,7 @@ public class PlaywrightService {
       options.setPath(Paths.get(target));
     }
     try {
-      byte[] bytes = spuriousRetry(() -> inst.page.screenshot(options));
+      byte[] bytes = spuriousRetry(() -> withHighlightHidden(inst, () -> inst.page.screenshot(options)));
       Kv data = Kv.by("size", bytes.length);
       if (target != null && !target.isEmpty()) {
         data.set("path", target);
@@ -6320,8 +6496,9 @@ public class PlaywrightService {
       file = defaultShotPath(inst);
     }
     try {
-      byte[] bytes = spuriousRetry(
-          () -> locator.screenshot(new Locator.ScreenshotOptions().setTimeout(actionTimeoutMs())));
+      // 元素截图是高亮层污染的重灾区:二维码/验证码正好是「必须看图」的元素,被彩色框压住就废了
+      byte[] bytes = spuriousRetry(() -> withHighlightHidden(inst,
+          () -> locator.screenshot(new Locator.ScreenshotOptions().setTimeout(actionTimeoutMs()))));
       Kv data = Kv.by("size", bytes.length).set("target", target);
       if (resolved != null) {
         data.set(resolved.describe());

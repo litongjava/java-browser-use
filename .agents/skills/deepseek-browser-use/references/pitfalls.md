@@ -1,4 +1,4 @@
-# 坑与限制（53 条）
+# 坑与限制（57 条）
 
 > 本文是 [SKILL.md](../SKILL.md) 的分册，按需阅读。SKILL.md 开头的「症状 → 命令」表里提到的「第 N 条」就是本文的编号。
 
@@ -256,3 +256,87 @@
     带偏去排查「为什么打不开」。现在幂等导航会读一次地址栏：已经落在目标上（比较主机+路径，
     忽略站点自动追加的 `?vd_source=…` 这类会话参数）就按成功返回，并带 `data.warning` 与
     `data.spuriousDispatch`。
+
+54. **截图里可能混进 get_browser_state 画的彩色高亮层 —— 二维码/验证码会因此**完全不可用**。**
+    实测在 DeepSeek 平台的收银台上：微信支付二维码是一个 160×160 的 `<canvas>`，
+    `get_element_screenshot` 截出来是"有内容"的图，但**人拿手机怎么都扫不出来**，因为我们自己画的
+    `#playwright-highlight-container`（每个可交互元素一个彩色框、`position:fixed` 全屏覆盖）被带进了镜头。
+    这件事在文本里完全看不出来 —— 只有把图交给人才会暴露，所以症状是"你给的图我扫不了"，而不是"报错"。
+
+    **确诊办法：不要靠眼睛看图，做一次像素直方图**（把 PNG 的颜色统计出来）。正常二维码只该有黑白灰；
+    出现 `255,165,0`（橙 `orange`）、`70,130,180`（钢蓝 `steelblue`）、`220,20,60`（绯红 `crimson`）
+    这些**高亮层专用色**就实锤了。实测污染版 `distinctColors=16+`，干净版 `distinctColors=5`。
+
+    **服务端现在这么做**：`screenshot`、`get_element_screenshot` 与**每次动作后的自动截图**
+    （`PlaywrightService.withHighlightHidden`）在拍之前把高亮层 `display:none`、拍完还原 ——
+    `extract_structured_data` 早就是这么干的，这次把同一套做法推广到了所有截图口。隐藏失败不阻断截图。
+
+    **如果手上是旧构建**（`data.url` 给的图仍是花的）：先用 `execute_js` 把高亮层从 DOM 里删掉再截，
+    顺序不能反、中间不要再调 `get_browser_state`（它会把高亮层画回来）：
+
+    ```json
+    {"body": "() => { const c=document.getElementById('playwright-highlight-container'); let n=0; if(c){c.remove();n++;} document.querySelectorAll('.playwright-highlight-label').forEach(e=>{e.remove();n++;}); return {removed:n}; }"}
+    ```
+
+    回归用例：`BrowserObservationUpgradeTest#elementScreenshotExcludesHighlightOverlay`、
+    `#actionCaptureAlsoExcludesHighlightOverlay`。
+
+55. **按文本点击会点中"包含"这个词的更长的容器 —— 回执 `ok:true` 而真按钮一动没动。**
+    实测在 DeepSeek 的开票表单上敲 `click_element_by_text` 传 `text=Submit`，命中的是「Invoice Rules」
+    那段说明文字，因为第 4 条写着 "cannot be changed once **submit**ted"：
+    `page.getByText(<字符串>)` 是**大小写不敏感的包含匹配**，而老实现取的是**文档顺序里的第一个候选**，
+    于是点了一个两千多字符的纯文本容器。
+
+    现在按元组 `[是否完全相等, 是否有可点击祖先, 是否可见, 文本长度]` 字典序打分取最优
+    （文本长度放最后是兜底：即使都不完全相等，也该点短的那个），并把匹配真相写进回执：
+
+    | 字段 | 含义 |
+    | --- | --- |
+    | `data.textMatch` | `exact` 完全相等 / `contains` 只是包含 |
+    | `data.textLength` | 命中元素的文本长度（两千多 = 点到正文了） |
+    | `data.textCandidates` | 这次有几个候选 |
+    | `data.textClickable` | 命中的元素有没有可点击祖先（`false` 时点它很可能什么都不发生） |
+    | `data.textMatchNote` | 可疑时给出的下一步建议 |
+
+    **判据**：`ok:true` 之外还要看 `data.textMatch` 与 `data.hit.text`。能拿到索引就用 `click_element_by_index`，
+    能写选择器就用 `click_element_by_selector`，按文本点是兜底手段。
+    回归用例：`BrowserObservationUpgradeTest#textClickPrefersExactMatchOverEarlierContainingContainer`。
+
+56. **`get_form_state` 对"自定义下拉"（`ds-select` / `ant-select` 那类）会**同时**骗你和漏报：值的归属与错误态。**
+    实测 DeepSeek 开票表单的抬头是 `ds-select`，它在两个不同状态下会给出两种相反的错觉：
+
+    | 状态 | ``input.ds-select__input`` 的 `value` | 显示节点 | 容器类名后缀 |
+    | --- | --- | --- | --- |
+    | 只打了字、**没点 option**（未落库） | **就是你打的字** | 只有占位符 | `--error` |
+    | 点中 option（已落库） | **`""`（被组件清空）** | 真值在这里 | `--none` |
+
+    于是：
+
+    - **未落库时**：`get_form_state` 会报出一个**看起来完全正常的值**（其实是过滤框里的文本），
+      而字段还在 `--error`、提交时照样说"必填"——**"有值"不等于"落库"**；
+    - **已落库时**：真值只存在于组件的显示节点里，`input.value` 是空的，
+      老实现只读 `input.value` → 把**已经填好的**字段报成空值。
+
+    现在服务端：
+
+    - `input.value` 为空时去组件根里找显示节点，把值报在 `value` 里并加
+      **`valueFrom: "display"`**（普通字段仍是 `"dom"`）。**看到 `valueFrom:"display"` 就别拿它去跟
+      `document.querySelector(...).value` 比对**，对不上是正常的；占位节点（``.ds-select__placeholder``）会被跳过，
+      不会把占位符当值；
+    - 错误态除了外层 `form-item`，也看**控件自己与它父节点**的类名（只认"整词"形状的 error，
+      免得把 `errorBoundary` 之类误判）。实测 `ds-select--error` 挂在**组件自己**身上、外层 `form-item`
+      干干净净，老版本于是给出 `errorCount:0` 而字段明明是红的。
+
+    **判断这类下拉到底落库没有，一次读三样**（值 / 显示节点文本 / 容器类名），
+    别只看其中任意一个（可复制的 JS 见 `deepseek-platform-topup-invoice` skill 第 4.3 节）。
+    回归用例：`BrowserObservationUpgradeTest#formStateReadsValueOfCustomSelectFromDisplayNode`、
+    `#formStateDetectsErrorClassOnTheControlItself`。
+
+57. **`wait_for_idle` 在带轮询/动画的页面上永远等不到，而它在 `commands` 里失败会把后面所有步骤都吃掉。**
+    实测 DeepSeek 的 `/top_up` 页上 `wait_for_idle` 等满 20 秒都没安静（在途请求 21 个、DOM 变更 1157 次）——
+    这页有轮询。**"忙不忙"（`wait_for_idle`）与"内容变没变"（`wait_for_stable`）不能互相替代**：
+    页面可能一直在动而你要读的内容早就定下来了，这时用 `wait_for_stable`。
+
+    另一半是批量的默认行为：`commands` 的 `stopOnError` 默认 `true`，一条等待超时会让**后面的命令一条都不跑**
+    （实测那次的 `get_browser_state` 就没执行，等于白跑一轮、还看不到页面）。
+    批量里显式加客户端的 `--keep-going`（= 服务端 `stopOnError:false`），让每一步的结果都回来。

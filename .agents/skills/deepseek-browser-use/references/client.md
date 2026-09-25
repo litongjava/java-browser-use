@@ -23,6 +23,12 @@
 - `dsb.cmd` 中间隔着一层 cmd.exe，参数里的 `&`、`^`、`%` 可能被提前吃掉（中文与引号不受影响，已验证）。
   遇到这种参数不要换回别的发送方式，而是**把参数从命令行挪进文件**：`--params @文件.json`、`batch cmds.json`、
   `js @脚本.js` —— 长脚本、带中文的 JSON、带引号的选择器都走这条路，连转义都不用想。
+- **PowerShell 还会额外吃掉方括号与逗号**（它自己的一套参数解析），实测两种翻车：
+  `-p selector=div[role=button]` → `unrecognized arguments: div[role=button]`；
+  `-Dtest=A,B` → `Missing argument in parameter list`（逗号是 PowerShell 的数组运算符）。
+  **凡是值里带 `[`、`]`、`,`、`"` 的参数，一律写进 `--params @文件.json`**，别在命令行里跟 shell 打架。
+  CSS 属性选择器（`input[name=foo][value=bar]` 这种不带引号的写法）虽然能在命令行里活下来，
+  但放进文件始终更省事。
 
 `dsb` 的要点（完整用法与退出码见 `client/README.md`）：
 
