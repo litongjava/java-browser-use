@@ -146,13 +146,9 @@ public final class ListenerProbe {
     Kv result = new Kv();
     Kv traces;
     try {
-      if (locator.count() == 0) {
-        result.set("found", false);
-        return result;
-      }
-      Object raw = locator.first().evaluate(FRAMEWORK_TRACES);
+      Object raw = evaluateTraces(locator, frame, elementScript);
       if (!(raw instanceof Map)) {
-        result.set("found", false).set("error", "页面没有返回探测结果");
+        result.set("found", false);
         return result;
       }
       traces = new Kv();
@@ -193,6 +189,37 @@ public final class ListenerProbe {
     result.set("listeners", merged).set("detection", "heuristic");
     result.set("hasListeners", merged.isEmpty() ? null : Boolean.TRUE);
     return result;
+  }
+
+  /**
+   * 取元素的框架痕迹
+   *
+   * <p>
+   * <b>优先「现场重新解析元素」,不要用 Locator。</b>实测 {@code setInputFiles} 之后框架会把原来的
+   * input 换成新的(企业微信的上传组件就是这样),此时 Locator 已指向脱离文档的节点,
+   * {@code Locator.evaluate} 会一直等到**默认 30 秒超时**才抛,于是「上传成功」被写成
+   * {@code readbackError: Timeout 30000ms exceeded.} + {@code consumed: unknown}。
+   * 用 {@code frame.evaluate} 现场重新查询既读得到新节点,也**不会等**。
+   *
+   * @param elementScript 解析元素的 JS 表达式;为 null 时才退回 Locator(可能等到超时)
+   */
+  private static Object evaluateTraces(Locator locator, Frame frame, String elementScript) {
+    if (frame != null && elementScript != null && !elementScript.isBlank()) {
+      try {
+        return frame.evaluate(
+            "(() => { const el = (" + elementScript + "); return (" + FRAMEWORK_TRACES + ")(el); })()");
+      } catch (PlaywrightException e) {
+        // 现场解析失败(元素真的没了 / frame 没了)再退回 Locator 试一次
+      }
+    }
+    if (locator == null || locator.count() == 0) {
+      return null;
+    }
+    Object raw = locator.first().evaluate(FRAMEWORK_TRACES);
+    if (!(raw instanceof Map)) {
+      throw new PlaywrightException("页面没有返回探测结果");
+    }
+    return raw;
   }
 
   /**

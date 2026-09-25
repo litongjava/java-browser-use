@@ -55,6 +55,49 @@ public class ActionService {
   /** 命令数组里最多允许多少条,挡住一次请求塞进上万个动作 */
   private static final int MAX_COMMANDS = 200;
 
+  /**
+   * 遇到 Playwright 事件泵的「伪故障」时可以**放心重发**的命令
+   *
+   * <p>
+   * 只收三类:①只读(读回的是同一个页面状态,重发没有任何副作用);②幂等导航与等待(去同一个地址、
+   * 再等一次);③覆盖式落盘(截图 / PDF 写的是同一个文件)。判据来自实现语义,不是猜的。
+   *
+   * <p>
+   * <b>动作类一律不在名单里</b> —— 点击 / 输入 / 提交 / `execute_js` 都可能已经生效,重发会造成重复提交。
+   * 它们照样会被识别成 {@code SPURIOUS_DISPATCH}(见 {@link ActionError}),只是不自动重发,由调用方
+   * 读完页面状态再决定。{@code start} / {@code close} / {@code upload_file} / {@code set_cookie} 同理不收。
+   */
+  public static final Set<String> SPURIOUS_RETRY_SAFE = Set.of(
+      // 只读:页面状态
+      "get_browser_state", "get_page_snapshot", "diff_dom_text", "get_interactive_map", "get_form_state",
+      "list_frames", "extract_structured_data",
+      // 只读:页签与地址
+      "get_tabs", "get_url", "get_title",
+      // 只读:元素
+      "get_element_text", "get_element_html", "get_element_value", "get_element_attribute",
+      "get_element_listeners", "get_element_count", "get_element_box", "is_visible", "is_enabled", "is_checked",
+      // 只读:弹窗、日志、网络、存储
+      "get_modals", "get_console_logs", "get_dialog", "get_requests", "get_response_body",
+      "get_cookies", "get_local_storage",
+      // 只读:服务自省
+      "list_methods", "get_config", "list_tasks", "list_recipes", "get_job", "list_jobs",
+      // 覆盖式落盘:重发只是把同一个文件再写一遍
+      "screenshot", "get_element_screenshot", "pdf",
+      // 幂等导航
+      "go_to_url", "navigate", "reload", "go_back", "go_forward", "bring_to_front",
+      // 等待:再等一次没有副作用
+      "wait", "wait_for_element", "wait_for_text", "wait_for_url", "wait_for_load", "wait_for_function",
+      "wait_for_idle", "wait_for_stable", "wait_for_count", "wait_for_response",
+      // 幂等设置与清理
+      "set_viewport", "set_media", "set_offline", "set_headers", "set_dialog_behavior",
+      "clear_dialog", "clear_console_logs");
+
+  /** 伪故障最多重发几次(含首次):3 次以内,再多就是别的问题了 */
+  private static final int SPURIOUS_MAX_ATTEMPTS = 3;
+
+  /** 两次重发之间的间隔:伪故障是「消息泵里正在派发的那一条」引起的,挪开一点点就够了 */
+  private static final long SPURIOUS_RETRY_DELAY_MS = 120;
+
   private final PlaywrightService svc;
 
   public ActionService() {
@@ -71,11 +114,100 @@ public class ActionService {
     BrowserInstance inst = svc.getInstance(id);
     if (inst == null)
       return;
-    Kv capture = svc.capture(inst);
+    // 自动截图是**附带的取证**,它失败绝不该把一条已经成功的命令翻成失败:实测点下载类按钮之后
+    // 页面正在消失,截图/取证会抛 object-does-not-exist。这里兜一层,把原因如实写进回执就好。
+    Kv capture;
+    try {
+      capture = svc.capture(inst);
+    } catch (RuntimeException e) {
+      capture = Kv.by("screenshot_error", PlaywrightService.briefMessage(e.getMessage()));
+    }
     Object data = result.getData();
     Kv merged = data instanceof Kv ? (Kv) data : Kv.by("result", data);
     merged.set(capture);
     result.setData(merged);
+  }
+
+  /**
+   * 跑一条命令,并对 Playwright 的「伪故障」做有限重发
+   *
+   * <p>
+   * 起因是实测里最贵的一类假故障:一次任务里 {@code execute_js}、{@code get_form_state}、
+   * {@code get_element_box}、{@code go_to_url}、{@code wait_for_idle}、自动截图会**成串**报
+   * {@code Object doesn't exist: response@… / request@…},报错的对象与本次命令毫不相干,而页面完全正常。
+   * 根因在 Playwright Java:上下文事件分发在按 guid 查对象时,碰到已释放的对象就抛,而这一抛发生在消息泵里,
+   * 会砸在「当时正在等待回复的那次 API 调用」上(详见 {@link ActionError#SPURIOUS_DISPATCH})。
+   *
+   * <p>
+   * 服务端能做的就两件事:①对**重发无害**的命令自己重发({@link #SPURIOUS_RETRY_SAFE}),把噪声吃掉;
+   * ②其余命令照旧如实报告,并把「可能已经生效」说清楚。重发过一次的回执里会多一个
+   * {@code data.spuriousRetry},便于事后统计这类噪声到底有多少。
+   *
+   * @param method 命令名,决定要不要重发
+   * @param call   真正执行命令的动作;每次重发都会重新调用一次
+   */
+  static RespBodyVo dispatchWithSpuriousRetry(String method, java.util.function.Supplier<RespBodyVo> call) {
+    return dispatchWithSpuriousRetry(method, null, call);
+  }
+
+  /**
+   * 同上,{@code params} 用来读调用方**显式声明**的重发许可(目前只有 {@code execute_js} 用得上)
+   *
+   * @param params 命令参数;为 {@code null} 时按「没有声明任何许可」处理
+   */
+  static RespBodyVo dispatchWithSpuriousRetry(String method, JSONObject params,
+      java.util.function.Supplier<RespBodyVo> call) {
+    int maxAttempts = retrySafeFor(method, params) ? SPURIOUS_MAX_ATTEMPTS : 1;
+    for (int attempt = 1;; attempt++) {
+      RespBodyVo result;
+      try {
+        result = call.get();
+      } catch (RuntimeException e) {
+        if (attempt >= maxAttempts || !ActionError.isSpuriousDispatch(e.getMessage())) {
+          throw e;
+        }
+        sleepBeforeSpuriousRetry();
+        continue;
+      }
+      if (result != null && !result.isOk() && attempt < maxAttempts
+          && ActionError.isSpuriousDispatch(result.getMsg())) {
+        sleepBeforeSpuriousRetry();
+        continue;
+      }
+      if (result != null && attempt > 1) {
+        Kv data = result.getData() instanceof Kv ? (Kv) result.getData() : new Kv();
+        data.set("spuriousRetry", Kv.by("attempts", attempt).set("errorCode", ActionError.SPURIOUS_DISPATCH)
+            .set("note", "前 " + (attempt - 1) + " 次失败是 Playwright 事件分发的伪故障（对象已释放，与本次命令无关）："
+                + "服务端已自动重发，这次是重发后的结果"));
+        result.setData(data);
+      }
+      return result;
+    }
+  }
+
+  /**
+   * 这条命令这次可以重发吗
+   *
+   * <p>
+   * 名单里的命令直接放行;`execute_js` **默认不放行** —— 脚本可能有副作用,重发等于再执行一次
+   * (可能重复提交)。调用方确认「这个脚本重发无害」(绝大多数是读页面)时,在参数里写
+   * {@code retryOnSpurious: true},服务端才会替它吃掉伪故障。
+   */
+  static boolean retrySafeFor(String method, JSONObject params) {
+    if (SPURIOUS_RETRY_SAFE.contains(method)) {
+      return true;
+    }
+    return "execute_js".equals(method) && params != null
+        && Boolean.TRUE.equals(params.getBoolean("retryOnSpurious"));
+  }
+
+  private static void sleepBeforeSpuriousRetry() {
+    try {
+      Thread.sleep(SPURIOUS_RETRY_DELAY_MS);
+    } catch (InterruptedException e) {
+      // 被中断就把中断标志还回去,别在这里把调用方的语义改掉
+      Thread.currentThread().interrupt();
+    }
   }
 
   /**
@@ -107,8 +239,9 @@ public class ActionService {
     if (executor == null) {
       return RespBodyVo.fail(unknownMethodMessage(method));
     }
+    JSONObject args = params == null ? new JSONObject() : params;
     try {
-      RespBodyVo result = executor.run(svc, id, params == null ? new JSONObject() : params);
+      RespBodyVo result = dispatchWithSpuriousRetry(method, args, () -> executor.run(svc, id, args));
       if (!result.isOk() && result.getMsg() != null) {
         java.util.regex.Matcher match = java.util.regex.Pattern.compile("\\[([A-Z_]+)\\]").matcher(result.getMsg());
         String errorCode = match.find() ? match.group(1) : ActionError.code(result.getMsg());
@@ -124,8 +257,53 @@ public class ActionService {
       }
       attachCapture(result, id, method);
       return result;
+    } catch (IllegalArgumentException e) {
+      // 参数校验错(CommandTable 的 reqInt/reqStr 等):命令**根本没发出去**,不存在「可能已生效」的问题,
+      // 照旧给一句干脆的失败信息即可
+      return RespBodyVo.fail(method + " 失败：" + e.getMessage());
     } catch (Exception e) {
-      return RespBodyVo.fail(method + " 失败：" + PlaywrightService.briefMessage(e.getMessage()));
+      // 执行器抛到这里的异常,处理不了「动作到底生效没有」——实测点下载按钮时底层抛
+      // object-does-not-exist(artifact@/response@),文件其实已经落盘。老写法只说「失败」,
+      // 调用方就会重试,而重试可能造成**重复下载 / 重复提交**。所以这里明确标成「不确定」,
+      // 并把「先读状态、别直接重试」写进 data.note 与 msg。
+      String detail = PlaywrightService.briefMessage(e.getMessage());
+      boolean spurious = ActionError.isSpuriousDispatch(detail);
+      boolean retrySafe = retrySafeFor(method, args);
+      if (spurious && !retrySafe) {
+        // 伪故障 + 动作类命令:诊断说清楚,但结论仍是「不确定」——动作可能已经生效
+        Kv uncertain = Kv.by("errorCode", ActionError.ACTION_UNCERTAIN).set("retryable", false)
+            .set("spuriousDispatch", true)
+            .set("note", "这个异常来自 Playwright 的事件分发（底层对象已释放），不是 " + method
+                + " 自己报的错：命令**可能已经生效**。请先用只读命令"
+                + "（get_browser_state / get_form_state / get_page_snapshot）确认页面状态，"
+                + "不要直接重试——重试可能造成重复下载 / 重复提交。");
+        RespBodyVo resp = RespBodyVo.fail(method + " 失败：" + detail
+            + "（[" + ActionError.SPURIOUS_DISPATCH + "] 疑似 Playwright 事件分发的伪故障，"
+            + "但无法判断本次是否已生效，请先读页面状态再决定是否重试）");
+        resp.setData(uncertain);
+        return resp;
+      }
+      if (spurious) {
+        // 伪故障 + 只读命令:服务端已经替调用方重发过 SPURIOUS_MAX_ATTEMPTS 次,仍失败就如实报,
+        // 并明确「可以再发」——只读命令重发没有副作用,不必让调用方去猜
+        Kv detailKv = Kv.by("errorCode", ActionError.SPURIOUS_DISPATCH).set("retryable", true)
+            .set("retryAfterMs", 200).set("spuriousDispatch", true)
+            .set("note", "这是 Playwright 事件分发投递过来的伪故障（底层对象已释放，与本次命令无关）："
+                + "服务端已自动重发 " + SPURIOUS_MAX_ATTEMPTS + " 次仍未成功。只读命令可以放心再发一次。");
+        RespBodyVo resp = RespBodyVo.fail(method + " 失败：" + detail
+            + "（[" + ActionError.SPURIOUS_DISPATCH + "] 疑似 Playwright 事件分发的伪故障，只读命令可以再发一次）");
+        resp.setData(detailKv);
+        return resp;
+      }
+      Kv uncertain = Kv.by("errorCode", ActionError.ACTION_UNCERTAIN)
+          .set("retryable", false)
+          .set("note", "执行器抛了未预期异常，无法判断动作是否已经生效。请先用只读命令"
+              + "（get_browser_state / get_form_state / get_page_snapshot）确认页面状态，"
+              + "不要直接重试——重试可能造成重复下载 / 重复提交。");
+      RespBodyVo resp = RespBodyVo.fail(method + " 失败：" + detail
+          + "（[" + ActionError.ACTION_UNCERTAIN + "] 无法判断动作是否已生效，请先读页面状态再决定是否重试）");
+      resp.setData(uncertain);
+      return resp;
     }
   }
 

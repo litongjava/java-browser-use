@@ -207,7 +207,7 @@ public class CommandTable {
             optStr(a, "selector"), a.getDouble("clipX"), a.getDouble("clipY"), a.getDouble("clipWidth"),
             a.getDouble("clipHeight"), a.getBoolean("inline")));
     put("get_element_screenshot", (svc, id, a) -> svc.getElementScreenshot(id, a.getInteger("index"),
-        optStr(a, "selector"), optStr(a, "path"), a.getBoolean("inline")));
+        optStr(a, "selector"), optStr(a, "path"), a.getBoolean("inline"), optStr(a, "frame")));
     put("pdf", (svc, id, a) -> svc.pdf(id, optStr(a, "path")));
 
     // ---------- Cookie 与本地存储 ----------
@@ -353,7 +353,7 @@ public class CommandTable {
       }
       return svc.requestHumanInput(id, optStrRaw(a, "prompt"), a.getInteger("index"), optStr(a, "selector"),
           a.getInteger("timeoutSeconds"), stepListOf(a.getJSONArray("steps")), a.getLong("expiresAt"),
-          a.getBoolean("ocr"), optStr(a, "ocrLanguage"), a.getBoolean("inline"));
+          a.getBoolean("ocr"), optStr(a, "ocrLanguage"), a.getBoolean("inline"), optStr(a, "frame"));
     });
     put("submit_human_input", (svc, id, a) -> svc.submitHumanInput(id, reqStr(a, "requestId"),
         optStrRaw(a, "answer"), optStr(a, "stepId"), a.getJSONObject("answers")));
@@ -533,10 +533,32 @@ public class CommandTable {
 
   // ==================== 参数读取,缺失必填参数时给出中文原因 ====================
 
+  /**
+   * 「回执里的字段名」与「参数名」不一致的地方
+   *
+   * <p>
+   * 实测最容易踩的一处:{@code get_tabs} / {@code get_page_snapshot} 回执里每个页签的字段叫
+   * {@code index},但切页签的参数叫 {@code pageIndex}。照着回执传 {@code index} 只会得到
+   * 「缺少参数 pageIndex」,而这句话本身不提示两个名字的关系,于是要在两个名字之间再来回猜一轮。
+   * 方法名写错时会给近似建议(见 {@code ActionService.unknownMethodMessage}),参数名同样值得给。
+   */
+  private static final java.util.Map<String, String> CONFUSABLE_PARAMS = java.util.Map.of(
+      "pageIndex", "index");
+
+  /** 缺参数时的说明:如果调用方传的是一个常见混淆名,直接把对应关系写出来 */
+  private static String missingParamMessage(JSONObject args, String key) {
+    String confused = CONFUSABLE_PARAMS.get(key);
+    if (confused != null && args.containsKey(confused)) {
+      return "缺少参数 " + key + "（你传的是 " + confused + "：回执里那个字段叫 " + confused
+          + "，但这里的参数名是 " + key + "，改成 " + key + " 即可）";
+    }
+    return "缺少参数 " + key;
+  }
+
   private static int reqInt(JSONObject args, String key) {
     Integer value = args.getInteger(key);
     if (value == null) {
-      throw new IllegalArgumentException("缺少参数 " + key);
+      throw new IllegalArgumentException(missingParamMessage(args, key));
     }
     return value;
   }
@@ -544,7 +566,7 @@ public class CommandTable {
   private static double reqDouble(JSONObject args, String key) {
     Double value = args.getDouble(key);
     if (value == null) {
-      throw new IllegalArgumentException("缺少参数 " + key);
+      throw new IllegalArgumentException(missingParamMessage(args, key));
     }
     return value;
   }
@@ -552,7 +574,7 @@ public class CommandTable {
   private static String reqStr(JSONObject args, String key) {
     String value = args.getString(key);
     if (value == null || value.isEmpty()) {
-      throw new IllegalArgumentException("缺少参数 " + key);
+      throw new IllegalArgumentException(missingParamMessage(args, key));
     }
     return value;
   }

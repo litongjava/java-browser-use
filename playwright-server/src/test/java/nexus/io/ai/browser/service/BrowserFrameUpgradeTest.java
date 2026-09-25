@@ -708,6 +708,35 @@ public class BrowserFrameUpgradeTest {
     assertNotNull("要说清这个请求没有生效", created.getStr("note"));
   }
 
+  /**
+   * {@code request_human_input} 要能把跨域 iframe 里的元素截给人看
+   *
+   * <p>
+   * 实测企业微信登录页的二维码就在 iframe 里:{@code ocr_image} 与 {@code upload_file} 都支持
+   * {@code frame},唯独 {@code request_human_input} 不支持,于是 selector 只在顶层文档找、回执里
+   * {@code imageUrl} 是空的 —— 而「把人叫来看 iframe 里的验证码/二维码」恰恰是最需要它的场景。
+   */
+  @Test
+  public void humanInputCanTargetElementInsideFrame() {
+    openMain();
+    JSONObject params = new JSONObject();
+    params.put("prompt", "请扫描 iframe 里的二维码");
+    params.put("selector", "#innerBtn");
+    params.put("frame", consoleBase);
+    Kv withFrame = data(actions.execute(id, "request_human_input", params));
+    assertNotNull("给了 frame 就必须把图截出来,实际:" + withFrame, withFrame.getStr("imageUrl"));
+    assertNotNull(withFrame.getStr("imagePath"));
+    assertTrue("截的应当是 iframe 里的元素,实际:" + withFrame.getStr("imageTarget"),
+        String.valueOf(withFrame.getStr("imageTarget")).contains("frame"));
+
+    // 不给 frame 时顶层文档里没有这个元素:要如实报 imageError,而不是静默给一张空图
+    JSONObject noFrame = new JSONObject();
+    noFrame.put("prompt", "顶层找不到这个元素");
+    noFrame.put("selector", "#innerBtn");
+    Kv topOnly = data(actions.execute(id, "request_human_input", noFrame));
+    assertNotNull("定位不到时必须说清楚(这正是不传 frame 的后果)", topOnly.getStr("imageError"));
+  }
+
   // ==================== 截图 / OCR ====================
 
   /** ocr_image 必须给出结构化结果(有没有装 OCR 语言包都要能回话,不能抛异常) */

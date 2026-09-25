@@ -546,6 +546,16 @@ POST http://localhost:10049/playwright/command
 
 - 二维码元素用 `get_element_screenshot` 单独取也行（走 Playwright 元素截图，不受 canvas 跨域污染限制），
   但**优先用 `request_human_input` 一次把图和提示都给出去**。
+- **把二维码贴进聊天框（用户明确要求过）**：`request_human_input` 回执里有 `data.imageUrl`
+  （形如 `/data/<任务id>/shot-N.png`）。**补上绝对地址**，用 markdown 图片语法贴到回复里：
+
+  ```markdown
+  ![扫脸二维码](http://localhost:10049/data/1001/shot-1.png)
+  ```
+
+  这样用户**在对话里就能直接扫码**，不用去浏览器窗口找。同时仍然 `bring_to_front` ——
+  二维码有短时效，有头窗口里那一份是最新的。
+  **不要**把 `data.imageBase64` 回填到上下文（几十 KB，且模型多半读不了图），要图就给 URL。
 - **必须是法定代表人本人**扫脸。实测这一步完成后 `formData.legalperson_face_info.verify_result` 变成 `1`——
   **用这个字段判断扫脸过没过**，不要看页面文案。
 - 扫脸超时/失败会重置，重新发起即可；不要让智能体去"重试人脸识别"。

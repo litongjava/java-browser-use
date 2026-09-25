@@ -47,6 +47,9 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | 索引老是失效 | 「一次快照只做一个动作」，或全程用选择器；报错里已经带上快照的年龄与元素范围 |
 | 换了浏览器之后所有站点都退登录了 | 看 `start` 回执里的 `data.profileSeenBefore` / `data.profileNote`（换引擎等于换一套登录态） |
 | 操作一个 id 得到「没有找到对应的浏览器实例」 | 看报错里的服务启动时间：实例只在内存里，**服务重启即失效**，`list_tasks` 确认后重新 `start` 即可（登录态在 profile 里，不会丢） |
+| **报错说 `Object doesn't exist: response@…`，可这条命令根本没碰过什么 response**；而且换一条毫不相干的命令还是报同样的对象 | 这是 Playwright 事件泵投递过来的**伪故障**（见第十一节第 47 条），不是页面坏了：只读命令服务端**已自动重发**，回执里会多一个 `data.spuriousRetry`；`execute_js` 读页面时请传 `retryOnSpurious: true`；**点击/提交/支付类命令绝不要自动重发**，先读页面状态 |
+| **`get_element_screenshot` / `click_element_by_selector` 用 `[class*=xxx]` 报 `ACTION_TIMEOUT`（等元素可操作超时），可 `get_element_count` 明明说匹配到好几个** | 选择器命中了**隐藏**节点：Playwright 只对可见元素做可操作性检查，隐藏的那个会一直等到超时。先 `get_element_count` 看数量，再用更精确的选择器、或改用索引（快照里只有可见元素才有索引）。实测登录页的 `[class*=qrcode]` 命中 3 个，只有第一个是真二维码 |
+| **`get_modals` 回 `count=0`，但页面上确实有一层挡着点不动** | `count=0` 只说明「没有命中框架弹窗 / 类名线索 / 几何兜底」这三轮扫描，**不是「绝对没有遮挡」**：新版站点的「引导层 / 新手蒙层」常常既没有 `role=dialog`、类名也不含 dialog/modal。改用 `get_browser_state` 读文本找「暂不体验 / 我知道了 / 跳过」这类按钮，按索引点掉，元素数会立刻从个位数涨到几十上百 |
 | 写了新站点 skill，`SkillDocConsistencyTest` 报「命令表里不存在」 | 页面里的 snake_case 标识符（Vue 字段 / CSS 类名 / id / URL 参数）请用**双反引号**包起来，见 `skills/README.md` |
 
 ## 一、请求与响应
@@ -187,7 +190,7 @@ python client/dsb.py --port 10049 selftest --browser chrome
 
 属性中的 name、value、状态值不再按 15 字符截断；title、placeholder、alt、aria-label、selected-text 的展示上限为 160 字符。普通布局容器不增加缩进，表单、菜单、表格等语义结构保留缩进，最多 6 层。
 
-动作错误的 `data.errorCode` 区分 ELEMENT_READ_ONLY、ELEMENT_DISABLED、ELEMENT_HIDDEN、ELEMENT_OBSCURED、ELEMENT_NOT_EDITABLE、STALE_ELEMENT、ACTION_TIMEOUT 和 ACTION_FAILED。错误原因来自完整调用日志；没有充分证据的超时只报 ACTION_TIMEOUT。
+动作错误的 `data.errorCode` 区分 ELEMENT_READ_ONLY、ELEMENT_DISABLED、ELEMENT_HIDDEN、ELEMENT_OBSCURED、ELEMENT_NOT_EDITABLE、STALE_ELEMENT、ACTION_TIMEOUT 和 ACTION_FAILED；另有一个 SPURIOUS_DISPATCH 专门标「异常来自 Playwright 的事件分发、与本次命令无关」（见第十一节第 47 条）。错误原因来自完整调用日志；没有充分证据的超时只报 ACTION_TIMEOUT。
 
 点击回执会短暂等待异步变化（观察循环上限约 500ms，具体浏览器调用耗时另计）。`data.changeStatus` 为 observed 或 not_observed，`data.observationComplete` 指示探针是否成功，`data.observationWindowMs` 为观察窗口配置。`changed=false` 不表示点击失败，`changed=true` 也不表示查询、缴款等业务成功；应使用目标元素、文本或网络响应确认，禁止仅据此重复提交。
 
@@ -371,13 +374,18 @@ iframe 里（微盘 / 文档 / 会议同理），顶层 `document` 里**一个�
 
 3. **按选择器 / 执行 JS 要显式指 frame**：这类命令用的是 `page.locator(...)` / 顶层 `document`，够不着 iframe
    内部。`click_element_by_selector`、`input_text_by_selector`、`get_element_count`、`wait_for_element`、
-   `upload_file`、`get_element_screenshot`（只接受 `selector` 形式）、`execute_js` 都接受一个可选的 `frame`
-   参数，取值是 frame 序号（0 是主 frame，见 `list_frames`）或 URL / name 子串：
+   `upload_file`、`get_element_screenshot`、`ocr_image`、`request_human_input`、`execute_js` 都接受一个可选的
+   `frame` 参数，取值是 frame 序号（0 是主 frame，见 `list_frames`）或 URL / name 子串：
 
    ```json
    {"id":"1001","method":"click_element_by_selector","params":{"selector":"a[href*=domain]","frame":"exmail.qq.com"}}
    {"id":"1001","method":"execute_js","params":{"frame":1,"body":"() => location.href"}}
    ```
+
+   > **`request_human_input` 的 `frame` 尤其容易漏**：验证码 / 二维码经常就嵌在 iframe 里
+   > （实测企业微信登录页的二维码就是）。不传 `frame` 时 `selector` 只在顶层文档找，
+   > 回执里 `imageUrl` 会是空的——而「把人叫来看 iframe 里的验证码」恰恰是最需要它的场景。
+   > `steps[]` 里的每一项也各自可以带 `frame`。
 
 **要点与坑**：
 
@@ -626,7 +634,7 @@ curl -H "Content-Type: application/json" \
 
 | 字段 | 含义 |
 | --- | --- |
-| `data.filesLength` | input 里现在有几个文件（正常应当是 1） |
+| `data.filesLength` | input 里现在有几个文件（正常应当是 1）。**回读看到 0 别慌**：SPA 组件收下文件后会把 input 重置，见下面 `readbackNote` |
 | `data.listeners` | `{vue2, vue3, react, inline, jquery, events}` —— 这个 input 挂了哪些事件；全为 `false` 就是「这个 input 没人监听」 |
 | `data.hasListeners` | 三态：`true` 有 / `false` 确认没有 / `null` 未知（见下面「hasListeners 的三态」） |
 | `data.listenerDetection` | `cdp`（浏览器自己报的清单，可信）/ `heuristic`（只探到框架痕迹） |
@@ -634,6 +642,13 @@ curl -H "Content-Type: application/json" \
 | `data.hint` | `noListener` / `unknown` 时给一句**可直接操作**的提示 |
 | `data.changed` / `data.changeStatus` | 上传前后页面有没有变化（探针取在 file input 所在的那个 frame 里） |
 | `data.effective` | `consumed=noListener` 且页面没变化时为 `false` —— 这次上传**没生效** |
+| `data.elementGone` / `data.readbackNote` | 回读时元素已不在页面上（框架把它换掉了）。**这不代表上传失败**，`readbackNote` 会说明原因 |
+
+> **回读看不到 input ≠ 上传失败。** 实测企业微信的授权书上传：组件收下文件后把原 input 换掉，回读时那个节点
+> 已经不在页面上。老版本回读走 `Locator`，节点一脱离文档就要等满默认 30 秒超时，于是 `ok:true` 的操作被写成
+> `readbackError: Timeout 30000ms exceeded.` + `consumed: unknown` —— 看着像失败，一重传就可能传两份。
+> 现在回读**现场重新解析 DOM**（不走 `Locator`，不会再等），并把原因写进 `data.readbackNote`。
+> **判断上传成没成，以页面为准**（文件名出现、`data.changed`、下一步的 `expect` 断言），不要只看 `consumed`。
 
 看到 `data.consumed: "noListener"`（或 `hasListeners: false`）就**不要再去调选择器**了，正解是：
 
@@ -756,7 +771,7 @@ curl -H "Content-Type: application/json" \
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
 | `screenshot` | `id`, `path`(可选), `fullPage`(bool), `index`(可选), `selector`(可选), `clipX`/`clipY`/`clipWidth`/`clipHeight`(可选), `inline`(bool，默认 false) | **默认落盘**：不传 `path` 时写到 `data/<id>/shot-N.png`，返回 `data.path`/`data.url`/`data.size` 与 `data.base64Omitted=true`；要内联 base64（直接喂视觉模型）才传 `inline: true`。传 `index` 或 `selector` 时**只截该元素**；否则截整页，`clipX/clipY/clipWidth/clipHeight` 四个都传才按区域裁剪 |
-| `get_element_screenshot` | `id`, `index`(可选), `selector`(可选), `path`(可选), `inline`(bool，默认 false) | 只截一个元素，返回 `data.path`+`data.url`+`data.size`、`data.target`；`inline: true` 时另给 `data.base64`。`index` 与 `selector` 传一个即可 |
+| `get_element_screenshot` | `id`, `index`(可选), `selector`(可选), `path`(可选), `inline`(bool，默认 false), `frame`(可选) | 只截一个元素，返回 `data.path`+`data.url`+`data.size`、`data.target`；`inline: true` 时另给 `data.base64`。`index` 与 `selector` 传一个即可。元素在跨域 iframe 里时传 `frame` |
 | `pdf` | `id`, `path`(可选) | 存 PDF，返回 `data.path`；不传 `path` 落到 `~/Downloads/broswer/` |
 
 > 日常「看页面长什么样」**先别看图**：`data.screenshot` 是每个改变页面的方法自动留下的截图地址，但把图读进上下文很贵，非必要不要读（见开头的省 token 铁律），读 `data.text` 就够了。`get_element_screenshot` 是验证码、二维码、图表这类「必须看图」的元素的标准做法：走 Playwright 自己的元素截图，**不受 canvas 跨域污染限制**（用 `execute_js` + canvas 手抠图，跨域图片会直接失败），而且只截一个元素、比整页图省得多。
@@ -862,7 +877,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
-| `request_human_input` | `id`, `prompt`, `index`(可选), `selector`(可选), `timeoutSeconds`(可选), `steps`(可选), `expiresAt`(可选), `ocr`(可选), `ocrLanguage`(可选), `inline`(可选) | 发起一个人工介入请求。传 `index`/`selector` 时把该元素（通常是验证码图）截下来，并**同时**回 `data.imageBase64`、`data.imagePath`（服务端本地路径）、`data.imageUrl`（可直接 GET 的地址，能贴给用户）；还把当前页签带到最前。返回 `data.requestId`、`data.prompt`、`data.expiresAt`、`data.expiresInSeconds`、`data.url` |
+| `request_human_input` | `id`, `prompt`, `index`(可选), `selector`(可选), `frame`(可选), `timeoutSeconds`(可选), `steps`(可选), `expiresAt`(可选), `ocr`(可选), `ocrLanguage`(可选), `inline`(可选) | 发起一个人工介入请求。传 `index`/`selector` 时把该元素（通常是验证码 / 二维码）截下来，并**同时**回 `data.imageBase64`、`data.imagePath`（服务端本地路径）、`data.imageUrl`（可直接 GET 的地址，能贴给用户）、`data.imageTarget`（截图取自哪个 frame / 选择器）；还把当前页签带到最前。返回 `data.requestId`、`data.prompt`、`data.expiresAt`、`data.expiresInSeconds`、`data.url`。**目标在跨域 iframe 里时传 `frame`**（`steps[]` 里每项也可各带一个） |
 | `submit_human_input` | `id`, `requestId`, `answer`, `stepId`(可选), `answers`(可选) | 提交人工答复。单步请求直接给 `answer`；多步请求（`steps`）用 `stepId` 逐条回填，或 `answers: {"s1":"...","s2":"..."}` 一次回填多步 |
 | `get_human_input` | `id`, `requestId`, `timeoutSeconds`(可选) | 取人工答复，返回 `data.status`（`pending`/`partial`/`answered`/`expired`）、`data.answer`、`data.steps`、`data.prompt`。传 `timeoutSeconds` 时长轮询等待，到时间还没答复就返回当前状态（**不算失败**）。过期时另给 `data.expired:true` 与提示 |
 | `ocr_image` | `id`, `path`(可选), `index`/`selector`(可选), `frame`(可选), `language`(可选) | 用**本机 OCR**（Windows 自带 `Windows.Media.Ocr`）把图上的文字读出来：`data.ok`、`data.text`、`data.lineCount`、`data.imagePath`/`data.imageUrl`。给 `path` 读服务端已有的一张图；给 `index`/`selector` 则先截这个元素再读。默认语言 `zh-Hans-CN`。**模型读不了图时的兜底**，见第九节 |
@@ -874,7 +889,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 | 方法 | 参数 | 说明 |
 | --- | --- | --- |
 | `extract_structured_data` | `id`, `query`, `extractLinks`(bool) | 返回 `data.text`（正文，最多 20000 字符，读取时会临时隐藏高亮层）与 `data.links` |
-| `execute_js` | `id`, `body` 或 `bodyFile`, `vars`(可选), `frame`(可选) | 返回 `data.result`，见第八节。**会 await Promise**；在跨域 iframe 里执行要传 `frame` |
+| `execute_js` | `id`, `body` 或 `bodyFile`, `vars`(可选), `frame`(可选), `retryOnSpurious`(可选) | 返回 `data.result`，见第八节。**会 await Promise**；在跨域 iframe 里执行要传 `frame`；脚本**重发无害**（读页面这类）时传 `retryOnSpurious: true`，服务端会替它吃掉「事件泵伪故障」 |
 | `commands` | `id`, `params.stopOnError`, `params.commands`, `params.async`(可选) | 批量指令，是 `method` 的一个取值，见第七节 |
 
 ### 服务自省（不知道有什么能力时先问它）
@@ -1002,6 +1017,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{
 
 - 返回值必须是 JSON 可序列化的；DOM 元素不报错，但只会得到 `ref: <Node>`，请先转成 `textContent`、`outerHTML`、`value`。
 - 脚本报错时返回 `code:0`，`msg` 形如 `execute_js 失败：执行 JavaScript 失败：TypeError: Cannot read properties of null (reading 'click')`（只有异常首行，没有堆栈）。
+- **脚本重发无害时传 `retryOnSpurious: true`**：这个站点/这个页面上 `execute_js` 报 `Object doesn't exist: response@…`（对象与脚本毫不相干）时，服务端会替你重发（最多 3 次），成功后在 `data.spuriousRetry` 里说明。**只给读页面/取值的脚本传**；会点按钮、提交表单的脚本不要传 —— 那种脚本重发等于再执行一次。机制见第十一节第 47 条。
 - `body` 长度上限 100000 字符；脚本**没有超时**。
 - **`execute_js` 一定会 await Promise**（回执里的 `data.awaited` 恒为 `true`）：脚本返回 Promise 时会等它 settle，返回函数时会先调用再等。所以需要现取一个接口值时直接写 `async () => { const r = await fetch(url, {credentials:'same-origin'}); return r.json(); }`，**不要**再用已废弃的同步 XHR（`x.open(..., false)`）去绕——它会阻塞渲染线程，而且没有理由。
 - **在跨域 iframe 里执行要传 `frame`**：不传时脚本跑在顶层文档，`document.querySelector` 穿不透 iframe。取值是 frame 序号（0 是主 frame，见 `list_frames`）或 URL / name 子串：
@@ -1280,6 +1296,91 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 42. **`execute_js` 里的 `.click()` 触发不了「真点击才有的东西」**：JS 派发的 click 不是可信事件，`window.open` 会被浏览器拦掉，部分框架的提交按钮也不认它。实测 12306 结果页的「预订」（`<a class="btn72" onclick="checkG1234(...)">`）用 `.click()` 完全没反应，**而接口照样回 `ok:true`** —— 于是「点了没反应」被误判成页面问题。正解是 `click_element_by_selector` / `click_element_by_index`（真实鼠标事件）。判断有没有生效看回执里的 `data.mode`（`js` 就是没走真实交互）与 `data.changed`。
 
 43. **服务进程被杀 = 它启动的浏览器一起退出 = session cookie 型登录态失效**：12306 这类站点的登录 cookie 是会话级的，浏览器一关就得人工重新登录。实测踩过：agent 的后台任务被回收时带走了 mvn / java / Chrome 整棵进程树，人工白登录一次。所以**别把「重启服务」当成无痛操作**：要么用 `scripts/run/start-server.cmd`（脱离当前进程树启动）与 `scripts/run/stop-server.cmd`（先关任务与浏览器再结束进程），要么在动手前先确认没有正在进行的人工登录环节。
+
+44. **动作抛了异常 ≠ 动作没生效：别看到失败就重试**。实测点企业微信的「下载合同」时 `click_element_by_selector`
+    抛 `Object doesn't exist: response@…`，点 Chrome 内置 PDF 查看器的下载按钮时 `mouse_click` 抛
+    `Object doesn't exist: artifact@…` —— **而文件都已经落盘了**。这类「动作成功、事后取证时对象没了」现在
+    不再回 `ok:false`：页面确实变了（或确实发生了下载）就回 `ok:true` + `data.warning` + `data.actionError`
+    （原始异常）+ `data.downloadsStarted`，所以：
+
+    - 看到 `data.warning` 说「很可能已经生效」时，**先用只读命令确认页面状态**，别直接重发；
+    - 回执里的 `data.downloads` / `data.lastDownload` 是「确实下载过」的正向证据（**下载不一定改变 DOM**，
+      所以它单独计数、也单独进回执）；
+    - 而 `ok:false` 且 `data.errorCode` 是 `ACTION_UNCERTAIN` 时，意思是「执行器抛了未预期异常、**无法判断**
+      有没有生效」——同样不该直接重试（重试可能造成重复下载 / 重复提交）；
+    - 端点兜底 catch 现在把「参数校验错」（`缺少参数 xxx`，命令根本没发出去，可安全重试）与上面这类
+      运行期异常分开了。
+
+    > **放宽是**刻意收窄**的**：只有 `Object doesn't exist`（句柄已失效）这一族才可能被改判为成功。
+    > **超时 / 元素不稳定这类异常即便页面变了也照旧失败**——它们是「动作根本没做完」。实测一条回归用例
+    > 正好卡在这个边界上：一直在动的元素会持续改变 DOM 指纹，只看「页面变了」就判成功的话，
+    > 原生点击超时会被误判成点击成功。
+
+45. **`upload_file` 的回读可能看不到 input，这不是上传失败**。SPA 的上传组件常在收下文件后**把原来的 input
+    换掉**（企业微信的授权书上传就是这样），于是回读时那个节点已经不在页面上了。老版本回读走 `Locator`，
+    节点一脱离文档就要等满默认 30 秒超时，把一次成功的上传写成
+    `readbackError: Timeout 30000ms exceeded.` + `consumed: unknown` —— 看着像失败，一重传就可能传两份。
+    现在回读改成**现场重新解析 DOM**（不走 `Locator`，不会再等），并会给出说明：
+
+    - `data.elementGone: true` + `data.readbackNote` → 元素已被框架换掉，**不代表上传失败**；
+    - `data.filesLength: 0` + `data.readbackNote` → 框架已经把文件收走并重置了 input，这通常是**成功**信号；
+    - `data.consumed` 才是「页面会不会处理它」的结论（`listened` / `noListener` / `unknown`）；
+    - **判断上传成没成，以页面为准**（文件名出现、`data.changed`、下一步断言），不要只看 `consumed`。
+
+46. **参数名与回执字段名不一定同名**：`switch_tab` / `close_tab` 的参数叫 `pageIndex`，而 `get_tabs` 回执里每个
+    页签的字段叫 `index`。照着回执传 `index` 过去，回执会直接把对应关系写出来
+    （`缺少参数 pageIndex（你传的是 index：…）`），照改即可。
+
+47. **成串出现、对象与命令毫不相干的 `Object doesn't exist: response@… / request@…`：这是 Playwright
+    事件泵投递过来的伪故障，不是页面坏了。**
+
+    **症状**（一次阿里云控制台的真实任务里连着踩）：`execute_js` 连续 8 次失败，连 `() => 1` 都失败；
+    `get_form_state`、`get_element_box`、`go_to_url`、`wait_for_idle`、自动截图跟着一起报，**报错的对象
+    每次都不一样**（`response@…` / `request@…`），而同一个页面上 `get_browser_state`、`get_element_count`
+    却一切正常。最迷惑人的地方就在这：**换一条不相干的命令也报同一个错**，于是很容易误判成「页面坏了 /
+    选择器写错了 / 登录态失效」，然后去改一堆根本没问题的地方。
+
+    **机制**（读驱动源码 + `javap` 字节码确认，不是猜的）：Playwright Java 把 Page 级事件挂在**上下文**上，
+    服务器按上下文通道下发 `response` / `request` / `requestFailed`；客户端在
+    `BrowserContextImpl.handleEvent` 里按 guid 查对象，**查不到就抛** `Object doesn't exist`。而这一抛
+    发生在**消息泵**里，会顺着 `Connection.processOneMessage → ChannelOwner.runUntil` 逃出来，砸在**当时
+    正在等待回复的那次 API 调用**上。所以栈长这样（`data.error.stack` 与 `logs/log.<日期>.log` 里能直接
+    看到）：
+
+    ```
+    PlaywrightException: Object doesn't exist: response@537bc134…
+      at Connection.getExistingObject(Connection.java:195)
+      at BrowserContextImpl.handleEvent(BrowserContextImpl.java:777)   ← 只有 "response" 分支
+      at Connection.dispatch(Connection.java:295)
+      at Connection.processOneMessage(Connection.java:214)
+      at ChannelOwner.runUntil(ChannelOwner.java:136)
+      at FrameImpl.evaluate(FrameImpl.java:277)                        ← 受害者：这次只是碰巧在跑 evaluate
+    ```
+
+    根因是「对象已被释放（驱动自己发的 ``__dispose__``，reason 可能是 ``gc``）」撞上「事件还在下发」，
+    属于**上游的竞态**：playwright-java#1197（Page close + onRequestFinished 监听器）、#624。
+
+    **升级 Playwright 没用**：1.53.0 与 1.63.0 的 `BrowserContextImpl.handleEvent` 里，只有 `dialog` 与
+    `pageError` 两个分支包了 try/catch（对比两者字节码的 Exception table 就能看到），`response` / `request`
+    分支的 `getExistingObject` 至今没有兜。**服务端也挡不住**：它在 handler 之前就抛，`safely(...)` 这类
+    「把监听器包起来」的写法对它无效（所以「别订阅网络事件」也换不掉这个能力，`get_requests` /
+    `get_response_body` 就靠它）。
+
+    **服务端现在这么做**（`ActionError.SPURIOUS_DISPATCH`，`data.errorCode` 里能直接看到这个码）：
+
+    | 命令类别 | 服务端行为 | 调用方该怎么做 |
+    | --- | --- | --- |
+    | **只读 / 幂等 / 覆盖式落盘**（`get_*`、`is_*`、`diff_dom_text`、`list_frames`、`wait_for_*`、`go_to_url`、`reload`、`screenshot`、`get_element_screenshot`、`pdf`、`set_viewport` …） | **自动重发**（含首次最多 3 次，间隔 120ms）；被吃掉后回执里多一个 `data.spuriousRetry`（含 `attempts`） | 什么都不用做；看到 `spuriousRetry` 就知道这次噪声发生过 |
+    | `execute_js` | **默认不重发**（脚本可能有副作用）；调用方在参数里写 `retryOnSpurious: true` 才重发 | 读页面 / 取值的脚本大胆传 `retryOnSpurious: true`；会点按钮、提交表单的脚本**不要**传 |
+    | **动作类**（点击 / 输入 / 勾选 / 上传 / 切换页签 / `start` / `close`） | **绝不自动重发**，只把码标成 SPURIOUS_DISPATCH（执行器抛异常时是 ACTION_UNCERTAIN + `data.spuriousDispatch: true`） | **先读页面状态再决定**：重发可能重复提交。看到这一类报错别去改选择器，那跟选择器无关 |
+
+    自动截图与 `get_element_screenshot` 的内部实现也各自重发一次（`PlaywrightService.spuriousRetry`），
+    所以「第 N 张截图失败:Object doesn't exist」这类日志会明显变少。
+
+    **怎么确认不是别的问题**：报错文本里出现 `Object doesn't exist` / `Cannot find object to call`，且
+    **同一步换一条只读命令能正常读到页面** —— 那就是它。反过来，`Object doesn't exist: elementHandle@…`
+    也可能是**你自己那条命令的目标句柄真的失效了**（元素被页面换掉），文本上分不开；所以服务端只拿它当
+    **重发**的依据（只读命令重发无害），不用它下「动作成功了」的结论。
 
 ## 十二、站点配方（`run_recipe`）
 

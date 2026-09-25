@@ -1526,6 +1526,11 @@ public class PlaywrightService {
     });
     page.onConsoleMessage(msg -> addBounded(inst.consoleLogs, msg.type() + ": " + msg.text()));
     page.onPageError(error -> addBounded(inst.pageErrors, error));
+    // 下载刻意**不在这里注册 page.onDownload**:Playwright Java 的 Page 级事件在客户端是挂到
+    // **上下文**上再按页过滤的,每个页签注册一次就会不断累积上下文级监听器;而上下文事件分发一旦碰到
+    // 已经释放的对象就会抛 `Object doesn't exist: response@…`,并在**后续任意一次 API 调用**上重抛
+    // (这一族异常在本套测试里确实会稳定复现,详见 docs/FEEDBACK-2026-09-24-wecom-admin.md 的 F8)。
+    // 下载的判定改成纯服务端地数下载目录,见 countDownloadFiles —— 不碰 Playwright 对象,少一份分发面。
     // 这个页签弹出的新窗口归同一个任务,别人看不见
     page.onPopup(popup -> claimPage(inst, popup));
     // 页签被人工关掉(共用浏览器时很常见)后要有人接管「当前页」
@@ -1562,6 +1567,43 @@ public class PlaywrightService {
       log.info("任务 {} 已经没有可用页签,已补一个新页签", inst.id);
     } catch (PlaywrightException e) {
       log.warn("任务 {} 补页签失败(浏览器可能已经关闭):{}", inst.id, briefMessage(e.getMessage()));
+    }
+  }
+
+  /** 浏览器把下载落到的目录(与 {@code setDownloadsPath} 保持一致) */
+  static Path downloadsDir() {
+    return Paths.get(userHome(), "Downloads", "broswer");
+  }
+
+  /**
+   * 下载目录里当前有多少个文件(读不到时返回 -1 = 未知)
+   *
+   * <p>
+   * 这是「确实发生了下载」的**纯服务端**判定,刻意不去注册 {@code page.onDownload}:Playwright Java 的
+   * Page 级事件在客户端是挂到**上下文**上再按页过滤的,每个页签注册一次就会不断累积上下文级监听器,
+   * 而上下文事件分发碰到已释放对象会抛 {@code Object doesn't exist: response@…} 并在后续任意一次
+   * API 调用上重抛。数目录不碰任何 Playwright 对象,也就不会增加那方面的分发面。
+   *
+   * <p>
+   * <b>说明</b>:这一族异常在本套测试里是**既有**问题(与本次改动无关,见
+   * {@code docs/FEEDBACK-2026-09-24-wecom-admin.md} 的 F8),所以换实现并不是「修好了它」,
+   * 只是不去增加新的分发面。
+   *
+   * <p>
+   * 局限:下载目录是全进程共用的,并发任务之间会互相看见,所以只把它当**正向线索**用,不作否定证据。
+   * 读不到目录时返回 -1(未知)。
+   */
+  static int countDownloadFiles() {
+    try {
+      Path dir = downloadsDir();
+      if (!Files.isDirectory(dir)) {
+        return 0;
+      }
+      try (java.util.stream.Stream<Path> files = Files.list(dir)) {
+        return (int) files.filter(Files::isRegularFile).count();
+      }
+    } catch (IOException | RuntimeException e) {
+      return -1;
     }
   }
 
@@ -2130,7 +2172,7 @@ public class PlaywrightService {
     try {
       Files.createDirectories(dir);
       settle(inst);
-      inst.page.screenshot(new Page.ScreenshotOptions().setPath(png));
+      spuriousRetry(() -> inst.page.screenshot(new Page.ScreenshotOptions().setPath(png)));
       kv.set("screenshot", "/" + DATA_DIR + "/" + inst.id + "/" + seq + ".png");
       kv.set("screenshot_path", png.toAbsolutePath().toString());
     } catch (PlaywrightException e) {
@@ -2141,6 +2183,37 @@ public class PlaywrightService {
       log.warn("任务 {} 第 {} 张截图写文件失败:{}", inst.id, seq, e.getMessage());
     }
     return kv;
+  }
+
+  /**
+   * 跑一次 Playwright 调用,碰到「事件泵投递过来的伪故障」就重发一次
+   *
+   * <p>
+   * 只给**重发无害**的调用用:截图/PDF 这类取证调用(写的是同一个文件)与只读查询。实测中自动截图
+   * 会成串报 {@code Object doesn't exist: request@…},而页面完全正常 —— 那就是这个伪故障,
+   * 重发一次基本都能拿到图(见 {@link ActionError#SPURIOUS_DISPATCH})。
+   *
+   * <p>
+   * <b>动作类绝不能用它</b>:点击/提交重发可能造成重复提交。命令级的那套重发策略在
+   * {@code ActionService#dispatchWithSpuriousRetry},那里按命令名分级。
+   */
+  static <T> T spuriousRetry(java.util.function.Supplier<T> call) {
+    for (int attempt = 1;; attempt++) {
+      try {
+        return call.get();
+      } catch (PlaywrightException e) {
+        if (attempt >= 2 || !ActionError.isSpuriousDispatch(e.getMessage())) {
+          throw e;
+        }
+        try {
+          Thread.sleep(120);
+        } catch (InterruptedException interrupted) {
+          // 中断时把原异常抛出去,别把「被中断」伪装成「伪故障重发失败」
+          Thread.currentThread().interrupt();
+          throw e;
+        }
+      }
+    }
   }
 
   /** 自动截图开关({@code browser.capture.enabled},默认开) */
@@ -3081,12 +3154,26 @@ public class PlaywrightService {
    *
    * @param frame 探针所在的 frame;null 表示顶层文档
    */
-  private static Kv stateProbe(BrowserInstance inst, Frame frame) {
-    Frame target = frame == null ? inst.page.mainFrame() : frame;
-    Kv probe = Kv.by("url", inst.page.url()).set("tabCount", pagesOf(inst).size());
-    if (frame != null) {
-      // 一并记住 frame 自己的 URL:iframe 内部跳页时顶层 URL 不变,靠它才能看出变化
-      probe.set("frameUrl", safeFrameUrl(frame));
+  // 包级可见是为了让 BrowserFrictionUpgradeTest 能直接构造「抛异常 + 页面已变」的输入组合
+  static Kv stateProbe(BrowserInstance inst, Frame frame) {
+    Frame target = frame;
+    Kv probe = new Kv();
+    try {
+      if (target == null) {
+        target = inst.page.mainFrame();
+      }
+      probe.set("url", inst.page.url()).set("tabCount", pagesOf(inst).size());
+      // 下载也是一次「页面确实发生了变化」:它反映在下载目录上,而不一定反映在 DOM 上
+      probe.set("downloads", countDownloadFiles());
+      if (frame != null) {
+        // 一并记住 frame 自己的 URL:iframe 内部跳页时顶层 URL 不变,靠它才能看出变化
+        probe.set("frameUrl", safeFrameUrl(frame));
+      }
+    } catch (PlaywrightException e) {
+      // 下载/关标签/渲染进程崩溃时 url() 与 pages 也会抛。探针是**取证**,失败只如实记下来,
+      // 不能让它冒出去把一次已经生效的动作判成失败。
+      probe.set("probeError", briefMessage(e.getMessage()));
+      return probe;
     }
     try {
       Object fingerprint = target.evaluate("""
@@ -3116,6 +3203,7 @@ public class PlaywrightService {
     return !java.util.Objects.equals(before.get("url"), after.get("url"))
         || !java.util.Objects.equals(before.get("tabCount"), after.get("tabCount"))
         || !java.util.Objects.equals(before.get("frameUrl"), after.get("frameUrl"))
+        || !java.util.Objects.equals(before.get("downloads"), after.get("downloads"))
         || (before.containsKey("fingerprint") && after.containsKey("fingerprint")
             && !java.util.Objects.equals(before.get("fingerprint"), after.get("fingerprint")));
   }
@@ -3126,7 +3214,14 @@ public class PlaywrightService {
     while (!probeChanged(before, after) && !after.containsKey("probeError") && System.nanoTime() < deadline) {
       // Pump Playwright events while waiting, allowing delayed popups and framework
       // updates to arrive.
-      inst.page.waitForTimeout(50);
+      try {
+        inst.page.waitForTimeout(50);
+      } catch (PlaywrightException e) {
+        // 页面/上下文正在消失(下载、关闭标签、渲染进程崩溃)时它会抛。这是**取证**失败而不是动作失败,
+        // 记下来就收工 —— 绝不让它冒出去,把一次已经生效的点击判成失败(见 actionErrorOrEffect)。
+        after.set("probeError", briefMessage(e.getMessage()));
+        break;
+      }
       after = stateProbe(inst, frame);
     }
     return after;
@@ -3197,6 +3292,68 @@ public class PlaywrightService {
   }
 
   /**
+   * 动作抛了异常、但页面其实已经变了的时候,**不要**把它报成失败
+   *
+   * <p>
+   * <b>为什么需要它</b>:实测在企业微信后台点「下载合同」,以及点 Chrome 内置 PDF 查看器工具栏上的
+   * 「下载」时,{@code locator.click(...)} 抛 {@code Object doesn't exist: response@…}、
+   * {@code page.mouse().click(...)} 抛 {@code Object doesn't exist: artifact@…}
+   * ——而**文件确实已经落了盘**。老写法把整条命令回成 {@code ok:false},调用方看到失败就会重试,
+   * 而重试的代价是**重复下载 / 重复提交**,比报错本身危险得多。
+   *
+   * <p>
+   * 所以这里统一改成:动作抛异常时**先取一次回执**,页面确实变了(URL / 页签数 / DOM 指纹有变化)
+   * 就回 {@code ok:true} + {@code data.warning},把原始异常原样放进 {@code data.actionError} 供追查;
+   * 页面确实没变才照旧失败。
+   *
+   * @param action          动作名,写进提示语
+   * @param before          动作前的状态探针(见 {@link #stateProbe})
+   * @param frame           探针要取在哪个 frame;null 表示主 frame
+   * @param error           底层抛出的异常
+   * @param fallbackFailure 页面也没变时用的失败信息(调用方已经拼好的那句)
+   */
+  // 包级可见是为了让 BrowserFrictionUpgradeTest 直接固定这条契约:真实触发条件(浏览器内置 PDF 查看器
+  // 的下载按钮)没法在 fixture 页面里复现,只能对「抛异常 + 页面已变」这个输入组合做断言。
+  static RespBodyVo actionErrorOrEffect(String action, Kv before, BrowserInstance inst, Frame frame,
+      PlaywrightException error, String fallbackFailure) {
+    if (before == null) {
+      return RespBodyVo.fail(fallbackFailure);
+    }
+    String detail = briefMessage(error.getMessage());
+    // **只对「句柄已失效」这一族放宽**。Playwright 在服务端对象已经没了的时候抛
+    // `Object doesn't exist: artifact@… / response@…`:实测点下载类按钮正是这一族(浏览器接管了那次点击,
+    // 并把相关句柄释放掉)。而超时 / 元素不稳定这类异常是「动作根本没做完」,**绝不能**放宽 ——
+    // 实测一条回归用例抓到了这个区别:一直在动的元素会持续改变 DOM 指纹,只看「页面变了」就判成功的话,
+    // 原生点击超时会被误判成点击成功(见 BrowserInspectionUpgradeTest#movingElementFallsBackToRealMouse)。
+    if (detail == null || !detail.toLowerCase(java.util.Locale.ROOT).contains(HANDLE_GONE)) {
+      return RespBodyVo.fail(fallbackFailure);
+    }
+    Kv report = receipt(before, inst, frame);
+    if (!Boolean.TRUE.equals(report.getBoolean("changed"))) {
+      return RespBodyVo.fail(fallbackFailure);
+    }
+    // 有下载发生是最硬的正向证据(下载不一定改变 DOM),把它单独标出来。
+    // -1 表示目录读不到 = 未知,这时**不敢**当证据用
+    int downloadsBefore = asInt(before.get("downloads"));
+    int downloadsNow = countDownloadFiles();
+    boolean downloaded = downloadsBefore >= 0 && downloadsNow > downloadsBefore;
+    report.set("effective", true).set("actionError", detail).set("changedByActionError", true)
+        .set("downloadsStarted", downloaded).set("downloads", downloadsNow);
+    report.set("warning", action + " 的底层调用抛了异常（" + detail + "），但"
+        + (downloaded ? "下载目录里多出了文件" : "页面已经发生变化")
+        + "：动作很可能已经生效。请先读取页面状态确认，不要直接重试"
+        + "（重试可能造成重复下载 / 重复提交）。");
+    return RespBodyVo.ok(report);
+  }
+
+  /**
+   * 「对象句柄已经失效」这一族异常的特征串
+   *
+   * <p>见 {@link #actionErrorOrEffect}:只有这一族才可能是「动作已生效、事后取证时对象没了」。
+   */
+  private static final String HANDLE_GONE = "object doesn't exist";
+
+  /**
    * 按索引动作,带索引失效重试(见下面的七参重载)
    */
   private RespBodyVo indexAction(BrowserInstance inst, int index, String action, String fallbackSelector,
@@ -3260,7 +3417,9 @@ public class PlaywrightService {
       }
     }
     // 失败信息里也带上快照来历:是索引过期、还是元素真的不可操作,这两件事的下一步完全不同
-    return RespBodyVo.fail(actionFailure(action, failure) + "（" + snapshotSuffix(inst) + "）");
+    String failureMessage = actionFailure(action, failure) + "（" + snapshotSuffix(inst) + "）";
+    // 抛异常 ≠ 没生效:点下载类按钮时底层会抛 object-does-not-exist,而动作其实已经落地(见 actionErrorOrEffect)
+    return actionErrorOrEffect(action, before, inst, probeFrame, failure, failureMessage);
   }
 
   private static void sleepQuietly(long millis) {
@@ -3557,11 +3716,14 @@ public class PlaywrightService {
     }
     Kv data = Kv.by("filename", file.getFileName().toString()).set("path", file.toString())
         .set("size", UploadStore.sizeOf(file)).set("target", target).set("mode", "native");
-    // setInputFiles 的语义只是「把文件放进 input」,页面有没有消费完全是另一回事 —— 所以必须回读
-    appendUploadReadback(locator, probeFrame, elementResolveScript(inst, index, selector), data);
+    // setInputFiles 的语义只是「把文件放进 input」,页面有没有消费完全是另一回事 —— 所以必须回读。
+    // 顺序上**先取回执、再回读 input**:观察窗口(最多 500ms)正好给框架把文件收走的时间,
+    // 回读看到的就是「被消费之后」的状态;而且回执里的 changed 本身就是回读结论要用的证据。
     Kv report = receipt(before, inst, probeFrame);
     data.set("changed", report.get("changed")).set("changeStatus", report.get("changeStatus"))
         .set("observationWindowMs", report.get("observationWindowMs"));
+    appendUploadReadback(locator, probeFrame, elementResolveScript(inst, index, selector), data,
+        Boolean.TRUE.equals(report.getBoolean("changed")));
     if ("noListener".equals(data.getStr("consumed")) && Boolean.FALSE.equals(report.getBoolean("changed"))) {
       data.set("effective", false);
     }
@@ -3590,6 +3752,48 @@ public class PlaywrightService {
   }
 
   /**
+   * 现场重新解析 input 并读它的状态
+   *
+   * <p>
+   * 用 {@code frame.evaluate} 而不是 {@code Locator.evaluate}:前者每次都重新查询 DOM(元素被框架
+   * 替换过也能读到新的那个),而且**不会等**;后者会在节点脱离文档后一直等到默认 30 秒超时。
+   *
+   * @return 状态 Map;拿不到解析脚本时返回 null(交给调用方退回 Locator);脚本报错时返回带
+   *         {@code readbackError} 的 Kv
+   */
+  private static Object readInputState(Frame frame, String elementScript) {
+    if (frame == null || elementScript == null || elementScript.isBlank()) {
+      return null;
+    }
+    try {
+      return frame.evaluate("(() => { const el = (" + elementScript + ");"
+          + " if (!el) return { elementGone: true };"
+          + " return { filesLength: el.files ? el.files.length : null,"
+          + " value: el.value ? String(el.value).slice(0, 200) : '',"
+          + " disabled: !!el.disabled,"
+          + " accept: el.getAttribute ? el.getAttribute('accept') : null }; })()");
+    } catch (PlaywrightException e) {
+      return Kv.by("readbackError", briefMessage(e.getMessage()));
+    }
+  }
+
+  /** 没有解析脚本时的退路:只能走 Locator(可能因为节点已脱离文档而等到超时) */
+  private static Object readInputStateViaLocator(Locator locator) {
+    if (locator == null) {
+      return null;
+    }
+    try {
+      return locator.first().evaluate("(el) => ({"
+          + " filesLength: el && el.files ? el.files.length : null,"
+          + " value: el && el.value ? String(el.value).slice(0, 200) : '',"
+          + " disabled: el ? !!el.disabled : null,"
+          + " accept: el && el.getAttribute ? el.getAttribute('accept') : null })");
+    } catch (PlaywrightException e) {
+      return Kv.by("readbackError", briefMessage(e.getMessage()));
+    }
+  }
+
+  /**
    * 上传之后回读 input 的真实状态
    *
    * <p>
@@ -3609,22 +3813,37 @@ public class PlaywrightService {
    * @param frame        {@code locator} 所在的 frame;null 表示主 frame(权威探测要拿它开 CDP 会话)
    * @param elementScript 解析该元素的 JS 表达式,给 CDP 用;为 null 时只走启发式
    */
-  private static void appendUploadReadback(Locator locator, Frame frame, String elementScript, Kv data) {
-    try {
-      Object raw = locator.first().evaluate("(el) => ({"
-          + " filesLength: el && el.files ? el.files.length : null,"
-          + " value: el && el.value ? String(el.value).slice(0, 200) : '',"
-          + " disabled: el ? !!el.disabled : null,"
-          + " accept: el && el.getAttribute ? el.getAttribute('accept') : null })");
-      if (raw instanceof Map) {
-        data.putAll((Map<?, ?>) raw);
+  private static void appendUploadReadback(Locator locator, Frame frame, String elementScript, Kv data,
+      boolean pageChanged) {
+    // 1) 读 input 自身状态。**优先现场重新解析 DOM,不要走 Locator**:实测 setInputFiles 之后框架会
+    //    把原来的 input 换掉(企业微信的上传组件就是这样),此时 Locator 已指向脱离文档的节点,
+    //    Locator.evaluate 会一直等到 30 秒超时才抛,把一次成功的上传写成
+    //    readbackError: "Timeout 30000ms exceeded."。frame.evaluate 现场查询既读得到新节点、也不会等。
+    Object raw = readInputState(frame, elementScript);
+    if (raw == null) {
+      // 拿不到解析脚本(例如索引已失效)才退回 Locator —— 这条路可能等超时,所以放在后面
+      raw = readInputStateViaLocator(locator);
+    }
+    if (raw instanceof Map) {
+      Map<?, ?> state = (Map<?, ?>) raw;
+      data.putAll(state);
+      if (Boolean.TRUE.equals(state.get("elementGone"))) {
+        data.set("readbackNote", "回读时这个 input 已经不在页面上了：SPA 的上传组件常在收下文件后把原节点"
+            + "换掉（这正是老版本回读会等满 30 秒超时的原因）。**这不代表上传失败**，请以页面为准。");
+      } else if (state.get("filesLength") instanceof Number
+          && ((Number) state.get("filesLength")).intValue() == 0) {
+        data.set("readbackNote", "input 里现在是 0 个文件：框架已经把文件收走并重置了它，"
+            + "这通常是**上传成功**的信号，请以页面上的文件名 / 回执里的 changed 为准。");
       }
-    } catch (PlaywrightException e) {
-      data.set("readbackError", briefMessage(e.getMessage()));
     }
     Kv probe = ListenerProbe.probe(locator, frame, elementScript);
     if (!Boolean.TRUE.equals(probe.getBoolean("found"))) {
       data.set("consumed", "unknown");
+      data.set("readbackHint", "没能读到这个 input 的监听器信息（元素可能已在框架重渲染后被替换）。"
+          + (pageChanged
+              ? "**页面已经发生变化，动作很可能已生效**，请以页面上的文件名或 data.changed 为准，"
+                  + "不要盲目重传——重传可能产生两份。"
+              : "**这不代表上传失败**，请以页面上的文件名或 data.changed 为准。"));
       return;
     }
     data.set("listeners", Kv.by("vue2", probe.get("vue2")).set("vue3", probe.get("vue3"))
@@ -4644,7 +4863,7 @@ public class PlaywrightService {
       Locator locator = target;
       clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions(timeoutMs)));
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(
+      return actionErrorOrEffect("click_element_by_selector", before, inst, probeFrame, e,
           locateFailure("click_element_by_selector", "选择器 " + selector + frameSuffix(frame), e)
               + blockerSuffix(target));
     }
@@ -4715,7 +4934,8 @@ public class PlaywrightService {
       try {
         clickWithMode(hit.locator, mode, outcome, () -> hit.locator.click(clickOptions()));
       } catch (PlaywrightException e) {
-        return RespBodyVo.fail(locateFailure("click_element_by_text", "文本 " + text, e));
+        return actionErrorOrEffect("click_element_by_text", before, inst, null, e,
+            locateFailure("click_element_by_text", "文本 " + text, e));
       }
       info.set(outcome.extra);
       return okWithHit(before, inst, "click_element_by_text", info);
@@ -4828,7 +5048,8 @@ public class PlaywrightService {
     try {
       clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions()));
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(locateFailure("click_element_by_role", "角色 " + role + "[name=" + name + "]", e));
+      return actionErrorOrEffect("click_element_by_role", before, inst, null, e,
+          locateFailure("click_element_by_role", "角色 " + role + "[name=" + name + "]", e));
     }
     info.set(outcome.extra);
     return okWithHit(before, inst, "click_element_by_role", info);
@@ -4891,7 +5112,8 @@ public class PlaywrightService {
       sleepQuietly(hoverDelayMs == null ? 300 : hoverDelayMs);
       clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions()));
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(locateFailure("hover_and_click", target, e));
+      return actionErrorOrEffect("hover_and_click", before, inst, null, e,
+          locateFailure("hover_and_click", target, e));
     }
     info.set(outcome.extra);
     return okWithHit(before, inst, "hover_and_click", info);
@@ -5478,7 +5700,8 @@ public class PlaywrightService {
       inst.page.mouse().click(x, y, new Mouse.ClickOptions().setButton(mouseButton(button))
           .setClickCount(clickCount == null || clickCount <= 0 ? 1 : clickCount));
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail("mouse_click 失败：" + briefMessage(e.getMessage()));
+      return actionErrorOrEffect("mouse_click", before, inst, null, e,
+          "mouse_click 失败：" + briefMessage(e.getMessage()));
     }
     return okWithReceipt(before, inst, "mouse_click", Kv.by("mode", "mouse").set("x", x).set("y", y));
   }
@@ -5586,7 +5809,7 @@ public class PlaywrightService {
       options.setPath(Paths.get(target));
     }
     try {
-      byte[] bytes = inst.page.screenshot(options);
+      byte[] bytes = spuriousRetry(() -> inst.page.screenshot(options));
       Kv data = Kv.by("size", bytes.length);
       if (target != null && !target.isEmpty()) {
         data.set("path", target);
@@ -5638,11 +5861,17 @@ public class PlaywrightService {
   }
 
   public RespBodyVo getElementScreenshot(Long browserId, Integer index, String selector, String path, Boolean inline) {
+    return getElementScreenshot(browserId, index, selector, path, inline, null);
+  }
+
+  /** {@code frame} 非空时把选择器限定在指定 frame 里(验证码/二维码在跨域 iframe 里时要传) */
+  public RespBodyVo getElementScreenshot(Long browserId, Integer index, String selector, String path,
+      Boolean inline, String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
     }
-    return elementScreenshot(inst, index, selector, path, inline);
+    return elementScreenshot(inst, index, selector, path, inline, frame);
   }
 
   private RespBodyVo elementScreenshot(BrowserInstance inst, Integer index, String selector, String path,
@@ -5677,7 +5906,8 @@ public class PlaywrightService {
       file = defaultShotPath(inst);
     }
     try {
-      byte[] bytes = locator.screenshot(new Locator.ScreenshotOptions().setTimeout(actionTimeoutMs()));
+      byte[] bytes = spuriousRetry(
+          () -> locator.screenshot(new Locator.ScreenshotOptions().setTimeout(actionTimeoutMs())));
       Kv data = Kv.by("size", bytes.length).set("target", target);
       if (file != null && !file.isEmpty()) {
         ensureParent(file);
@@ -7233,7 +7463,8 @@ public class PlaywrightService {
    * @param inline         是否内联 base64,默认 true(要省 token 可以关掉,只用 imagePath/imageUrl)
    */
   public RespBodyVo requestHumanInput(Long browserId, String prompt, Integer index, String selector,
-      Integer timeoutSeconds, List<Kv> steps, Long expiresAt, Boolean ocr, String ocrLanguage, Boolean inline) {
+      Integer timeoutSeconds, List<Kv> steps, Long expiresAt, Boolean ocr, String ocrLanguage, Boolean inline,
+      String frame) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -7270,6 +7501,9 @@ public class PlaywrightService {
     Integer shotIndex = index;
     String shotSelector = selector;
     String shotPrompt = prompt;
+    // 验证码/二维码经常在跨域 iframe 里(实测企业微信登录页的二维码就在 iframe 中),
+    // 不给 frame 时 selector 只在顶层文档找,回执里 imageUrl 会是空的 —— 所以这里一路透传下去
+    String shotFrame = frame;
     if (steps != null && !steps.isEmpty()) {
       List<Kv> items = new ArrayList<>();
       int seq = 0;
@@ -7283,6 +7517,9 @@ public class PlaywrightService {
         if (step.getStr("selector") != null) {
           item.set("selector", step.getStr("selector"));
         }
+        if (step.getStr("frame") != null) {
+          item.set("frame", step.getStr("frame"));
+        }
         items.add(item);
       }
       request.set("steps", items).set("status", "pending");
@@ -7295,6 +7532,9 @@ public class PlaywrightService {
         String stepSelector = steps.get(0).getStr("selector");
         shotIndex = stepIndex instanceof Number ? ((Number) stepIndex).intValue() : null;
         shotSelector = stepSelector;
+        if (shotFrame == null || shotFrame.isBlank()) {
+          shotFrame = steps.get(0).getStr("frame");
+        }
       }
       data.set("note", "这是一次带多步待办的请求:让人一次做完,再用 submit_human_input 按 stepId 逐个回填;"
           + "全部回填后 get_human_input 的 status 会变成 answered");
@@ -7304,7 +7544,7 @@ public class PlaywrightService {
       // 请人看验证码/二维码是「确实必须看图」的场景:落盘 + 内联 + 可 GET 的 URL 一起给,
       // 读不了图的模型至少还能把 imageUrl 贴给用户,或走 OCR
       String path = defaultShotPath(inst);
-      RespBodyVo shot = elementScreenshot(inst, shotIndex, shotSelector, path, wantInline);
+      RespBodyVo shot = elementScreenshot(inst, shotIndex, shotSelector, path, wantInline, shotFrame);
       if (shot.isOk() && shot.getData() instanceof Kv) {
         Kv shotData = (Kv) shot.getData();
         if (wantInline) {
@@ -7312,7 +7552,9 @@ public class PlaywrightService {
         }
         data.set("imageSize", shotData.get("size"))
             .set("imagePath", shotData.getStr("path"))
-            .set("imageUrl", shotData.getStr("url"));
+            .set("imageUrl", shotData.getStr("url"))
+            // 截图取自哪个 frame/选择器:跨域 iframe 里截图时,这是判断「到底截到没有」的唯一线索
+            .set("imageTarget", shotData.getStr("target"));
       } else {
         data.set("imageError", shot.getMsg());
       }

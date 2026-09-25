@@ -104,7 +104,7 @@ Content-Type: application/json
 | 字段 | 说明 |
 | --- | --- |
 | `id` | 任务 ID。`start` 时可自己指定，不传就自动生成；其余方法必填 |
-| `method` | 方法名，共 113 个（`list_methods` 或 `GET /playwright/methods` 能随时查全量清单） |
+| `method` | 方法名，共 116 个（`list_methods` 或 `GET /playwright/methods` 能随时查全量清单） |
 | `params` | 该方法自己的参数 |
 
 响应统一是：
@@ -376,7 +376,8 @@ Chromium 会走到空白页或 HTTP 400；同一流程在 Firefox 139 下能正�
 | `000001-1001-get_browser_state.json` | 这一次调用的完整请求与完整响应（含整页 `data.text`） |
 
 配置项：`browser.trace.enabled`（默认开）、`browser.trace.dir`、`browser.trace.maxRecordChars`。
-写盘失败只留警告，不会影响浏览器命令；日志**不做脱敏、不会自动清理**，里面有敏感值时请自行清理。
+写盘失败只留警告，不会影响浏览器命令；日志**不会自动清理**（里面的敏感值请自行清理），但**默认脱敏** ——
+规则与边界见下文「安全提示」。
 
 客户端这一侧还有两个把请求也留档的客户端：PowerShell 的 `scripts/trace/browse.ps1` 与 Python 的
 `client/dsb.py`（Windows 上还有一层薄包装 `client/dsb.cmd`，直接敲 `client\dsb.cmd ...` 即可，不必写
@@ -605,7 +606,7 @@ deepseek-browser-use/
 ├── client/README.md                        Python 客户端的用法与退出码约定
 ├── recipes/*.json                          显式 opt-in 的站点配方(run_recipe 用)
 ├── skills/SKILL.md                        给智能体读的技能文档(装进 DSH 时放到 .dsh/skills/deepseek-browser-use/)
-├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register、railway-12306-ticket)
+├── skills/<站点名>/SKILL.md                具体站点的实操手册(例如 cnipa-trademark-register、railway-12306-ticket、aliyun-lightweight-server)
 └── dist/                                  发行版产物(构建后生成)
 ```
 

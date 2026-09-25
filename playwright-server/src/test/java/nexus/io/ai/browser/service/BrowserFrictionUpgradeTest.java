@@ -73,11 +73,28 @@ public class BrowserFrictionUpgradeTest {
         </div>
         <div id="result">idle</div>
         <div id="xhrOut">none</div>
+        <input type="file" id="swapFile">
+        <div id="swapFlag">none</div>
+        <button id="growBtn">点我就改页面</button>
+        <div id="growOut">none</div>
         <script>
           document.getElementById('qr_submit_id').addEventListener('click', function () {
             document.getElementById('confirmBox').remove();
             document.getElementById('mark').remove();
             document.getElementById('result').textContent = 'confirmed';
+          });
+          // 模拟 SPA 上传组件:收下文件之后把原来的 input **换掉**(企业微信的上传组件就是这个行为)。
+          // 老版本的回读走 Locator,此时节点已脱离文档,Locator.evaluate 会一直等到 30 秒超时。
+          document.getElementById('swapFile').addEventListener('change', function (e) {
+            var old = document.getElementById('swapFile');
+            var fresh = document.createElement('input');
+            fresh.type = 'file';
+            fresh.id = 'swappedIn';
+            old.parentNode.replaceChild(fresh, old);
+            document.getElementById('swapFlag').textContent = 'replaced:' + e.target.files.length;
+          });
+          document.getElementById('growBtn').addEventListener('click', function () {
+            document.getElementById('growOut').textContent = 'grown';
           });
           fetch('/api/data').then(function (r) { return r.text(); }).then(function (t) {
             document.getElementById('xhrOut').textContent = t;
@@ -294,5 +311,119 @@ public class BrowserFrictionUpgradeTest {
     Kv body = data(service.getResponseBody(id, null, null, null, requestId));
     assertTrue("按 requestId 也要读得到响应体", Boolean.TRUE.equals(body.get("bodyAvailable")));
     assertEquals("requestId 要原样回带", requestId, String.valueOf(body.get("requestId")));
+  }
+
+  // ==================== 上传回读:框架把 input 换掉之后不能等 30 秒超时 ====================
+
+  /**
+   * 上传后元素被框架替换:回读要如实说明,**不能**报成 {@code Timeout 30000ms exceeded}
+   *
+   * <p>
+   * 实测企业微信的授权书上传就是这样:{@code setInputFiles} 之后组件把原 input 换掉,
+   * 老版本回读走 {@code Locator.evaluate},它会在节点脱离文档后一直等到默认 30 秒超时才抛,
+   * 于是「上传成功」被写成 {@code readbackError: Timeout 30000ms exceeded.} + {@code consumed: unknown}
+   * —— 一次成功的操作看起来像失败了,调用方一重试就可能传两份。
+   *
+   * <p>这里断言两件事:① 回读没有超时错误;② 页面上确实收到了文件(即上传本身是成功的)。
+   */
+  @Test
+  public void uploadReadbackSurvivesInputReplacement() {
+    open();
+    long startedAt = System.currentTimeMillis();
+    RespBodyVo response = service.uploadFileInline(id, null, "#swapFile", "授权书.pdf", "application/pdf",
+        java.util.Base64.getEncoder().encodeToString("%PDF-1.4 fake".getBytes(StandardCharsets.UTF_8)),
+        null, 5_000);
+    long elapsed = System.currentTimeMillis() - startedAt;
+    Kv result = data(response);
+
+    assertNull("不该再有 30 秒超时的回读错误,实际:" + result.getStr("readbackError"),
+        result.getStr("readbackError"));
+    assertTrue("上传本身必须是最快的:回读不该把一次上传拖成几十秒(实测 " + elapsed + "ms)",
+        elapsed < 20_000);
+    assertEquals("页面要真的收到了这个文件", "replaced:1", innerText("#swapFlag"));
+    assertTrue("回执要说明清楚「回读时元素已被换掉」,而不是让人以为上传失败,实际:"
+        + result.getStr("readbackNote"), result.getStr("readbackNote") != null);
+  }
+
+  // ==================== 抛异常 ≠ 没生效:点下载类按钮的假失败 ====================
+
+  /**
+   * 「动作抛了异常、但页面已经变了」必须回 {@code ok:true} + 明确的 warning
+   *
+   * <p>
+   * 实测点「下载合同」时 {@code locator.click(...)} 抛 {@code Object doesn't exist: response@…},
+   * 点 Chrome 内置 PDF 查看器的下载按钮时 {@code page.mouse().click(...)} 抛 {@code artifact@…},
+   * 而**文件都已经落盘**。老写法回 {@code ok:false},调用方看到失败就会重试 ——
+   * 重试的代价是重复下载 / 重复提交。真实触发条件(浏览器内置查看器)没法在 fixture 里复现,
+   * 所以这里直接对 {@code actionErrorOrEffect} 的输入组合做断言,把契约固定住。
+   */
+  @Test
+  public void actionErrorIsNotFailureWhenPageChanged() {
+    open();
+    BrowserInstance inst = service.getInstance(id);
+    Kv before = (Kv) PlaywrightService.stateProbe(inst, null);
+    // 让页面真的发生变化 —— 模拟「下载已经发生 / 页面已经跳走」
+    service.clickElementBySelector(id, "#growBtn", null, null);
+    assertEquals("grown", innerText("#growOut"));
+
+    RespBodyVo changed = PlaywrightService.actionErrorOrEffect("click_element_by_selector", before, inst, null,
+        new com.microsoft.playwright.PlaywrightException("Object doesn't exist: response@deadbeef"),
+        "click_element_by_selector 失败：Object doesn't exist: response@deadbeef");
+    assertTrue("页面确实变了,就不能报失败", changed.isOk());
+    Kv data = data(changed);
+    assertTrue("要给出 warning 说明「很可能已生效、先读状态再重试」,实际:" + data.getStr("warning"),
+        String.valueOf(data.getStr("warning")).contains("不要直接重试"));
+    assertNotNull("原始异常要原样留下供追查", data.getStr("actionError"));
+    assertEquals("要标出这次回执是异常路径产生的", Boolean.TRUE, data.getBoolean("changedByActionError"));
+
+    // 页面没变时照旧报失败:不能把「抛异常」一律洗成成功
+    Kv quietBefore = (Kv) PlaywrightService.stateProbe(inst, null);
+    RespBodyVo unchanged = PlaywrightService.actionErrorOrEffect("click_element_by_selector", quietBefore, inst,
+        null, new com.microsoft.playwright.PlaywrightException("boom"), "click_element_by_selector 失败：boom");
+    assertFalse("页面没变就该照旧失败", unchanged.isOk());
+    assertTrue(unchanged.getMsg().contains("boom"));
+
+    // **超时 / 元素不稳定这类异常即使页面变了也不能放宽**:那是「动作根本没做完」。
+    // 实测就是这个区别救了回归用例 —— 一直在动的元素会持续改变 DOM 指纹,只看「页面变了」就判成功的话,
+    // 原生点击超时会被误判成点击成功(BrowserInspectionUpgradeTest#movingElementFallsBackToRealMouse)。
+    Kv movingBefore = (Kv) PlaywrightService.stateProbe(inst, null);
+    service.clickElementBySelector(id, "#growBtn", null, null); // 制造一次真实的 DOM 变化
+    RespBodyVo timeout = PlaywrightService.actionErrorOrEffect("click_element_by_selector", movingBefore, inst,
+        null, new com.microsoft.playwright.PlaywrightException(
+            "Locator.click: Timeout 700ms exceeded. waiting for element to be stable"),
+        "click_element_by_selector 失败：超时");
+    assertFalse("超时不属于「句柄失效」,页面变了也只能算失败", timeout.isOk());
+  }
+
+  // ==================== 参数名混淆要给提示 ====================
+
+  /**
+   * {@code switch_tab} 的参数叫 {@code pageIndex},而回执里的字段叫 {@code index}
+   *
+   * <p>照着回执传 {@code index} 只会得到一句「缺少参数 pageIndex」,不提示两个名字的关系,
+   * 于是要在两个名字之间再来回猜一轮。这里要求把对应关系直接写出来。
+   */
+  @Test
+  public void switchTabExplainsParamNameConfusion() {
+    open();
+    ActionService actions = new ActionService(service);
+    com.alibaba.fastjson2.JSONObject params = new com.alibaba.fastjson2.JSONObject();
+    params.put("index", 0);
+    RespBodyVo response = actions.execute(id, "switch_tab", params);
+    assertFalse("传错名字本来就该失败", response.isOk());
+    String msg = response.getMsg();
+    assertTrue("要指出「你传的是 index」,实际:" + msg, msg.contains("你传的是 index"));
+    assertTrue("要说明回执里的字段名和参数名不一样,实际:" + msg, msg.contains("pageIndex"));
+
+    // 参数真正缺失(什么都没传)时,保持原来的简洁措辞,不要硬塞一段解释
+    RespBodyVo empty = actions.execute(id, "switch_tab", new com.alibaba.fastjson2.JSONObject());
+    assertFalse(empty.isOk());
+    assertEquals("缺少参数 pageIndex", empty.getMsg().replaceFirst("^switch_tab 失败：", ""));
+  }
+
+  private static String innerText(String selector) {
+    return String.valueOf(service.getInstance(id).page.evaluate(
+        "() => { const el = document.querySelector('" + selector + "');"
+            + " return el ? el.textContent : null; }"));
   }
 }
