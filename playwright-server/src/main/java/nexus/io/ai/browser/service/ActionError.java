@@ -43,6 +43,35 @@ public final class ActionError {
   public static final String SPURIOUS_DISPATCH = "SPURIOUS_DISPATCH";
 
   /**
+   * 选择器在页面里**一个都没匹配到**
+   *
+   * <p>
+   * <b>为什么要单独一个码</b>:以前这种情况会走到 {@code locator.click()} 上,等满可操作性超时之后
+   * 报 {@code ACTION_TIMEOUT}「等待元素可操作超时,不能据此确定元素不存在」。这句话在两种情况下都成立,
+   * 于是调用方**分不清**「选择器写错了」和「元素在、只是暂时不可点」,只能两条路都试一遍。
+   * 实测踩到过:把 {@code .tag-pre-wrp input.input-val} 当成「标签输入框在 .tag-pre-wrp 里面」——
+   * 实际上那个 input 是 {@code .tag-pre-wrp} 的**兄弟**节点,选择器匹配 0 个,却报成超时,
+   * 于是先去查监听器、又去查遮挡,白花了两轮。
+   *
+   * <p>
+   * 现在动作类命令在动手之前先 {@code count()} 一次:为 0 就立刻失败,并把「匹配到 0 个」写在提示里。
+   * 这类错误**不可重试** —— 页面没变,重试多少次都是 0。
+   */
+  public static final String ELEMENT_NOT_FOUND = "ELEMENT_NOT_FOUND";
+
+  /**
+   * 页面正在导航 / 重载,DOM 这一刻拿不到(主 frame 为 null)
+   *
+   * <p>
+   * 症状是一句与命令毫不相干的 {@code Cannot invoke "com.microsoft.playwright.Frame.childFrames()"
+   * because "frame" is null}:用户手动刷新、SPA 整页重建、micro-app 重新挂载时都会出现。
+   * 以前它被归成 {@link #ACTION_UNCERTAIN}(「无法判断动作是否生效,不要重试」)—— 对一次已经成功的
+   * 只读命令来说这是最糟的答复:明明**重发一次就好**,却告诉调用方别动。
+   * 现在单独给码并标成可重试,只读命令由服务端自己等页面回来。
+   */
+  public static final String PAGE_NAVIGATING = "PAGE_NAVIGATING";
+
+  /**
    * 这是「事件泵投递过来的伪故障」吗
    *
    * <p>
@@ -62,11 +91,43 @@ public final class ActionError {
     return text.contains("object doesn't exist") || text.contains("cannot find object to call");
   }
 
+  /**
+   * 这条异常是不是「页面正在导航/重载,这一刻拿不到 DOM」
+   *
+   * <p>
+   * 实测原文是 {@code Cannot invoke "com.microsoft.playwright.Frame.childFrames()" because "frame" is null},
+   * 出现在用户手动刷新 B 站投稿页之后(SPA 整页重建 + micro-app 重新挂载)。它既不是伪故障
+   * (不是事件泵投递的),也不是页面坏了 —— 就是**这一刻**还没有 frame。
+   *
+   * <p>
+   * 只认这一族措辞,不认 {@code Target closed}:后者往往意味着浏览器/上下文真的没了,等多久都不会回来,
+   * 把它当「等一会儿就好」会掩盖真实故障。
+   */
+  public static boolean isPageNavigating(String message) {
+    if (message == null) {
+      return false;
+    }
+    String text = message.toLowerCase(Locale.ROOT);
+    return text.contains("because \"frame\" is null")
+        || text.contains("because \"page\" is null")
+        || text.contains("execution context was destroyed")
+        || text.contains("frame was detached")
+        || text.contains("navigating and changing the document");
+  }
+
   public static String code(String message) {
     String text = message == null ? "" : message.toLowerCase(Locale.ROOT);
     // 放在最前面:这一族措辞很独特,而且「是不是伪故障」比「元素怎么了」更该先告诉调用方
     if (isSpuriousDispatch(text)) {
       return SPURIOUS_DISPATCH;
+    }
+    // 这两个是服务端自己掷出来的哨兵(见上面各常量的注释)。必须排在通用措辞之前,
+    // 否则 PAGE_NAVIGATING 会被后面的 timeout 分支当成普通失败。
+    if (text.contains("element_not_found")) {
+      return ELEMENT_NOT_FOUND;
+    }
+    if (isPageNavigating(text)) {
+      return PAGE_NAVIGATING;
     }
     if (text.contains("element_read_only") || text.contains("read-only") || text.contains("readonly"))
       return "ELEMENT_READ_ONLY";
@@ -111,6 +172,7 @@ public final class ActionError {
     case "RATE_LIMITED":
     case "ACTION_TIMEOUT":
     case "STALE_ELEMENT":
+    case PAGE_NAVIGATING:
       return true;
     default:
       return false;
@@ -131,6 +193,9 @@ public final class ActionError {
       return 1_500;
     case "STALE_ELEMENT":
       return 300;
+    case PAGE_NAVIGATING:
+      // SPA 整页重建通常几百毫秒就回来了;给 1 秒,足够而不用让调用方干等
+      return 1_000;
     default:
       return 0;
     }
@@ -163,6 +228,15 @@ public final class ActionError {
       break;
     case "ACTION_TIMEOUT":
       reason = "等待元素可操作超时；不能据此确定元素不存在或快照过期";
+      break;
+    case ELEMENT_NOT_FOUND:
+      reason = "选择器在页面里**一个都没匹配到**（不是超时、也不是被遮挡）："
+          + "先 get_element_count 复核数量，再检查选择器里的祖先/兄弟关系是不是写错了 —— "
+          + "input 常常不是那个包装元素的子节点，而是它的兄弟";
+      break;
+    case PAGE_NAVIGATING:
+      reason = "页面正在导航/重载，这一刻拿不到 DOM（主 frame 还是 null）："
+          + "等它稳定下来再重发即可；只读命令服务端已经自己等过，动作类命令请先读页面状态确认没有生效";
       break;
     case ACTION_UNCERTAIN:
       reason = "执行器抛了未预期异常，**无法判断动作是否已经生效**；"

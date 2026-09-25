@@ -51,6 +51,13 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | **`get_element_screenshot` / `click_element_by_selector` 用 `[class*=xxx]` 报 `ACTION_TIMEOUT`（等元素可操作超时），可 `get_element_count` 明明说匹配到好几个** | 选择器命中了**隐藏**节点：Playwright 只对可见元素做可操作性检查，隐藏的那个会一直等到超时。先 `get_element_count` 看数量，再用更精确的选择器、或改用索引（快照里只有可见元素才有索引）。实测登录页的 `[class*=qrcode]` 命中 3 个，只有第一个是真二维码 |
 | **`get_modals` 回 `count=0`，但页面上确实有一层挡着点不动** | `count=0` 只说明「没有命中框架弹窗 / 类名线索 / 几何兜底」这三轮扫描，**不是「绝对没有遮挡」**：新版站点的「引导层 / 新手蒙层」常常既没有 `role=dialog`、类名也不含 dialog/modal。改用 `get_browser_state` 读文本找「暂不体验 / 我知道了 / 跳过」这类按钮，按索引点掉，元素数会立刻从个位数涨到几十上百 |
 | 写了新站点 skill，`SkillDocConsistencyTest` 报「命令表里不存在」 | 页面里的 snake_case 标识符（Vue 字段 / CSS 类名 / id / URL 参数）请用**双反引号**包起来，见 `docs/SKILL-CONVENTIONS.md` |
+| **每条命令都慢了几十秒，而且一张图都拿不到** | 看回执里的 ``capture_degraded``：自动截图在这个页面上根本成功不了，已熔断。**别再指望画面**：改用 `diff_dom_text` 等文本取证，关键步骤请人看一眼；调 `browser.capture.timeoutMs` / `browser.capture.failThreshold` / `browser.capture.cooldownMs` |
+| **报 `ELEMENT_NOT_FOUND`** | 选择器**一个都没匹配到**（不是超时、不是被遮挡）：先 `get_element_count` 复核数量，再检查父子/兄弟关系写错了没有。别去查监听器、别去查遮挡 |
+| **`get_element_count` 说有好几个，但点击/输入就是不可操作** | 匹配到的多半是**隐藏副本**（同名控件在隐藏弹窗里还有一份）：动作类命令现在会优先挑可见的那个，看回执的 `matched` / `chosenIndex` / `visibleMatched` / `hiddenMatchNote` |
+| **回执里 `probeTrustworthy:false` / `observationComplete:false`，还附一个 `coveredBy`** | 页面正在导航或整页重建，**这次取证不可信**：`changed` 与 `coveredBy` 都是假象（实测两次点击其实都成功了）。不要重复点击，等几秒重新 `get_browser_state` |
+| **报 `because "frame" is null`，可这条命令只是只读查询** | `PAGE_NAVIGATING`：页面正在刷新/重建，**可重试**（约 1 秒后重发），只读命令服务端已自己等过 |
+| **`send_keys` 回了 `ok:true` 但页面毫无反应** | 看回执里的 `focused`：焦点可能根本不在输入框上（`isBody:true` 时会给 `focusNote`）。先 `click` 目标输入框，再送键 |
+| **`go_to_url` 报失败，可地址栏其实已经跳过去了** | 幂等导航现在会读地址栏核对（忽略 `?vd_source=…` 这类会话参数），到达了就按成功返回并带 `data.warning` |
 
 ## 一、请求与响应
 
@@ -1382,6 +1389,72 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
     也可能是**你自己那条命令的目标句柄真的失效了**（元素被页面换掉），文本上分不开；所以服务端只拿它当
     **重发**的依据（只读命令重发无害），不用它下「动作成功了」的结论。
 
+48. **自动截图可能整页截不出来，而回执现在会明说（``capture_degraded``）**。实测 B 站投稿页上
+    `page.screenshot()` **一次都没成功过**，每次都等满默认 30 秒：结果是**每条命令白等 30 秒**，
+    而调用方**完全没有画面可看**，页面上出现过整页白屏也判断不出来（当时是等人来说「屏幕都白了」
+    才知道）。现在自动截图连续失败到阈值就**熔断**一段时间，并在每条回执里给出：
+
+    ```
+    capture_degraded: true
+    capture_note: 自动截图不可用(连续 N 次失败,已暂停 X 秒,首次失败原因:Timeout …)…
+    ```
+
+    **看到 ``capture_degraded`` 就要改变工作方式**，而不是照原样继续点：① 画面取证改用文本
+    （`get_browser_state` / `diff_dom_text` / `execute_js` 读 DOM）；② **不要**只凭文本断言「页面正常」
+    ——白屏、样式错乱、遮罩在文本里看不出来；③ 关键步骤（提交、支付、扫码）请人看一眼
+    （`request_human_input`）。调参：`browser.capture.timeoutMs`（单次超时，默认 8000）、
+    `browser.capture.failThreshold`（连续失败几次熔断，默认 3）、`browser.capture.cooldownMs`（默认 120000）。
+
+49. **选择器匹配 0 个 = `ELEMENT_NOT_FOUND`，不是超时**。以前这种情况会等满动作超时再报
+    `ACTION_TIMEOUT` + 一句「不能据此确定元素不存在」——两种含义混在一句话里，于是调用方只能两条路都试
+    （查监听器、查遮挡），方向全错。实测把一个 input 的**兄弟关系写成了父子关系**
+    （`.tag-pre-wrp input.input-val`，而那个 input 其实是 `.tag-pre-wrp` 的兄弟），白花了两轮。
+
+    - 看到 `ELEMENT_NOT_FOUND`：**去改选择器**，先 `get_element_count` 复核数量，再检查父子/兄弟关系；
+    - 匹配到**多个**同名控件时，动作类命令会**优先挑可见的那个**，并把解析结果写进回执
+      （`matched` / `chosenIndex` / `scanned` / `selectorNote`）。站点的同名控件常有两份，
+      另一份在隐藏的弹窗里且是 0×0 —— 这时 `get_element_count` 说「有 2 个」而 `locator.first()` 挑到的
+      正是隐藏那份，表现就是「明明有元素却怎么都点不动」；
+    - 匹配到的元素**全都不可见**时**不判死**（`input_text_by_selector` 的 auto 模式要靠 JS 设值把值填进
+      `type=hidden` 字段），回执会给 `visibleMatched: 0` 与 `hiddenMatchNote`。
+    - **只作用于「动作」命令**：`wait_for_element`（等的就是「现在还没有」）与 `upload_file`
+      （file input 天生隐藏）**不适用**这套挑选规则。
+
+50. **回执里有 `probeTrustworthy` / `observationComplete`，它们说「这次取证能不能当结论」**。
+    页面正在导航、或 SPA 整页重建（Vue 重挂载、micro-app 重建）时取的探针**什么都不能说明**，
+    而老回执会给出这种看着像结论、其实全错的组合：
+
+    ```
+    observationComplete: false, textLengthAfter: 0, changed: false, coveredBy: {className: "header"}
+    hint: …目标中心点上命中的是别的元素——很可能被遮挡物吃掉了…
+    ```
+
+    实测（B 站投稿页打开封面弹窗、点「立即投稿」）这两次点击**都生效了**，`coveredBy` 报的
+    `div.header` 是页面被清空时 `elementFromPoint` 撞到残留节点的产物，**那个遮挡物根本不存在**。
+    现在服务端的行为是：发现探针不可用就**先等页面回来再下结论**（最多约 2.5 秒），等到就标
+    `page_appears_blank: true` + `probeRecovered: true`（说明 changed 是恢复后测的），等不到就
+    `probeTrustworthy: false` 并**盖掉遮挡提示**。
+
+    **调用方的判据**：`probeTrustworthy` 为 `false` 时**什么都别下结论** —— 既不要重复点击（可能重复提交），
+    也不要急着重新取快照（页面还没稳），等几秒重新 `get_browser_state` 看真实结果。
+
+51. **`frame` 为 null 是「页面正在导航」，不是动作失败**。用户手动刷新、SPA 整页重建时，只读命令会抛
+    `Cannot invoke "com.microsoft.playwright.Frame.childFrames()" because "frame" is null`。以前它被归成
+    `ACTION_UNCERTAIN`（「无法判断是否生效，不要重试」）——对一条只读命令来说这是最糟的答复：明明重发一次
+    就好，却告诉调用方别动。现在单独给 `PAGE_NAVIGATING` 并标成**可重试**（建议 1 秒后重发），
+    只读命令服务端会自己等页面回来。
+
+52. **`send_keys` 会回报按键时的焦点元素**。实测「填完输入框 → `send_keys` Enter」会**悄悄什么都不做**
+    （焦点已经不在那个 input 上了），而回执只有一句 `ok:true`，调用方只能靠「结果没多出来」反推，白跑
+    一轮。现在回执里有 `focused`（`tag`/`id`/`className`/`placeholder`/`isBody`）；焦点落在 `<body>`
+    上时还会给 `focusNote` 提示「先 click 目标输入框再送键」。
+
+53. **导航报伪故障时，地址栏才是答案**。实测 `go_to_url` 连试 3 次都报
+    `Object doesn't exist: response@…`，随后 `get_url` 读到的**正是目标地址** —— 报成失败会直接把人
+    带偏去排查「为什么打不开」。现在幂等导航会读一次地址栏：已经落在目标上（比较主机+路径，
+    忽略站点自动追加的 `?vd_source=…` 这类会话参数）就按成功返回，并带 `data.warning` 与
+    `data.spuriousDispatch`。
+
 ## 十二、站点配方（`run_recipe`）
 
 配方是把「某个站点上必须这么点」的经验固化成服务端的 JSON 命令序列：文件放在配方目录（默认 `<启动目录>/recipes`，可用 `browser.recipes.dir` 改），文件名就是配方名，内容形如：
@@ -1445,4 +1518,3 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 - **进了控制台之后用改 hash 的方式跳页**：`location.hash = '#/domain'` 是**同文档跳转**，不会重新请求，也就
   不会让 token 失效；而 `go_to_url` 到控制台里的另一个 URL 会重新走鉴权，多半失败。控制台内部导航优先用
   `execute_js` 改 hash，或点页面上的导航项。
-

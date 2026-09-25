@@ -270,11 +270,44 @@ public class BrowserResponseIntegrationTest {
         switched.getMsg().contains(current));
   }
 
+  /**
+   * 等两条 {@code /query} 请求的**响应事件真的送达 Java 侧**
+   *
+   * <p><b>为什么必须等</b>：页面里的 {@code await fetch(...)} 只保证「浏览器收到了响应」，
+   * 而 {@code page.onResponse} 是**异步投递**到 Java 的 —— {@code get_requests} 读的是 {@code onRequest}
+   * 写下的记录（先到），{@code get_response_body} 读的是 {@code onResponse} 写下的记录（后到）。
+   * 两者之间本来就有时间差，所以「fetch 一返回就去读响应体」是一个**竞态**：
+   * 实测同一次全量 {@code mvn test} 里它会偶发地报
+   * {@code get_response_body 没有匹配的响应: /query(只保留最近 100 个响应)}，而单独跑这个类必过。
+   *
+   * <p>判据用 {@code respondedAt}：{@code onResponse} 到齐后它才会有值。
+   */
+  private List<?> awaitQueryResponses() {
+    long deadline = System.currentTimeMillis() + 5_000;
+    List<?> requests = List.of();
+    while (System.currentTimeMillis() < deadline) {
+      requests = (List<?>) data(service.getRequests(id, "/query")).get("requests");
+      boolean allResponded = requests.size() >= 2;
+      for (Object entry : requests) {
+        if (((Kv) entry).get("respondedAt") == null) {
+          allResponded = false;
+          break;
+        }
+      }
+      if (allResponded) {
+        return requests;
+      }
+      page().waitForTimeout(50);
+    }
+    return requests;
+  }
+
   @Test public void repeatedUrlResponsesAreCorrelatedAndTruncationIsExplicit() {
     page().navigate(base);
     page().evaluate("async () => {for(const month of ['2026-07','2026-08'])"
         + "await fetch('/query',{method:'POST',body:JSON.stringify({month})}).then(r=>r.text());}");
-    List<?> requests = (List<?>) data(service.getRequests(id, "/query")).get("requests");
+    // 等响应事件投递到 Java 侧再读（见 awaitQueryResponses 的说明）
+    List<?> requests = awaitQueryResponses();
     Kv first = (Kv) requests.get(requests.size() - 2);
     Kv second = (Kv) requests.get(requests.size() - 1);
     assertNotEquals(first.get("requestId"), second.get("requestId"));

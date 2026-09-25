@@ -139,6 +139,31 @@ public class PlaywrightService {
   /** 自动截图开关:关掉后动作照常执行,只是不再每次落图 */
   public static final String KEY_CAPTURE_ENABLED = "browser.capture.enabled";
 
+  /**
+   * 自动截图的单次超时(毫秒)
+   *
+   * <p>
+   * Playwright 默认 30 秒。实测 B 站投稿页**一张都截不出来**,于是每条命令都要白等 30 秒
+   * （一次会话几十条命令 = 十几分钟纯等待),而这一等换不来任何画面。这里默认收到 8 秒:
+   * 正常情况下截图是几十毫秒的事,8 秒还没出来就说明这个页面截不动,早点放弃。
+   */
+  public static final String KEY_CAPTURE_TIMEOUT = "browser.capture.timeoutMs";
+
+  /** 自动截图连续失败几次就熔断({@code browser.capture.failThreshold},默认 3) */
+  public static final String KEY_CAPTURE_FAIL_THRESHOLD = "browser.capture.failThreshold";
+
+  /** 熔断持续多久(毫秒,{@code browser.capture.cooldownMs},默认 120000) */
+  public static final String KEY_CAPTURE_COOLDOWN = "browser.capture.cooldownMs";
+
+  /** 自动截图单次超时默认值(毫秒) */
+  private static final double DEFAULT_CAPTURE_TIMEOUT_MS = 8_000;
+
+  /** 连续失败多少次熔断 */
+  private static final int DEFAULT_CAPTURE_FAIL_THRESHOLD = 3;
+
+  /** 熔断时长默认值(毫秒) */
+  private static final long DEFAULT_CAPTURE_COOLDOWN_MS = 120_000;
+
   /** 动作类命令的超时(毫秒),可用配置项覆盖 */
   public static final String KEY_ACTION_TIMEOUT = "browser.action.timeoutMs";
 
@@ -206,6 +231,14 @@ public class PlaywrightService {
 
   /** 每次截图前最多等页面进入 DOMCONTENTLOADED 多久(毫秒),等不到也照常截图 */
   private static final double CAPTURE_SETTLE_TIMEOUT_MS = 1_500;
+
+  /**
+   * 探针发现正文被清空后,最多再等多久让 SPA 把正文重建回来(纳秒)
+   *
+   * <p>实测 B 站投稿页整页重建大约 1~2 秒;2.5 秒足够,又不至于让「页面真的白屏了」这种结论
+   * 迟迟给不出来。
+   */
+  private static final long BLANK_RECOVERY_NANOS = 2_500_000_000L;
 
   /**
    * 启动一个任务的浏览器(浏览器类型按配置里的默认值)
@@ -2168,20 +2201,89 @@ public class PlaywrightService {
       kv.set("screenshot_skipped", "browser.capture.enabled=false");
       return kv;
     }
+    long now = System.currentTimeMillis();
+    if (inst.captureCooldownUntil > now) {
+      // 熔断中:不再白等一次超时,但**必须说清**——调用方此刻是完全看不到画面的
+      return degraded(kv, inst, "熔断中,还有 " + ((inst.captureCooldownUntil - now) / 1000) + " 秒");
+    }
+    if (inst.captureCooldownUntil != 0 && inst.captureCooldownUntil <= now) {
+      // 冷却结束:放开一次,成败由这次决定(失败就再熔断)
+      inst.captureCooldownUntil = 0;
+    }
     try {
       Files.createDirectories(dir);
       settle(inst);
-      spuriousRetry(() -> inst.page.screenshot(new Page.ScreenshotOptions().setPath(png)));
+      spuriousRetry(() -> inst.page
+          .screenshot(new Page.ScreenshotOptions().setPath(png).setTimeout(captureTimeoutMs())));
       kv.set("screenshot", "/" + DATA_DIR + "/" + inst.id + "/" + seq + ".png");
       kv.set("screenshot_path", png.toAbsolutePath().toString());
+      inst.captureFailures.set(0);
+      inst.captureFailureReason = null;
     } catch (PlaywrightException e) {
-      kv.set("screenshot_error", briefMessage(e.getMessage()));
-      log.warn("任务 {} 第 {} 张截图失败:{}", inst.id, seq, briefMessage(e.getMessage()));
+      String reason = briefMessage(e.getMessage());
+      kv.set("screenshot_error", reason);
+      int failures = inst.captureFailures.incrementAndGet();
+      if (inst.captureFailureReason == null) {
+        inst.captureFailureReason = reason;
+      }
+      log.warn("任务 {} 第 {} 张截图失败(连续第 {} 次):{}", inst.id, seq, failures, reason);
+      if (failures >= captureFailThreshold()) {
+        inst.captureCooldownUntil = System.currentTimeMillis() + captureCooldownMs();
+        degraded(kv, inst, "连续 " + failures + " 次失败,已暂停 " + (captureCooldownMs() / 1000) + " 秒");
+      }
     } catch (IOException e) {
       kv.set("screenshot_error", e.getMessage());
       log.warn("任务 {} 第 {} 张截图写文件失败:{}", inst.id, seq, e.getMessage());
     }
     return kv;
+  }
+
+  /**
+   * 截图能力已经退化:把「你现在看不到画面」这件事写进回执
+   *
+   * <p>
+   * 起因是实测的一次任务:B 站投稿页全程截不出图,而页面上出现过整页白屏,只读文本完全看不出来 ——
+   * 调用方直到人来说「屏幕都白了」才知道自己一直在盲操作。回执里明说之后,调用方至少能做三件事:
+   * 改用 {@code diff_dom_text} 之类的文本取证、不要只凭文本断言「页面正常」、关键步骤请人看一眼。
+   */
+  private static Kv degraded(Kv kv, BrowserInstance inst, String why) {
+    kv.set("capture_degraded", true)
+        .set("capture_note", "自动截图不可用(" + why + (inst.captureFailureReason == null ? ""
+            : ",首次失败原因:" + inst.captureFailureReason) + ")。"
+            + "这期间**没有任何画面留档**,别只凭 data.text 断言「页面正常」:"
+            + "整页白屏、样式错乱、弹窗遮罩这类问题在文本里看不出来。"
+            + "需要确认画面请让人类看一眼浏览器窗口(request_human_input),或用 execute_js 读 DOM 自证。");
+    return kv;
+  }
+
+  /** 自动截图单次超时(毫秒,{@code browser.capture.timeoutMs}) */
+  static double captureTimeoutMs() {
+    return positiveDouble(ChromeBrowser.config(KEY_CAPTURE_TIMEOUT), DEFAULT_CAPTURE_TIMEOUT_MS);
+  }
+
+  /** 连续失败几次熔断({@code browser.capture.failThreshold}) */
+  static int captureFailThreshold() {
+    Double configured = positiveDouble(ChromeBrowser.config(KEY_CAPTURE_FAIL_THRESHOLD), 0);
+    return configured <= 0 ? DEFAULT_CAPTURE_FAIL_THRESHOLD : configured.intValue();
+  }
+
+  /** 熔断时长(毫秒,{@code browser.capture.cooldownMs}) */
+  static long captureCooldownMs() {
+    Double configured = positiveDouble(ChromeBrowser.config(KEY_CAPTURE_COOLDOWN), 0);
+    return configured <= 0 ? DEFAULT_CAPTURE_COOLDOWN_MS : configured.longValue();
+  }
+
+  /** 读一个正整数配置:没配/配错/非正数都退回默认值 */
+  private static double positiveDouble(String configured, double fallback) {
+    if (configured == null) {
+      return fallback;
+    }
+    try {
+      double parsed = Double.parseDouble(configured.trim());
+      return parsed > 0 ? parsed : fallback;
+    } catch (NumberFormatException e) {
+      return fallback;
+    }
   }
 
   /**
@@ -2694,6 +2796,117 @@ public class PlaywrightService {
     return frameOf(inst, frame).locator(selector).first();
   }
 
+  /** 可见性扫描的上限:匹配到几百个时不必每个都问一遍,前 20 个里挑得到就够了 */
+  private static final int VISIBLE_SCAN_LIMIT = 20;
+
+  /**
+   * 动作类命令的选择器定位结果
+   *
+   * <p>
+   * 与 {@code locator.first()} 的差别有两条,都是 2026-09-25 在 B 站投稿页上踩出来的:
+   *
+   * <ul>
+   * <li><b>匹配到 0 个就当场失败</b>,不等到可操作性超时再报 {@code ACTION_TIMEOUT} ——
+   * 后者会让调用方以为「元素在、只是不可点」,于是去查监听器、查遮挡,方向全错。</li>
+   * <li><b>优先挑可见的那个</b>。站点的同名控件常常有两份,一份在表单里、一份在隐藏的弹窗里
+   * (B 站的标签输入框就是:真正的在 {@code .tag-input-wrp} 里,另一份在 {@code bcc-dialog__body} 里
+   * 且是 0×0)。{@code .first()} 按文档顺序取,取到的可能正好是隐藏那份,于是「明明有元素却怎么都点不动」。</li>
+   * </ul>
+   */
+  private static final class ActionTarget {
+    final Locator locator;
+    final int matched;
+    final int chosenIndex;
+    final int scanned;
+    /**
+     * 匹配到的元素**一个可见的都没有**
+     *
+     * <p>
+     * 这种情况**不能当场失败**:{@code input_text_by_selector} 在 auto 模式下走的正是
+     * 「原生输入不可操作 → 退回 JS 设值」这条降级链,而 JS 设值对隐藏字段是完全有效的
+     * (实测 {@code type=hidden} 的字段就是这么填进去的,见 BrowserActionUpgradeTest)。
+     * 当场判死会把一条本来能成的命令挡掉,所以这里只**记下来**,失败时再用它把原因说清。
+     */
+    final boolean allHidden;
+
+    ActionTarget(Locator locator, int matched, int chosenIndex, int scanned, boolean allHidden) {
+      this.locator = locator;
+      this.matched = matched;
+      this.chosenIndex = chosenIndex;
+      this.scanned = scanned;
+      this.allHidden = allHidden;
+    }
+
+    /** 写进回执的选择器解析摘要;只有一个匹配且可见时只报数量 */
+    Kv describe() {
+      Kv kv = Kv.by("matched", matched);
+      if (matched > 1) {
+        kv.set("chosenIndex", chosenIndex).set("scanned", scanned).set("selectorNote",
+            "选择器匹配到 " + matched + " 个元素,这次用的是第 " + chosenIndex
+                + " 个（按文档顺序遇到的第一个**可见**元素）;要精确指定就把选择器写得更具体");
+      }
+      if (allHidden) {
+        kv.set("visibleMatched", 0).set("hiddenMatchNote",
+            "选择器匹配到 " + matched + " 个元素,但可见的 0 个:页面上的同名控件常有两份"
+                + "(一份在表单里、一份在隐藏的弹窗里)。原生输入/点击对它一定会失败,"
+                + "auto 模式会退回 JS 设值(有效,但 committed=false)");
+      }
+      return kv;
+    }
+
+    /** 失败提示的尾巴:把「匹配到几个、可见几个、这次用的是哪个」直接说清,省掉一次 get_element_count */
+    String failureSuffix() {
+      StringBuilder sb = new StringBuilder();
+      if (allHidden) {
+        sb.append("（该选择器匹配到 ").append(matched).append(" 个元素，可见的 0 个："
+            + "定位到的就是隐藏副本。要么把选择器写具体，要么先让宿主控件把容器显出来；"
+            + "隐藏字段确实可以填，但要用 auto 模式走 JS 设值）");
+      } else if (matched > 1) {
+        sb.append("（该选择器共匹配到 ").append(matched).append(" 个元素，这次定位的是第 ")
+            .append(chosenIndex).append(" 个）");
+      }
+      return sb.toString();
+    }
+  }
+
+  /**
+   * 动作类命令的选择器定位:先 count 再挑可见的那个,两个坑都在里面挡掉
+   *
+   * <p>
+   * <b>只给「动作」用</b>,不要用在等待类命令上({@code wait_for_element} 等的就是「现在还没有」,
+   * 匹配 0 个完全正常),也不要用在 {@code upload_file} 上(站点上的 file input 几乎都是隐藏的,
+   * 「挑可见的」会把唯一正确的那个排除掉)。
+   *
+   * <p>
+   * 匹配到元素但**全都不可见**时**不失败**:JS 派发点击与 JS 设值对隐藏节点都有效,auto 模式的降级链
+   * 正依赖这一点(见 {@link ActionTarget#allHidden})。这时只把「可见 0 个」记下来。
+   *
+   * @param root     定位的根 frame(主 frame 或指定 frame)
+   * @param selector CSS 选择器
+   * @param action   命令名,只用于错误信息
+   * @throws PlaywrightException 匹配 0 个({@link ActionError#ELEMENT_NOT_FOUND})
+   */
+  static ActionTarget resolveActionTarget(Frame root, String selector, String action) {
+    int matched = root.locator(selector).count();
+    if (matched == 0) {
+      throw new PlaywrightException(ActionError.ELEMENT_NOT_FOUND + " " + action + " 的选择器 " + selector
+          + " 在页面里匹配到 0 个元素:这不是超时也不是被遮挡 —— "
+          + "先 get_element_count 复核数量,再检查选择器里的父子/兄弟关系(input 未必在它所属的面板元素里面)");
+    }
+    int scanned = Math.min(matched, VISIBLE_SCAN_LIMIT);
+    int chosen = -1;
+    for (int i = 0; i < scanned; i++) {
+      if (root.locator(selector).nth(i).isVisible()) {
+        chosen = i;
+        break;
+      }
+    }
+    boolean allHidden = chosen < 0;
+    int pick = allHidden ? 0 : chosen;
+    Locator locator = pick == 0 ? root.locator(selector).first() : root.locator(selector).nth(pick);
+    return new ActionTarget(locator, matched, pick, scanned, allHidden);
+  }
+
   private RespBodyVo actByLocator(Long browserId, String action, String target,
       Function<BrowserInstance, Locator> locatorFn, Consumer<Locator> consumer) {
     BrowserInstance inst = INSTANCES.get(browserId);
@@ -3127,12 +3340,14 @@ public class PlaywrightService {
     }
   }
 
-  /** 输入类动作的公开实现:回执里带上 mode/committed */
+  /** 输入类动作的公开实现:回执里带上 mode/committed,以及选择器解析摘要(matched/chosenIndex…) */
   private static RespBodyVo inputResult(ActionOutcome outcome) {
     Kv data = Kv.by("mode", outcome.mode).set("committed", !"js".equals(outcome.mode));
     if ("js".equals(outcome.mode)) {
       data.set("note", JS_MODE_NOTE);
     }
+    // 选择器匹配到多个时的解析摘要必须带出来:否则调用方看到 ok:true 却不知道值落到了哪一份同名控件上
+    data.set(outcome.extra);
     return RespBodyVo.ok(data);
   }
 
@@ -3154,8 +3369,7 @@ public class PlaywrightService {
    * @param frame 探针所在的 frame;null 表示顶层文档
    */
   // 包级可见是为了让 BrowserFrictionUpgradeTest 能直接构造「抛异常 + 页面已变」的输入组合
-  static Kv stateProbe(BrowserInstance inst, Frame frame) {
-    Frame target = frame;
+  static Kv stateProbe(BrowserInstance inst, Frame frame) {    Frame target = frame;
     Kv probe = new Kv();
     try {
       if (target == null) {
@@ -3223,7 +3437,49 @@ public class PlaywrightService {
       }
       after = stateProbe(inst, frame);
     }
+    // 第二段:探针本身不可用时再多等一会儿重取。
+    //
+    // 什么算「不可用」有两种形态,本质是同一件事 —— 页面正处在导航/整页重建的中间态:
+    //   ① probeError:evaluate 直接抛(上下文正在销毁、文档正在被替换);此时 **textLength 也是 0**,
+    //      因为那个字段压根没取到,而不是「正文真的是空的」;
+    //   ② 正文从中途变成 0:SPA(Vue 整页重建、micro-app 重新挂载)先清空 DOM 再重建。
+    // 这两种情况下取到的探针**什么都不能说明**:比较指纹只会得到 changed=false,
+    // elementFromPoint 会命中页头(于是 coveredBy 报出一个根本不存在的遮挡物)。
+    //
+    // 实测 B 站投稿页打开封面弹窗、点「立即投稿」都是形态 ①(回执里 observationComplete:false +
+    // textLengthAfter:0 + coveredBy:div.header),而两次动作其实**都生效了**。当时没有任何提示说明
+    // 「这次取证不可信」,于是那一堆字段被当成了结论。现在:先等页面回来再下结论,等不到就明说不可信。
+    boolean probeWasUnusable = afterUnusable(before, after);
+    if (probeWasUnusable) {
+      long recovery = System.nanoTime() + BLANK_RECOVERY_NANOS;
+      while (System.nanoTime() < recovery) {
+        try {
+          inst.page.waitForTimeout(100);
+        } catch (PlaywrightException e) {
+          after.set("probeError", briefMessage(e.getMessage()));
+          break;
+        }
+        after = stateProbe(inst, frame);
+        if (!afterUnusable(before, after)) {
+          after.set("probeRecovered", true);
+          break;
+        }
+      }
+    }
+    if (probeWasUnusable) {
+      after.set("probeWasUnusable", true);
+    }
     return after;
+  }
+
+  /** 这一次取到的探针能不能用:探针自己失败了(probeError),或者正文被清空成了 0 */
+  private static boolean afterUnusable(Kv before, Kv after) {
+    return after.containsKey("probeError") || bodyWentBlank(before, after);
+  }
+
+  /** 正文长度是不是「本来是有的,现在变成 0」——SPA 整页重建的独有形态 */
+  private static boolean bodyWentBlank(Kv before, Kv after) {
+    return asInt(before.get("textLength")) > 0 && asInt(after.get("textLength")) == 0;
   }
 
   private static int asInt(Object value) {
@@ -3251,11 +3507,30 @@ public class PlaywrightService {
     int lenBefore = asInt(before.get("textLength"));
     int lenAfter = asInt(after.get("textLength"));
     boolean changed = probeChanged(before, after);
+    boolean probeWasUnusable = Boolean.TRUE.equals(after.getBoolean("probeWasUnusable"));
+    boolean probeRecovered = Boolean.TRUE.equals(after.getBoolean("probeRecovered"));
+    // 取证可信 = 基线探针没失败 + 结束探针没失败 + 中途没有出现「用不了的探针」(或者出现过但已经等到恢复)
+    boolean observationComplete = !before.containsKey("probeError") && !after.containsKey("probeError")
+        && (!probeWasUnusable || probeRecovered);
     Kv report = Kv.by("urlBefore", urlBefore).set("urlAfter", urlAfter).set("tabCountBefore", tabBefore)
         .set("tabCountAfter", tabAfter).set("textLengthBefore", lenBefore).set("textLengthAfter", lenAfter)
         .set("changed", changed).set("changeStatus", changed ? "observed" : "not_observed")
-        .set("observationComplete", !before.containsKey("probeError") && !after.containsKey("probeError"))
+        .set("observationComplete", observationComplete)
+        .set("probeTrustworthy", observationComplete)
         .set("observationWindowMs", 500);
+    if (probeWasUnusable) {
+      // 观察窗口内取到过「用不了的探针」:必须显式说出来,否则调用方会把 changed=false、
+      // textLengthAfter=0 与 coveredBy 当成结论 —— 实测两次都是这么误判的。
+      report.set("page_appears_blank", true).set("probeRecovered", probeRecovered)
+          .set("probeNote", "观察窗口内页面正处在导航/整页重建的中间态(探针取不到 DOM,或正文被清空):"
+              + (probeRecovered
+                  ? "已等到页面恢复,下面的 changed 是恢复之后测的,可以采信"
+                  : "等了 " + (BLANK_RECOVERY_NANOS / 1_000_000)
+                      + " 毫秒仍没恢复 —— 这次的 changed=false 与 coveredBy **都是假象**,不可采信"));
+      if (!probeRecovered && after.containsKey("probeError")) {
+        report.set("probeError", after.get("probeError"));
+      }
+    }
     if (frame != null) {
       report.set("probedFrameUrl", after.get("frameUrl"));
     }
@@ -3279,13 +3554,25 @@ public class PlaywrightService {
       report.set(extra);
     }
     boolean changed = Boolean.TRUE.equals(report.getBoolean("changed"));
+    // probeTrustworthy 由 receipt 统一给出:探针取到过「用不了的中间态」且没等到恢复时为 false
+    boolean probeTrustworthy = !Boolean.FALSE.equals(report.getBoolean("probeTrustworthy"));
     // effective 是给智能体用的机器可读结论:动作发出去了,但观察窗口内页面没动 = 不保证生效
     report.set("effective", changed);
-    if (!changed && !report.containsKey("hint")) {
-      report.set("hint", action + " 已执行，但观察窗口内尚未发现变化；不代表点击失败，请等待目标条件或读取新状态");
-    }
-    if (!changed && report.containsKey("coveredBy")) {
-      report.set("hint", action + " 已执行但页面没变化，且目标中心点上命中的是别的元素——很可能被遮挡物吃掉了(见 coveredBy)");
+    if (!probeTrustworthy) {
+      // 取证不可信时**盖掉**通用提示与遮挡提示:这时候的 changed / coveredBy 都是假象
+      // (实测 B 站点分区报了一个根本不存在的 div.header 遮挡,而那次点击其实生效了)。
+      report.set("hint", action + " 已执行，但这次**取证不可信**：观察窗口内页面正处在导航/整页重渲染的中间态，"
+          + "探针取不到 DOM。changed=false 与 coveredBy 都不可采信 —— "
+          + "请等几秒重新 get_browser_state 看真实结果，不要据此重复点击、也不必急着重取元素快照");
+    } else {
+      if (!changed && !report.containsKey("hint")) {
+        report.set("hint", action + " 已执行，但观察窗口内尚未发现变化；不代表点击失败，请等待目标条件或读取新状态");
+      }
+      // coveredBy 只在探针可信时才当结论:正文被清空时元素命中测试命中的往往是页头之类的残留节点,
+      // 报出来的「遮挡物」根本不存在。
+      if (!changed && report.containsKey("coveredBy")) {
+        report.set("hint", action + " 已执行但页面没变化，且目标中心点上命中的是别的元素——很可能被遮挡物吃掉了(见 coveredBy)");
+      }
     }
     return RespBodyVo.ok(report);
   }
@@ -3516,7 +3803,78 @@ public class PlaywrightService {
       Response rsp = inst.page.navigate(url);
       return RespBodyVo.ok(Kv.by("status", rsp == null ? 0 : rsp.status()));
     } catch (PlaywrightException e) {
+      // 伪故障兜底:这条异常可能只是事件泵投递过来的(见 ActionError#SPURIOUS_DISPATCH),
+      // 而导航**其实已经成功**。实测 go_to_url 连试 3 次都报 Object doesn't exist: response@…,
+      // 随后 get_url 读到的正是目标地址 —— 报成失败会直接误导调用方去排查「为什么打不开」。
+      // 幂等导航的答案在地址栏里,读一次就能定论,不必猜。
+      if (ActionError.isSpuriousDispatch(e.getMessage()) && landedOn(inst, url)) {
+        return RespBodyVo.ok(Kv.by("status", 200).set("url", safeUrl(inst))
+            .set("warning", "这次导航的底部调用抛了 Playwright 事件分发的伪故障"
+                + "(Object doesn't exist,与本次命令无关),但地址栏**已经是目标地址**,按成功处理")
+            .set("spuriousDispatch", true));
+      }
       return RespBodyVo.fail("go_to_url 失败：" + briefMessage(e.getMessage()));
+    }
+  }
+
+  /**
+   * 页面是不是已经落在目标地址上
+   *
+   * <p>幂等导航专用的判据:比较主机与路径(忽略 query / hash 里的会话参数),两边都规范化到末尾无斜杠。
+   * 只看「主机相同」太松(同站不同页会误判成功),做完整字符串比较又太紧(站点会自动补 {@code ?vd_source=…}
+   * 这类参数)。
+   */
+  private static boolean landedOn(BrowserInstance inst, String url) {
+    return sameLocation(url, safeUrl(inst));
+  }
+
+  /**
+   * 两个地址是不是「同一个位置」(纯函数,便于单测)
+   *
+   * <p>规则:去掉末尾斜杠后完全相同算到达;否则再去掉 {@code ?query} 与 {@code #fragment} 后比较。
+   * 站点自动追加会话参数(实测 B 站会补 {@code ?vd_source=…})不该被当成「没跳过去」。
+   */
+  static boolean sameLocation(String want, String have) {
+    if (want == null || have == null) {
+      return false;
+    }
+    String a = stripTrailingSlash(want.trim());
+    String b = stripTrailingSlash(have.trim());
+    if (a.equals(b)) {
+      return true;
+    }
+    String bareA = stripQuery(a);
+    String bareB = stripQuery(b);
+    return !bareA.isEmpty() && bareA.equals(bareB);
+  }
+
+  private static String stripQuery(String value) {
+    int cut = value.length();
+    int q = value.indexOf('?');
+    int h = value.indexOf('#');
+    if (q >= 0) {
+      cut = Math.min(cut, q);
+    }
+    if (h >= 0) {
+      cut = Math.min(cut, h);
+    }
+    return stripTrailingSlash(value.substring(0, cut));
+  }
+
+  private static String stripTrailingSlash(String value) {
+    String out = value;
+    while (out.endsWith("/") && out.length() > 1) {
+      out = out.substring(0, out.length() - 1);
+    }
+    return out;
+  }
+
+  /** 读当前地址;页面正在导航/关闭时读不到,返回 null(取证失败不影响结论) */
+  private static String safeUrl(BrowserInstance inst) {
+    try {
+      return inst.page.url();
+    } catch (PlaywrightException e) {
+      return null;
     }
   }
 
@@ -4200,7 +4558,46 @@ public class PlaywrightService {
     } catch (PlaywrightException e) {
       return RespBodyVo.fail("send_keys 失败：" + briefMessage(e.getMessage()));
     }
-    return RespBodyVo.ok();
+    // 按键**发给谁**必须回报:实测「填完标签输入框 → send_keys Enter」会悄悄什么也不做
+    // (焦点已经不在那个 input 上,或者框架刚把输入框重置了),而回执只有一句 ok:true ——
+    // 调用方只能靠「标签没多出来」反推,白跑一轮。把焦点元素写进回执,空操作一眼可见。
+    Kv data = new Kv();
+    Kv focused = focusedElement(inst);
+    if (focused != null) {
+      data.set("focused", focused);
+      if (Boolean.TRUE.equals(focused.getBoolean("isBody"))) {
+        data.set("focusNote", "按键发出时焦点在 <body> 上(不在任何输入控件里):"
+            + "像 Enter 这种「创建/提交」键很可能被页面直接忽略 —— 先 click 目标输入框,再送键");
+      }
+    }
+    return RespBodyVo.ok(data);
+  }
+
+  /** 当前焦点元素是谁(取证用;取不到就返回 null,绝不影响命令本身的成败) */
+  private static Kv focusedElement(BrowserInstance inst) {
+    try {
+      Object raw = inst.page.evaluate("""
+          () => {
+            const el = document.activeElement;
+            if (!el) return null;
+            return {
+              tag: el.tagName,
+              id: el.id || null,
+              className: typeof el.className === 'string' ? el.className.slice(0, 80) : null,
+              placeholder: el.getAttribute ? el.getAttribute('placeholder') : null,
+              isBody: el === document.body
+            };
+          }
+          """);
+      if (raw instanceof Map) {
+        Kv kv = new Kv();
+        kv.putAll((Map<?, ?>) raw);
+        return kv;
+      }
+    } catch (PlaywrightException e) {
+      // 页面正在导航/关闭时 evaluate 会抛:这只是取证,失败就算了
+    }
+    return null;
   }
 
   public RespBodyVo scrollToText(Long browserId, String text) {
@@ -4848,23 +5245,29 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     int tabCountBefore = pagesOf(inst).size();
-    Locator target;
+    ActionTarget resolved;
     Frame probeFrame;
     try {
       probeFrame = frame == null || frame.isBlank() ? null : frameOf(inst, frame);
-      target = locatorIn(inst, frame, selector);
+      resolved = resolveActionTarget(frameOf(inst, frame), selector, "click_element_by_selector");
     } catch (IllegalArgumentException e) {
       return RespBodyVo.fail("click_element_by_selector 失败：" + e.getMessage());
+    } catch (PlaywrightException e) {
+      // 匹配 0 个 / 全都不可见:当场说清,不等到可操作性超时(那时报的是 ACTION_TIMEOUT,方向全错)
+      return RespBodyVo.fail(locateFailure("click_element_by_selector",
+          "选择器 " + selector + frameSuffix(frame), e));
     }
+    Locator target = resolved.locator;
     Kv before = stateProbe(inst, probeFrame);
     ActionOutcome outcome = new ActionOutcome();
+    outcome.extra.set(resolved.describe());
     try {
       Locator locator = target;
       clickWithMode(locator, mode, outcome, () -> locator.click(clickOptions(timeoutMs)));
     } catch (PlaywrightException e) {
       return actionErrorOrEffect("click_element_by_selector", before, inst, probeFrame, e,
           locateFailure("click_element_by_selector", "选择器 " + selector + frameSuffix(frame), e)
-              + blockerSuffix(target));
+              + resolved.failureSuffix() + blockerSuffix(target));
     }
     adoptNewTab(inst, tabCountBefore);
     return okWithReceipt(before, inst, "click_element_by_selector", outcome.extra, probeFrame);
@@ -4885,16 +5288,21 @@ public class PlaywrightService {
       return notFound(browserId);
     }
     ActionOutcome outcome = new ActionOutcome();
-    Locator target;
+    ActionTarget resolved;
     try {
-      target = locatorIn(inst, frame, selector);
+      resolved = resolveActionTarget(frameOf(inst, frame), selector, "input_text_by_selector");
     } catch (IllegalArgumentException e) {
       return RespBodyVo.fail("input_text_by_selector 失败：" + e.getMessage());
-    }
-    try {
-      fillWithMode(target, value, mode, outcome);
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(locateFailure("input_text_by_selector", "选择器 " + selector + frameSuffix(frame), e));
+      return RespBodyVo.fail(locateFailure("input_text_by_selector",
+          "选择器 " + selector + frameSuffix(frame), e));
+    }
+    outcome.extra.set(resolved.describe());
+    try {
+      fillWithMode(resolved.locator, value, mode, outcome);
+    } catch (PlaywrightException e) {
+      return RespBodyVo.fail(locateFailure("input_text_by_selector",
+          "选择器 " + selector + frameSuffix(frame), e) + resolved.failureSuffix());
     }
     return inputResult(outcome);
   }
@@ -5882,6 +6290,7 @@ public class PlaywrightService {
   private RespBodyVo elementScreenshot(BrowserInstance inst, Integer index, String selector, String path,
       Boolean inline, String frame) {
     Locator locator;
+    ActionTarget resolved = null;
     String target;
     if (index != null) {
       locator = locatorOf(inst, index);
@@ -5891,9 +6300,15 @@ public class PlaywrightService {
       }
     } else if (selector != null && !selector.isEmpty()) {
       try {
-        locator = locatorIn(inst, frame, selector);
+        // 走动作类定位:验证码/二维码这类目标经常有隐藏副本(实测登录页的 [class*=qrcode] 命中 3 个),
+        // 「挑第一个可见的」正是这里最需要的语义 —— 截到隐藏副本只会等满超时。
+        resolved = resolveActionTarget(frameOf(inst, frame), selector, "get_element_screenshot");
+        locator = resolved.locator;
       } catch (IllegalArgumentException e) {
         return RespBodyVo.fail("get_element_screenshot 失败：" + e.getMessage());
+      } catch (PlaywrightException e) {
+        return RespBodyVo.fail(locateFailure("get_element_screenshot",
+            "选择器 " + selector + frameSuffix(frame), e));
       }
       target = "selector=" + selector + frameSuffix(frame);
     } else {
@@ -5908,6 +6323,9 @@ public class PlaywrightService {
       byte[] bytes = spuriousRetry(
           () -> locator.screenshot(new Locator.ScreenshotOptions().setTimeout(actionTimeoutMs())));
       Kv data = Kv.by("size", bytes.length).set("target", target);
+      if (resolved != null) {
+        data.set(resolved.describe());
+      }
       if (file != null && !file.isEmpty()) {
         ensureParent(file);
         Files.write(Paths.get(file), bytes);
@@ -5922,7 +6340,8 @@ public class PlaywrightService {
       }
       return RespBodyVo.ok(data);
     } catch (PlaywrightException e) {
-      return RespBodyVo.fail(locateFailure("get_element_screenshot", target, e));
+      return RespBodyVo.fail(locateFailure("get_element_screenshot", target, e)
+          + (resolved == null ? "" : resolved.failureSuffix()));
     } catch (IOException e) {
       return RespBodyVo.fail("get_element_screenshot 写文件失败：" + e.getMessage());
     }

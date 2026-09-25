@@ -85,6 +85,29 @@ public class BrowserInstance {
   /** 最近一次 get_browser_state 的文本,供 diff_dom_text 比较(每次快照后覆盖) */
   public volatile String lastDomText;
 
+  /**
+   * 自动截图连续失败了几次 / 熔断到什么时刻
+   *
+   * <p>
+   * <b>为什么要有这个</b>:2026-09-25 在 B 站投稿页上,{@code page.screenshot()} 一次都没成功过,
+   * 每次都要等满 30 秒超时。于是**每一条命令都白等 30 秒**,而回执里只有一行
+   * {@code screenshot_error: Timeout 30000ms exceeded.} —— 看起来像「这次运气不好」,
+   * 实际上是「这个页面根本截不出图」。更糟的是调用方从此**没有任何画面可看**,却不知道这件事:
+   * 页面上出现过整页白屏,只靠文本根本判断不出来。
+   *
+   * <p>
+   * 所以连续失败到阈值就**熔断**一段时间:不再白等,改在每条命令的回执里明说
+   * {@code capture_degraded: true} 与原因,让调用方知道自己现在是「盲操作」,该改用文本取证
+   * 或者请人看一眼。
+   */
+  public final AtomicInteger captureFailures = new AtomicInteger();
+
+  /** 熔断到什么时候(毫秒时间戳);0 表示没熔断 */
+  public volatile long captureCooldownUntil;
+
+  /** 第一次失败的原因,熔断期间一直带着它(否则调用方只知道「停了」不知道为什么) */
+  public volatile String captureFailureReason;
+
   /** 最近一次弹窗信息 */
   public volatile Kv lastDialog;
   /** 弹窗序号:每次弹窗自增,客户端据此判断读到的是不是新弹窗 */

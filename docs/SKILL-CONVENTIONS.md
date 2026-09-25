@@ -4,7 +4,7 @@
 
 技能文档都放在仓库的 **`.agents/skills/`** 下 —— 这是 DSH 的**项目级技能根**（DSH 按
 `<项目根>/.dsh/skills` → `<项目根>/.agents/skills` → `customSkillDirs` → `~/.dsh/skills` →
-`~/.agents/skills` 的顺序扫描），而仓库根有 `.git`，所以**在仓库里启动 dsh 会话就能直接发现这 8 个技能**，
+`~/.agents/skills` 的顺序扫描），而仓库根有 `.git`，所以**在仓库里启动 dsh 会话就能直接发现这些技能**，
 不用再往 `.dsh/skills` 复制一份。发现规则只有两条：
 
 - 只认 `<根>/<技能名>/SKILL.md`（或 `<根>/<技能名>.md`）这一层，**不递归**；
