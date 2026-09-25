@@ -22,6 +22,20 @@
 
 构建时会跑 `SkillDocConsistencyTest`（`playwright-server/src/test/java/nexus/io/ai/browser/docs/`）校验两者与服务端的一致性。
 
+### 主技能是「一个入口 + 若干分册」
+
+主技能文档装不下全部细节时，拆成 `SKILL.md` 入口加同目录 `references/*.md` 分册 —— 入口每次触发技能都会整体进上下文，所以**只放必读内容**，细节按需再读：
+
+| 文件 | 放什么 |
+| --- | --- |
+| `SKILL.md` | 省 token 铁律、症状 → 命令索引表、读页面、全部命令的一行速查、交互循环、最常踩的坑 |
+| `references/*.md` | 按主题分册（协议、命令全表、批量与 JS、人机协同、读页面、浏览器、坑、客户端），用 read 工具按需读 |
+
+两条维护要求：
+
+1. **只查 `SKILL.md` 的那几条测试，决定了新方法必须写进 `SKILL.md`**：`everyCommandIsDocumented` 只读主技能，新加一个方法时名字要出现在 `SKILL.md` 里（加在「命令速查」那一节最省事），光写进分册不算数。
+2. **分册里的命令名不会被检查**（`allSkillDocs()` 只找名为 `SKILL.md` 的文件），所以分册写错命令名不会有人报错 —— 要自己照着 `CommandTable` 核对。
+
 ## 最重要的一条：单反引号 vs 双反引号
 
 **测试把单反引号包起来的东西当作命令名检查**：
