@@ -491,9 +491,9 @@ Chromium 会走到空白页或 HTTP 400；同一流程在 Firefox 139 下能正�
 成对存进 `logs/agent/<会话>/`，并维护一份 `steps.log`。好处是**请求在发送前就落盘**，连服务没起来、
 请求根本没发出去这种情况也能看出来。
 
-| | `scripts/trace/browse.ps1` | `client/dsb.py` / `client/dsb.cmd` |
+| | `scripts/trace/browse.ps1` | `client/dsb.py` / `client/dsb`（macOS/Linux）/ `client/dsb.cmd`（Windows） |
 | --- | --- | --- |
-| 运行环境 | Windows PowerShell | 任意平台的 Python 3（只用标准库）；`dsb.cmd` 是 Windows 包装 |
+| 运行环境 | Windows PowerShell | 任意平台的 Python 3（只用标准库）；`dsb` 是 macOS/Linux 包装，`dsb.cmd` 是 Windows 包装 |
 | 形态 | 传 `-PayloadFile` 发一次请求 | 子命令式 CLI（`start`/`run`/`batch`/`state`/`upload`/`selftest`…）+ 可 import 的库 |
 | 退出码 | 0 业务结果、1 传输失败 | 0 成功 / 1 传输错 / 2 业务失败 / 3 用法错（分得更细，便于写脚本） |
 | 适合 | 已有的 PowerShell 排查习惯、一次性排障 | 跨平台、写进 Python 流程、批量与异步任务 |

@@ -10,7 +10,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 
 - 默认地址：`http://localhost:10049`（端口来自 `playwright-server/src/main/resources/app.properties` 的 `server.port`）
 - 启动服务：`java -jar deepseek-browser-use-<版本>-<平台>.jar`（发行包），或开发态在 `playwright-server` 目录执行 `mvn spring-boot:run`
-- **发行包可能落后于源码**：`dist/` 下的 jar 是构建产物，实测有一版连 `list_methods` / `get_config` / `shutdown` 都不支持，拿它开工会在半路撞「不支持的方法」。**开工第一条命令永远是 `list_methods`**（连它都没有 = 这份包太旧），要跟源码一致就用开发态起（`scripts/run/start-server.cmd`）。
+- **发行包可能落后于源码**：`dist/` 下的 jar 是构建产物，实测有一版连 `list_methods` / `get_config` / `shutdown` 都不支持，拿它开工会在半路撞「不支持的方法」。**开工第一条命令永远是 `list_methods`**（连它都没有 = 这份包太旧），要跟源码一致就用开发态起（Windows 用 `scripts/run/start-server.cmd`，macOS/Linux 用 `scripts/run/start-server.sh`；停止分别对应 `stop-server.cmd` / `stop-server.sh`）。
 - **只有一个业务端点**：`POST http://localhost:10049/playwright/command`
 - 另有 `GET /playwright/health`（健康检查）与 `GET /data/**`（读取截图与结构化文本）
 - 共 116 个方法（拿不准就先 `list_methods`），`get_browser_state` 是阅读页面的入口，其余方法负责操作与观测
@@ -57,7 +57,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | 需要人扫码 / 输验证码 / 支付确认 | `request_human_input`（一串动作用 `steps` 一次交办） |
 | 模型读不了图，但要读验证码 / 维护图 | `ocr_image`（Windows 自带 OCR，支持中文） |
 | 长批次怕 HTTP 超时 | `commands` 加 `async: true` + `get_job`；或客户端 `batch cmds.json --async --wait` |
-| 手拼 JSON 被引号 / 中文 / 编码坑了（Windows 尤其） | 别硬拼，用仓库里的 `dsb` 客户端：Windows 敲 `.\client\dsb.cmd`，参数进文件用 `batch cmds.json` / `js @脚本.js`，见 `references/client.md` |
+| 手拼 JSON 被引号 / 中文 / 编码坑了（Windows 尤其） | 别硬拼，用仓库里的 `dsb` 客户端：Windows 敲 `.\client\dsb.cmd`，macOS/Linux 敲 `./client/dsb`，参数进文件用 `batch cmds.json` / `js @脚本.js`，见 `references/client.md` |
 | 索引老是失效 | 「一次快照只做一个动作」，或全程用选择器；报错里已经带上快照的年龄与元素范围 |
 | 换了浏览器之后所有站点都退登录了 | 看 `start` 回执里的 `data.profileSeenBefore` / `data.profileNote`（换引擎等于换一套登录态） |
 | 操作一个 id 得到「没有找到对应的浏览器实例」 | 看报错里的服务启动时间：实例只在内存里，**服务重启即失效**，`list_tasks` 确认后重新 `start` 即可（登录态在 profile 里，不会丢） |
@@ -120,15 +120,15 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 手工拼 `-d '...'` 在参数带中文、引号、换行时很容易出错（PowerShell 尤其爱吃掉引号），返回体还得自己解析。仓库里的 `dsb` 客户端把这几件事都替你办了：**子命令式传参**、**批量与异步**、**每一步的请求与响应都留档**。凡是「发请求 → 读页面 → 再发请求」的任务，用它比手拼 JSON 少一大类无谓的失败。
 
 ```shell
-# Windows 上直接敲 .\client\dsb.cmd（cmd.exe 里写 client\dsb.cmd）；
-# 其它平台用 python client/dsb.py，参数完全一致。
-.\client\dsb.cmd --port 10049 health
-.\client\dsb.cmd --port 10049 --id 1001 start --browser chrome --headful
-.\client\dsb.cmd --port 10049 --id 1001 run go_to_url -p url=https://example.com
-.\client\dsb.cmd --port 10049 --id 1001 state --full          # 标题/URL/元素/结构化文本
-.\client\dsb.cmd --port 10049 --id 1001 js @脚本.js --var who=dsb
-.\client\dsb.cmd --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
-.\client\dsb.cmd --port 10049 selftest --browser chrome       # 不确定服务端状态时先自检
+# macOS/Linux 用 ./client/dsb（可执行；软链进 PATH 后直接敲 dsb）；
+# Windows 用 .\client\dsb.cmd（cmd.exe 里写 client\dsb.cmd）；也可退回 python client/dsb.py，参数一致。
+./client/dsb --port 10049 health
+./client/dsb --port 10049 --id 1001 start --browser chrome --headful
+./client/dsb --port 10049 --id 1001 run go_to_url -p url=https://example.com
+./client/dsb --port 10049 --id 1001 state --full          # 标题/URL/元素/结构化文本
+./client/dsb --port 10049 --id 1001 js @脚本.js --var who=dsb
+./client/dsb --port 10049 --id 1001 batch cmds.json --async --wait   # 长批次不受 HTTP 超时限制
+./client/dsb --port 10049 selftest --browser chrome       # 不确定服务端状态时先自检
 ```
 
 **退出码 0 成功 / 1 传输错 / 2 业务失败 / 3 用法错** —— 把「服务没起」与「业务失败」分开了，写脚本时不用去解析 `msg` 猜。还有两个直接好处：`steps.log` 一行一次调用（时间、序号、任务 ID、方法、成败、耗时、摘要），第几步开始不对一眼就能看出来；每一步的请求与响应都留档。**多行脚本不要写在命令行里**（经 cmd/PowerShell 传参会只剩第一行），用 `js @脚本.js`、`--params @文件.json` 或 `batch cmds.json`。完整用法（含 `--summary` 与 `responseMode` 的区别、脱敏规则）见 `references/client.md`。

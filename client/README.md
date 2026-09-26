@@ -7,7 +7,7 @@ PowerShell 那份是 `scripts/trace/browse.ps1`,这个 `dsb.py` 是给「跨平�
 client/
 ├── dsb.py          客户端本体(单文件,标准库)
 ├── dsb.cmd         Windows 包装:直接敲 dsb 就行
-├── dsb             Linux/macOS 包装(chmod +x 后可直接 ./dsb)
+├── dsb             macOS/Linux 包装(可执行;./dsb 或软链进 PATH)
 ├── test_dsb.py     本地自测(不连服务):脱敏规则、参数解析、编号接续
 └── README.md       本文件
 ```
@@ -43,6 +43,26 @@ Windows 下把 `python client/dsb.py` 换成 `client\dsb.cmd`(或先把 `client`
 - 在 **PowerShell** 里当前目录不在 `PATH`,要写 `.\client\dsb.cmd ...`;在 **cmd.exe** 里 `client\dsb.cmd ...` 就行。
 - `dsb.cmd` 中间隔着一层 cmd.exe,参数里的 `&`、`^`、`%` 可能被提前吃掉(中文与引号不受影响)。这类参数不要走
   命令行,挪进文件:`--params @文件.json`、`batch cmds.json`、`js @脚本.js`。
+
+macOS / Linux 下把 `python client/dsb.py` 换成 `./client/dsb`(或软链进 `PATH`,直接敲 `dsb`):
+
+```bash
+# 仓库里已经带了可执行位,克隆后一般不用再 chmod;若权限被磨掉就补一下
+chmod +x client/dsb
+
+# 可选:装进 PATH,之后在任何目录直接敲 dsb
+ln -s "$(pwd)/client/dsb" ~/.local/bin/dsb
+
+./client/dsb health
+./client/dsb start --browser firefox --id 1001
+
+# venv / conda 里想钉住解释器(默认顺序 DSB_PYTHON > python3 > python,且必须是 Python 3)
+DSB_PYTHON=/opt/venv/bin/python3 ./client/dsb --version
+```
+
+`dsb` 用 `exec` 交棒给 `dsb.py`,退出码与直接敲 `python3 client/dsb.py` 完全一致;它会解析符号链接,
+软链到别处也能找到同目录的 `dsb.py`。包装自身找不到解释器或 `dsb.py` 时退出 `127`(环境问题,不是业务问题)。
+与 Windows 那层 `cmd.exe` 不同,Unix shell 不额外吃参数,`&` 之类只要自己加好引号即可。
 
 ## 子命令
 

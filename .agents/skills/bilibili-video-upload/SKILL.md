@@ -9,6 +9,10 @@ whenToUse: 需要把一个本地视频文件（或一组视频）投稿到哔哩
 一次真实任务（2026-09-25，发布 `使用 deepseek-browser-use 在腾讯云购买服务器.mp4`，9 分 48 秒 / 1080P / 47MB）
 的完整记录:从打开投稿页到拿到 BV 号。文中数据都已脱敏,替换占位符即可复用。
 
+> **平台说明**：本文示例用 Windows 的 `client/dsb.cmd`。macOS/Linux 下换成 `./client/dsb`（参数完全相同），
+> 例如 `./client/dsb --id 3001 start --browser chrome --headful`；服务端启动/停止换成 `scripts/run/start-server.sh` /
+> `stop-server.sh`。下文所有以 `client/dsb.cmd` 开头或嵌在命令里的调用，均按此替换。
+
 ## 一、站点特征
 
 | 项 | 值 |

@@ -8,6 +8,10 @@ description: 用 deepseek-browser-use 在 DeepSeek 开放平台（platform.deeps
 平台是 `platform.deepseek.com`（DeepSeek 开放平台，API 计费的那个，不是 chat.deepseek.com）。本文覆盖两件事：
 **给账号充值**与**就充值金额开票**。两条线共用一套登录态，通常一次会话里连着做。
 
+> **平台说明**：本文示例用 Windows 写法（`client\dsb.cmd`、`scripts\run\start-server.cmd`）。macOS/Linux 下分别换成
+> `./client/dsb` 与 `scripts/run/start-server.sh` / `stop-server.sh`，参数含义一致（`-Port` 对应 `-p`/`--port`，`-Jar` 对应
+> `--jar`）。下文所有 `client\dsb.cmd` / `scripts\run\*.cmd` 均按此替换。
+
 ## 0. 边界（先读这一节）
 
 - **钱与发票的事只做用户明确要求的那一笔**。金额、收票邮箱、抬头、税号一律先问清楚再动手；

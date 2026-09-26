@@ -104,7 +104,7 @@
 
 42. **`execute_js` 里的 `.click()` 触发不了「真点击才有的东西」**：JS 派发的 click 不是可信事件，`window.open` 会被浏览器拦掉，部分框架的提交按钮也不认它。实测 12306 结果页的「预订」（`<a class="btn72" onclick="checkG1234(...)">`）用 `.click()` 完全没反应，**而接口照样回 `ok:true`** —— 于是「点了没反应」被误判成页面问题。正解是 `click_element_by_selector` / `click_element_by_index`（真实鼠标事件）。判断有没有生效看回执里的 `data.mode`（`js` 就是没走真实交互）与 `data.changed`。
 
-43. **服务进程被杀 = 它启动的浏览器一起退出 = session cookie 型登录态失效**：12306 这类站点的登录 cookie 是会话级的，浏览器一关就得人工重新登录。实测踩过：agent 的后台任务被回收时带走了 mvn / java / Chrome 整棵进程树，人工白登录一次。所以**别把「重启服务」当成无痛操作**：要么用 `scripts/run/start-server.cmd`（脱离当前进程树启动）与 `scripts/run/stop-server.cmd`（先关任务与浏览器再结束进程），要么在动手前先确认没有正在进行的人工登录环节。
+43. **服务进程被杀 = 它启动的浏览器一起退出 = session cookie 型登录态失效**：12306 这类站点的登录 cookie 是会话级的，浏览器一关就得人工重新登录。实测踩过：agent 的后台任务被回收时带走了 mvn / java / Chrome 整棵进程树，人工白登录一次。所以**别把「重启服务」当成无痛操作**：要么用 `scripts/run/start-server.cmd` / `start-server.sh`（Windows / macOS+Linux，脱离当前进程树启动）与 `scripts/run/stop-server.cmd` / `stop-server.sh`（先关任务与浏览器再结束进程），要么在动手前先确认没有正在进行的人工登录环节。
 
 44. **动作抛了异常 ≠ 动作没生效：别看到失败就重试**。实测点企业微信的「下载合同」时 `click_element_by_selector`
     抛 `Object doesn't exist: response@…`，点 Chrome 内置 PDF 查看器的下载按钮时 `mouse_click` 抛

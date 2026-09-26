@@ -8,13 +8,16 @@
 仓库里的 `dsb` 客户端把这几件事都替你办了：**子命令式传参**、**批量与异步**、**每一步的请求与响应都留档**。
 凡是「发请求 → 读页面 → 再发请求」的任务，用它比手拼 JSON 少一大类无谓的失败。
 
-三个客户端（都在仓库里，跟着仓库一起分发）：
+四个客户端（都在仓库里，跟着仓库一起分发）：
 
 | 客户端 | 位置 | 适合 | 例子 |
 | --- | --- | --- | --- |
 | `dsb.py`（Python 3，只用标准库，跨平台，也可当库 import） | 仓库根 `client/dsb.py` | 写进脚本、批量、异步、跨平台 | `python client/dsb.py --port 10049 start --browser chrome` |
+| `dsb`（macOS/Linux 薄包装，可执行，透传参数与退出码） | 仓库根 `client/dsb` | macOS/Linux 上少打一截前缀，直接敲就行 | `./client/dsb --port 10049 health` |
 | `dsb.cmd`（Windows 薄包装，透传参数与退出码） | 仓库根 `client/dsb.cmd` | Windows 上少打一截前缀，直接敲就行 | `client\dsb.cmd --port 10049 health` |
 | `browse.ps1` | `scripts/trace/browse.ps1` | 已有的 PowerShell 排查习惯 | `browse.ps1 -PayloadFile req.json -Session t1` |
+
+**macOS / Linux 上用 `./client/dsb`，不必写 `python dsb.py`**：它只做两件事 —— 挑一个 Python 3（顺序 `DSB_PYTHON` > `python3` > `python`），再把同目录的 `dsb.py` 连同全部参数交出去；用 `exec` 交棒，退出码原样透传。它会解析符号链接，所以 `ln -s "$(pwd)/client/dsb" ~/.local/bin/dsb` 之后在任何目录直接敲 `dsb` 即可。Unix shell 不像 cmd/PowerShell 那样额外吃 `&`、方括号、逗号（只有自己没加引号时才会被 shell 解释）。包装自身找不到解释器或 `dsb.py` 时退出 `127`。
 
 **Windows 上直接用它，不必写 `python dsb.py`**：`dsb.cmd` 只做两件事 —— 找 `python`（取不到就退回 `py`），
 再把 `%~dp0dsb.py` 连同全部参数交出去，退出码原样 `exit /b` 透传。两点注意：
@@ -47,7 +50,7 @@ python client/dsb.py --port 10049 last                            # 重放最近
 
 用它还有两个直接好处：**`steps.log` 一行一次调用**（时间、序号、任务 ID、方法、成败、耗时、摘要），第几步开始
 不对一眼就能看出来；**退出码把「服务没起」与「业务失败」分开**（`1` 与 `2`），写脚本时不用去解析 `msg` 猜。
-Windows 下把上面例子里的 `python client/dsb.py` 换成 `.\client\dsb.cmd` 即可，其余参数完全一致。
+Windows 下把上面例子里的 `python client/dsb.py` 换成 `.\client\dsb.cmd`，macOS/Linux 下换成 `./client/dsb` 即可，其余参数完全一致。
 
 三个容易用错的地方：
 

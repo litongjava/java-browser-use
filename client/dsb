@@ -1,6 +1,71 @@
 #!/usr/bin/env bash
-# dsb —— Linux/macOS 下的薄包装(记得 chmod +x dsb)
-# 用法: ./dsb health / ./dsb start --browser firefox / ./dsb batch cmds.json --async --wait
-set -euo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "$here/dsb.py" "$@"
+#
+# dsb —— deepseek-browser-use 客户端的 macOS / Linux 薄包装
+#
+# 目标只有一个:把 "python3 client/dsb.py ..." 缩短成 "dsb ...",行为完全等价。
+# Windows 对应的是 client/dsb.cmd。
+#
+# 设计要点:
+#   1. 只做三件事:挑一个可用的 Python 3、把同目录的 dsb.py 连同全部参数交出去、原样透传退出码。
+#   2. 用 exec 替换当前 shell:不额外留一层进程,退出码(0/1/2/3)与信号(尤其 Ctrl-C)完全透明。
+#   3. 解析符号链接:把 dsb 软链到 ~/.local/bin 或 /usr/local/bin 也能找到同目录的 dsb.py。
+#   4. DSB_PYTHON 可指定解释器(venv / conda 里想钉住版本时用);
+#      挑选顺序 DSB_PYTHON > python3 > python,且都必须是 Python 3。
+#
+# 用法:
+#   ./client/dsb health
+#   ./client/dsb start --browser firefox --id 1001
+#   ./client/dsb --id 1001 run go_to_url -p url=https://example.com
+#   ./client/dsb --id 1001 batch cmds.json --async --wait
+#
+# 装进 PATH(可选):
+#   ln -s "$(pwd)/client/dsb" ~/.local/bin/dsb        # 或 /usr/local/bin
+#
+# 退出码与 dsb.py 一致:0 成功 / 1 传输或协议错 / 2 业务失败 / 3 用法错。
+# 包装自身的问题(找不到解释器或 dsb.py)退出 127 —— 那是环境问题,不是业务问题。
+#
+
+# --- 解析自身路径(跟符号链接到真实文件)--------------------------------
+src=$BASH_SOURCE
+if [ -z "$src" ]; then src=$0; fi
+while [ -h "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)
+  target=$(readlink "$src")
+  case $target in
+    /*) src=$target ;;
+    *) src=$dir/$target ;;
+  esac
+done
+here=$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd) || {
+  printf 'dsb: 无法确定所在目录\n' >&2
+  exit 127
+}
+script=$here/dsb.py
+
+die() {
+  printf 'dsb: %s\n' "$1" >&2
+  printf '提示:需要 Python 3;可用 DSB_PYTHON=/path/to/python3 指定解释器。\n' >&2
+  exit 127
+}
+
+[ -f "$script" ] || die "找不到 $script(dsb 应与 dsb.py 放在同一目录)"
+
+# --- 挑解释器:只认 Python 3 ---------------------------------------------
+is_py3() {
+  command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1
+}
+
+PY=""
+if is_py3 "$DSB_PYTHON"; then
+  PY=$DSB_PYTHON
+elif is_py3 python3; then
+  PY=python3
+elif is_py3 python; then
+  PY=python
+else
+  die "找不到 Python 3 解释器(tried: DSB_PYTHON, python3, python)"
+fi
+
+# --- 交棒 -----------------------------------------------------------------
+exec "$PY" "$script" "$@"
