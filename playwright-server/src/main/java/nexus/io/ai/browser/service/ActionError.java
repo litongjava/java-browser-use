@@ -133,7 +133,7 @@ public final class ActionError {
       return "ELEMENT_READ_ONLY";
     if (text.contains("element_disabled") || text.contains("not enabled") || text.contains("element is disabled"))
       return "ELEMENT_DISABLED";
-    if (text.contains("intercepts pointer events"))
+    if (text.contains("element_obscured") || text.contains("intercepts pointer events"))
       return "ELEMENT_OBSCURED";
     if (text.contains("not visible") || text.contains("element_hidden"))
       return "ELEMENT_HIDDEN";

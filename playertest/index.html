@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>player web-fullscreen test</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xgplayer@3.0.26/dist/index.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xgplayer@3.0.26/dist/index.min.css">
+<script src="https://cdn.jsdelivr.net/npm/xgplayer-hls@3.0.26/dist/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/artplayer@5.4.0/dist/artplayer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dplayer@1.27.1/dist/DPlayer.min.js"></script>
+<style>
+  body { margin: 0; padding: 24px; font: 14px/1.6 system-ui, sans-serif; background: #f5f5f5; }
+  h1 { font-size: 16px; }
+  #wrap { width: 720px; }           /* 故意给一个受限宽度，方便观察网页全屏是否真的铺满视口 */
+  #player { width: 100%; aspect-ratio: 16 / 9; background: #000; }
+  #log { margin-top: 16px; white-space: pre-wrap; font-family: Consolas, monospace; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>web-fullscreen test · <span id="kind"></span></h1>
+<div id="wrap"><div id="player"></div></div>
+<div id="log"></div>
+
+<script>
+const HLS = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';
+const qs = new URLSearchParams(location.search);
+const kind = qs.get('p') || 'xgplayer';
+// ?wrap=transform 用来复现「祖先节点带 transform 时 position:fixed 被捕获」这个经典坑
+if (qs.get('wrap') === 'transform') {
+  document.getElementById('wrap').style.transform = 'translateZ(0)';
+  document.getElementById('log').textContent = 'wrap transform applied\n';
+}
+document.getElementById('kind').textContent = kind;
+const log = (m) => { document.getElementById('log').textContent += m + '\n'; };
+window.__ready = false;
+window.__err = null;
+
+try {
+  if (kind === 'xgplayer') {
+    const p = new window.Player({
+      id: 'player',
+      url: HLS,
+      autoplay: true,
+      muted: true,
+      cssFullscreen: true,
+      fullscreen: true,
+      presets: [window.Player.defaultPreset],
+      plugins: [window.HlsPlayer]
+    });
+    window.__p = p;
+  } else if (kind === 'artplayer') {
+    const art = new window.Artplayer({
+      container: '#player',
+      url: HLS,
+      type: 'm3u8',
+      autoplay: true,
+      muted: true,
+      fullscreen: true,
+      fullscreenWeb: true,
+      setting: true,
+      hotkey: true
+    });
+    window.__p = art;
+  } else if (kind === 'dplayer') {
+    const dp = new window.DPlayer({
+      container: document.getElementById('player'),
+      autoplay: true,
+      video: { url: HLS, type: 'hls' }
+    });
+    window.__p = dp;
+  }
+  window.__ready = true;
+  log('constructed: ' + kind);
+} catch (e) {
+  window.__err = String(e);
+  log('ERROR: ' + e);
+}
+
+// 便于事后取证：把「网页全屏相关」的类名与几何信息全量吐出来
+window.__probe = () => {
+  const root = document.getElementById('player');
+  const r = root.getBoundingClientRect();
+  const cls = Array.from(document.querySelectorAll('*'))
+    .map(el => el.className)
+    .filter(c => typeof c === 'string' && /fullscreen|full-screen|cssfull/i.test(c));
+  const btns = Array.from(document.querySelectorAll('[class*=fullscreen],[class*=full-screen],[class*=full-in]'))
+    .map(el => ({ cls: el.className, tag: el.tagName, title: el.getAttribute('title') || el.getAttribute('aria-label') || '', w: Math.round(el.getBoundingClientRect().width) }));
+  const v = document.querySelector('video');
+  return {
+    kind: kind,
+    viewport: [window.innerWidth, window.innerHeight],
+    containerRect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+    docFullscreenElement: document.fullscreenElement ? document.fullscreenElement.className : null,
+    fullscreenClasses: Array.from(new Set(cls)).slice(0, 20),
+    fullscreenButtons: btns,
+    video: v ? { w: Math.round(v.getBoundingClientRect().width), h: Math.round(v.getBoundingClientRect().height), currentTime: +v.currentTime.toFixed(2), paused: v.paused, src: (v.src || '').slice(0, 60) } : null
+  };
+};
+</script>
+</body>
+</html>

@@ -4,6 +4,18 @@
 
 ## 也可以不手拼 JSON：用现成客户端（**首选**）
 
+阅读页面首选 `dsb state --text-only`，只输出脱敏的结构化文本，不重复列出元素清单。
+视口外内容用 `--viewport-expansion 1500`（`-1` 表示全部），跨域 frame 用 `--include-frames`。
+需要字段筛选时用 `dsb run get_form_state --select data.fields` 或
+`dsb run get_browser_state --select data.text`。`--select` 输出 JSON，支持点分隔对象键和数字数组下标
+（如 `data.fields.0`），不执行表达式；缺少路径报用法错误，显式 null 保留为 null。
+它只筛终端输出，日志仍记录完整脱敏响应；失败保留完整错误信封和业务退出码。
+`--text-only` 是纯文本便利选项，与 `--json`/`--select` 同用时后两者优先。
+快照不可靠或动作结果未知时，筛选模式仍在 stderr 提示，不能靠选出的一个字段判断业务完成。
+
+复杂请求继续使用 `--params @文件.json` / `batch 文件.json`，不为过滤输出改用裸 HTTP 请求，
+否则会丢失客户端脱敏、统一退出码和调用留档。
+
 手工拼 `-d '...'` 在参数带中文、引号、换行时很容易出错（PowerShell 尤其爱吃掉引号），返回体还得自己解析。
 仓库里的 `dsb` 客户端把这几件事都替你办了：**子命令式传参**、**批量与异步**、**每一步的请求与响应都留档**。
 凡是「发请求 → 读页面 → 再发请求」的任务，用它比手拼 JSON 少一大类无谓的失败。

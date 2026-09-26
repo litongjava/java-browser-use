@@ -215,10 +215,11 @@ public class BrowserInspectionUpgradeTest {
         + " layer.id = 'agreement'; document.body.appendChild(layer);"
         + " document.getElementById('moving').scrollIntoView(); }");
     service.getInstance(id).page.waitForTimeout(150);
-    Kv result = data(service.clickElementBySelector(id, "#moving", "auto", 700));
-    assertEquals("被遮住时应当退回 JS 派发,而不是点遮挡物", "js", result.getStr("mode"));
-    assertEquals("target-covered", result.getStr("mouseSkipped"));
-    assertNotNull("回执要说清被谁挡住了", result.getStr("coveredBy"));
+    String before = text("#clickFlag");
+    RespBodyVo result = service.clickElementBySelector(id, "#moving", "auto", 700);
+    assertFalse("auto 不应穿透遮挡层", result.isOk());
+    assertTrue(result.getMsg(), result.getMsg().contains("ELEMENT_OBSCURED"));
+    assertEquals("背景按钮不应收到点击", before, text("#clickFlag"));
   }
 
   // ==================== DOM 弹窗 ====================

@@ -349,6 +349,7 @@ public class BrowserFrameUpgradeTest {
   public void indexClickRoutesIntoFrameAutomatically() {
     openMain();
     Kv state = data(service.getBrowserState(id, false, 0, true, 200, Boolean.TRUE));
+    assertEquals(state.toString(), true, state.get("snapshotConsistent"));
     Integer innerIndex = null;
     for (Object item : listOf(state.get("elements"))) {
       Kv element = mapToKv(item);

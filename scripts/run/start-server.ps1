@@ -144,12 +144,16 @@ if (-not $javaExe) {
 # 在 PS 5.1 下原生命令往 stderr 写会被当成终止性错误,所以这里临时放宽一下。
 $savedEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-$javaVersionLine = (& $javaExe -version 2>&1 | Select-Object -First 1)
+# 必须先完整接收输出；在原生命令管道中 Select-Object -First 1 会提前关闭管道，导致 PS7 的退出码未更新。
+$javaVersionOutput = @(& $javaExe -version 2>&1)
 $javaExitCode = $LASTEXITCODE
+$javaVersionLine = $javaVersionOutput | Select-Object -First 1
 $ErrorActionPreference = $savedEap
 if ($javaExitCode -ne 0 -or -not $javaVersionLine) {
   Write-Host "✗ 这个 java 跑不起来:$javaExe"
-  Write-Host '  先确认 JAVA_HOME 指向的 JDK 与本机架构一致(x64 / arm64、32 位 / 64 位不一致就是这种表现)。'
+  Write-Host "  退出码:$javaExitCode"
+  $javaVersionOutput | ForEach-Object { Write-Host "  $_" }
+  Write-Host '  请根据上面的实际错误检查 JAVA_HOME、可执行文件和架构。'
   Write-Host '  改法:换一个 JDK 21+。'
   exit 1
 }

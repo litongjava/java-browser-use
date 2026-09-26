@@ -27,6 +27,12 @@ python client/dsb.py --id 1001 run go_to_url -p url=https://example.com
 # 看页面状态(标题/URL/元素数)
 python client/dsb.py --id 1001 state
 
+# 仅结构化文本；仍脱敏、留档，警告写入 stderr
+python client/dsb.py --id 1001 state --text-only --viewport-expansion -1
+
+# 字段投影输出 JSON，支持数字数组下标，如 data.fields.0
+python client/dsb.py --id 1001 run get_form_state --select data.fields
+
 # 长批次:后台跑 + 轮询,不受 HTTP 超时限制
 python client/dsb.py --id 1001 batch cmds.json --async --wait
 

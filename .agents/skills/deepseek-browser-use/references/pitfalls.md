@@ -64,7 +64,7 @@
     - 换引擎会重建浏览器，所以只能在「当前没有其它任务」时换（把在跑的任务 `close` 掉再 `start`，不用重启服务）。
     - 这仍然是**排障候选**，不保证适用于所有网站，也不代表已成功登录。详见[问题记录与复测证据](scripts/diagnostics/RESULTS-2026-09-22.md)。
 
-30. **`data.mode=js` 意味着「这次没走真实交互」**：被遮挡、带动画、或 `pointer-events` 有问题的元素上，原生点击会等满超时，服务会自动降级成 JS 派发事件（回执里 `data.mode=js` + `data.fallbackReason`），点击本身通常是有效的。但 JS 设值**不保证进框架的 model**：`input_text` 走 JS 时会回 `data.committed=false`，DOM 上明明有值、预览或提交校验却说「不能为空」就是这种情况——用 `input_text_by_selector` 重填一遍（可见字段默认走真实输入）。**关键步骤（提交、缴费）看到 `mode=js` 要额外确认页面状态**，不要只看 `ok=true`。
+30. **`data.mode=js` 意味着「这次没走真实交互」**：未发现遮挡的元素上，原生点击失败后可能降级成 JS 派发事件；明确被遮挡时 auto 不会穿透点击，对象释放异常也不会自动补点（回执里 `data.mode=js` + `data.fallbackReason`），点击本身通常是有效的。但 JS 设值**不保证进框架的 model**：`input_text` 走 JS 时会回 `data.committed=false`，DOM 上明明有值、预览或提交校验却说「不能为空」就是这种情况——用 `input_text_by_selector` 重填一遍（可见字段默认走真实输入）。**关键步骤（提交、缴费）看到 `mode=js` 要额外确认页面状态**，不要只看 `ok=true`。
 
 31. **`POST /playwright/upload` 与 `/data/**` 一样没有鉴权**：能访问端口的人就能往服务端磁盘写文件（只能写进暂存目录、文件名会被清洗，但文件内容不限）。服务只监听本机时问题不大，**对外部署前必须一起加访问控制**；`browser.upload.enabled=false` 可以整体关掉这个接口。追踪日志默认脱敏（手机号、证件号、邮箱、长数字）但只是尽力而为，日志与暂存文件也都不会自动清理。
 

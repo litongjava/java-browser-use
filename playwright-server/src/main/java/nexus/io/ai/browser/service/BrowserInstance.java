@@ -73,6 +73,8 @@ public class BrowserInstance {
    * 可交互结构化文本,两者一一对应。
    */
   public final AtomicInteger captureSeq = new AtomicInteger();
+  /** A detected mixed snapshot must not fall back to the unrelated CSS index space. */
+  public boolean snapshotInvalidated;
 
   /**
    * 手动截图(screenshot / get_element_screenshot)的序号

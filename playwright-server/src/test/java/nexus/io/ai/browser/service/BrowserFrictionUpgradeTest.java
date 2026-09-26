@@ -363,7 +363,7 @@ public class BrowserFrictionUpgradeTest {
     BrowserInstance inst = service.getInstance(id);
     Kv before = (Kv) PlaywrightService.stateProbe(inst, null);
     // 让页面真的发生变化 —— 模拟「下载已经发生 / 页面已经跳走」
-    service.clickElementBySelector(id, "#growBtn", null, null);
+    inst.page.evaluate("() => document.getElementById('growOut').textContent = 'grown'");
     assertEquals("grown", innerText("#growOut"));
 
     RespBodyVo changed = PlaywrightService.actionErrorOrEffect("click_element_by_selector", before, inst, null,
@@ -387,7 +387,7 @@ public class BrowserFrictionUpgradeTest {
     // 实测就是这个区别救了回归用例 —— 一直在动的元素会持续改变 DOM 指纹,只看「页面变了」就判成功的话,
     // 原生点击超时会被误判成点击成功(BrowserInspectionUpgradeTest#movingElementFallsBackToRealMouse)。
     Kv movingBefore = (Kv) PlaywrightService.stateProbe(inst, null);
-    service.clickElementBySelector(id, "#growBtn", null, null); // 制造一次真实的 DOM 变化
+    inst.page.evaluate("() => document.getElementById('growOut').textContent = 'changed again'");
     RespBodyVo timeout = PlaywrightService.actionErrorOrEffect("click_element_by_selector", movingBefore, inst,
         null, new com.microsoft.playwright.PlaywrightException(
             "Locator.click: Timeout 700ms exceeded. waiting for element to be stable"),

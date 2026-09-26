@@ -6,6 +6,13 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 
 # DeepSeek Browser Use（HTTP 浏览器自动化）
 
+新增阅读方式：`dsb state --text-only` 只输出脱敏结构化文本；`--viewport-expansion -1`
+纳入视口外元素，`--include-frames` 纳入跨域 frame。字段筛选用 `--select data.fields` 等，
+仍保留客户端日志、脱敏和失败退出码，详见 [客户端分册](references/client.md)。
+快照返回 ``snapshotConsistent:false`` / ``indicesUsable:false`` 时不要使用该次索引；
+点击返回 ``actionStatus:unknown`` 时先读取业务结果，禁止自动重发。已完成的动作与后续观测错误分别报告，
+详见 [协议分册](references/protocol.md)。同一任务的依赖命令要等前一条返回后再执行。
+
 这是给智能体用的浏览器中间件：一个 tio-boot 服务，用 HTTP 驱动真实的浏览器（默认是**本机安装的 Google Chrome**，配一份**共享的持久化 profile**），把网页变成「可交互结构化文本 + 截图」。
 
 - 默认地址：`http://localhost:10049`（端口来自 `playwright-server/src/main/resources/app.properties` 的 `server.port`）
@@ -25,6 +32,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | `references/commands.md` | 每个方法的参数与返回字段（全量）、站点配方 |
 | `references/batch-and-js.md` | `commands` 批量、`expect` 断言、`execute_js` / `bodyFile` / `vars` |
 | `references/human-in-loop.md` | 验证码 / 扫码 / 短信码 / 人工登录、`ocr_image`、多步 `steps` |
+| `references/payment-onboarding.md` | 商户申请、多层弹窗、短信验证、密钥上传、审核状态及资料脱敏 |
 | `references/browsers.md` | 选浏览器与引擎、profile 与登录态、实例生命周期、残留进程 |
 | `references/pitfalls.md` | 60 条坑与限制（下面「症状表」与「最常踩的坑」里说的「第 N 条」都指它） |
 
@@ -264,7 +272,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 
 | `mode` | 行为 |
 | --- | --- |
-| 不传 / `auto` | 原生方式 → 失败改**真实鼠标** → 再失败改 JS 派发；目标被遮挡时跳过鼠标档直接走 JS |
+| 不传 / `auto` | 原生方式 → 可确认未被遮挡时尝试真实鼠标与 JS 降级；被遮挡时停止，不穿透弹窗；对象释放异常不补点，先读状态 |
 | `native` | 只用原生方式；失败就是失败 |
 | `mouse` | 只用真实鼠标点击（不做可操作性检查） |
 | `js` | 直接在页面里派发事件，**跳过可操作性检查** |

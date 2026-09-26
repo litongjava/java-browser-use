@@ -91,12 +91,12 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
 
 | `mode` | 行为 |
 | --- | --- |
-| 不传 / `auto` | 先按原生方式做，超时或不可操作时**自动改用 JS 派发事件**，成功则回执里写明 `data.mode=js` 与 `data.fallbackReason` |
+| 不传 / `auto` | 先用原生方式；普通失败且未发现遮挡时尝试真实鼠标、JS 降级；被遮挡时返回 `ELEMENT_OBSCURED`，对象释放异常不补点 |
 | `native` | 只用原生方式；失败就是失败，不换方式 |
 | `js` | 直接在页面里派发事件（点击派发 mousedown/mouseup/click），**跳过可操作性检查** |
 | 输入类的 `fill` / `type` | 只用真实输入（`fill` 覆盖式、`type` 逐键） |
 
-为什么需要降级：有些站点（实测 ant-design 的 Vue SPA，例如商标网上申请系统）在 Playwright 的可操作性检查下会等满超时返回 `[ACTION_TIMEOUT] 等待元素可操作超时`，而元素明明在那里、点上去也有反应——常见于被浮层遮挡、有过渡动画、或在 `pointer-events` 上做了手脚的元素。这时唯一稳的办法就是在页面里直接派发事件。
+降级适用于部分框架的可操作性检查与实际交互不一致的场景。遮挡层可能承载短信验证或确认操作，不能自动用 JS 穿透点击背景按钮。应先读取当前弹窗，再精确定位控件。多个可见匹配会优先选择中心点能接收事件的控件；这不等于业务语义唯一，重要按钮仍需检查命中文本和所属弹窗。
 
 - **降级不会被伪装成原生成功**：回执 `data.mode` 说明这次实际用了哪种方式，`data.fallbackReason` 给出原生失败的原因。看到 `mode=js` 就要知道「这次没走真实交互」，关键步骤（提交、缴费）建议再确认一次页面状态。
 - **JS 设值不等于进了框架模型**：`input_text` 走 JS 设值时会回 `data.committed=false` 与 `data.note`。DOM 上能看到值、但 Vue/React 的 model 里可能是空的——预览页或提交校验会因此报「不能为空」。这类字段要用 `input_text_by_selector`（可见字段默认走真实输入，`committed=true`）重新填一遍。
@@ -150,3 +150,22 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' \
 - 脱敏是**尽力而为**：按模式匹配，不认识的个人信息（姓名、门牌号、账号）不会被掩掉，日志也**不会自动清理**。交付或共享 `logs/trace/` 前自己过一眼。
 - `POST /playwright/upload` 的落盘记录另写在同一天的 `uploads.log`（文件名、大小、SHA-256、落盘路径），只记元数据、不记文件内容。
 - `start` 的返回里带 `data.browser.trace`（日志目录、是否开启、是否脱敏）与 `data.browser.upload`（暂存目录、开关、单文件上限），客户端-服务器模式下照着它就知道该去哪清理。
+
+## 动作与快照可靠性补充
+
+点击成功返回后，回执的 `actionStatus:completed` 只说明动作调用完成，不保证业务成功。
+后续探针失败时仍保留成功响应，并给出 `observationComplete:false`、`effective:null`；
+如果整个观测过程异常，还带 `observationError` 和 `changeStatus:unknown`。
+底层对象释放异常使动作本身是否完成无法判断时，回执包含 `actionStatus:unknown`、
+`retrySafe:false` 和 `actionError`。未观察到变化时保持失败信封，但不能自动重复提交。
+观察到变化也只是业务可能已执行的证据，仍应回读结果。
+
+`get_browser_state` 在读取前后检查文档标识、URL、DOM 变动、frame 读取错误及元素回查。
+排除服务自身高亮层的变动，以及截图引起的光标颜色样式变动；检测到不一致后最多重建一次，只重读，不重放操作。
+返回 `snapshotConsistent`、`snapshotAttempts`、`indicesUsable` 和 `pageAppearsBlank`。
+两次都不可靠时返回 `snapshotIssues`，并清除服务端索引快照。元素回查失败显示
+`resolved:false` 与原标签，不再静默显示无标签元素。
+主 frame 读取失败按读取错误返回，由只读重试策略处理，不伪装成正常空页面。
+
+一致性检查不是业务完成条件：持续动画可能被标为不一致，SPA 在新 URL 下暂时保留旧内容也可能
+在读取窗口内完全不变。应等待具体的表单、列表或响应，不以 URL 或 `snapshotConsistent:true` 代替业务确认。

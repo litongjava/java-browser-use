@@ -1919,6 +1919,11 @@ public class PlaywrightService {
    */
   public RespBodyVo getBrowserState(Long browserId, Boolean highlight, Integer viewportExpansion,
       Boolean includeElements, Integer maxElements, Boolean includeFrames) {
+    return getBrowserStateAttempt(browserId, highlight, viewportExpansion, includeElements, maxElements, includeFrames, 1);
+  }
+
+  private RespBodyVo getBrowserStateAttempt(Long browserId, Boolean highlight, Integer viewportExpansion,
+      Boolean includeElements, Integer maxElements, Boolean includeFrames, int attempt) {
     BrowserInstance inst = INSTANCES.get(browserId);
     if (inst == null) {
       return notFound(browserId);
@@ -1927,6 +1932,7 @@ public class PlaywrightService {
     int expansion = viewportExpansion == null ? 0 : viewportExpansion;
     boolean withFrames = Boolean.TRUE.equals(includeFrames);
 
+    Kv startStamp = snapshotStamp(inst);
     DOMState state;
     try {
       // 一律走「按 frame 逐个求值」这条路:同源 iframe 的元素仍然全部在快照里(和以前顺着 iframe 递归
@@ -1935,6 +1941,8 @@ public class PlaywrightService {
       // includeFrames 控制的是「要不要连跨域 iframe 也纳入」。
       state = DomService.getFrameState(inst.page, doHighlight, expansion, !withFrames);
     } catch (PlaywrightException e) {
+      inst.domState = null;
+      inst.snapshotInvalidated = true;
       return RespBodyVo.fail("构建页面结构失败：" + briefMessage(e.getMessage()));
     }
     recordSnapshot(inst, state);
@@ -1967,9 +1975,11 @@ public class PlaywrightService {
     }
 
     // 索引清单:text 是给人读的树,index 才是按索引命令要用的东西,直接内联免得再跑一趟
+    List<Kv> allElements = null;
     if (includeElements == null || includeElements) {
       int cap = maxElements == null || maxElements <= 0 ? DEFAULT_MAX_INLINE_ELEMENTS : maxElements;
       List<Kv> all = interactiveElements(inst);
+      allElements = all;
       List<Kv> inline = all.size() > cap ? new ArrayList<>(all.subList(0, cap)) : all;
       // elementsTruncated 无论是否截断都要给:调用方靠它判断「清单是不是全的」,缺字段会让人以为没截断
       kv.set("elements", inline).set("elementCount", all.size()).set("elementsTruncated", all.size() > cap);
@@ -1985,7 +1995,87 @@ public class PlaywrightService {
     if (stateFile != null) {
       kv.set("state_file", stateFile);
     }
+    Kv endStamp = snapshotStamp(inst);
+    List<String> issues = snapshotIssues(startStamp, endStamp, state, allElements);
+    kv.set("snapshotConsistent", issues.isEmpty()).set("snapshotAttempts", attempt);
+    kv.set("pageAppearsBlank", text.isBlank());
+    if (!issues.isEmpty()) {
+      // Never leave indices from a known mixed snapshot available to later actions.
+      inst.domState = null;
+      inst.snapshotInvalidated = true;
+      if (attempt < 2) {
+        return getBrowserStateAttempt(browserId, highlight, viewportExpansion, includeElements,
+            maxElements, includeFrames, attempt + 1);
+      }
+      kv.set("snapshotIssues", issues).set("indicesUsable", false)
+          .set("snapshotLastMutation", endStamp.get("lastMutation"))
+          .set("snapshotHint", "页面在读取期间变化或部分读取失败；本次索引已作废，请等待目标内容后重新读取快照。");
+    } else {
+      kv.set("indicesUsable", true);
+    }
     return RespBodyVo.ok(kv);
+  }
+
+  /** Observe document identity and DOM mutations, excluding our own highlight overlay. */
+  private static Kv snapshotStamp(BrowserInstance inst) {
+    try {
+      Object raw = inst.page.evaluate("""
+          () => {
+            const key = '__dsbSnapshotWatch';
+            if (!window[key] || window[key].document !== document) {
+              const watch = {document, id: performance.timeOrigin + ':' + Math.random(), count: 0};
+              watch.observer = new MutationObserver(records => {
+                for (const r of records) {
+                  const e = r.target.nodeType === 1 ? r.target : r.target.parentElement;
+                  if (e?.closest('#playwright-highlight-container')) continue;
+                  // Playwright screenshots temporarily hide input carets via inline style.
+                  // Ignore only caret-color/no-op changes; visibility/layout styles still count.
+                  if (r.type === 'attributes' && r.attributeName === 'style') {
+                    const normalized = value => {
+                      const style = document.createElement('span').style;
+                      style.cssText = value || '';
+                      style.removeProperty('caret-color');
+                      return style.cssText;
+                    };
+                    if (normalized(r.oldValue) === normalized(e?.getAttribute('style'))) continue;
+                  }
+                  if (r.type === 'childList' && [...r.addedNodes, ...r.removedNodes].length &&
+                      [...r.addedNodes, ...r.removedNodes].every(n =>
+                        n.nodeType === 1 && n.id === 'playwright-highlight-container')) continue;
+                  watch.count++;
+                  watch.lastMutation = {type:r.type, tag:e?.tagName, attribute:r.attributeName};
+                }
+              });
+              watch.observer.observe(document, {subtree:true, childList:true, attributes:true,
+                attributeOldValue:true, characterData:true});
+              window[key] = watch;
+            }
+            return {documentId:window[key].id, mutations:window[key].count,
+              lastMutation:window[key].lastMutation,
+              url:location.href, readyState:document.readyState};
+          }
+          """);
+      return new Kv().set((Map<?, ?>) raw);
+    } catch (RuntimeException e) {
+      return Kv.by("error", briefMessage(e.getMessage()));
+    }
+  }
+
+  static List<String> snapshotIssues(Kv before, Kv after, DOMState state, List<Kv> elements) {
+    List<String> issues = new ArrayList<>();
+    if (before.containsKey("error") || after.containsKey("error")) issues.add("document_probe_failed");
+    for (String field : List.of("documentId", "url", "mutations")) {
+      if (!java.util.Objects.equals(before.get(field), after.get(field))) issues.add(field + "_changed");
+    }
+    if ("loading".equals(after.get("readyState"))) issues.add("document_loading");
+    for (FrameSnapshot frame : state.getFrames()) {
+      if (!frame.skipped && frame.readFailure != null) issues.add("frame_read_failed:" + frame.index);
+      if (frame.main && !java.util.Objects.equals(frame.url, after.get("url"))) issues.add("frame_url_changed");
+    }
+    if (elements != null && elements.stream().anyMatch(e -> Boolean.FALSE.equals(e.get("resolved")))) {
+      issues.add("elements_unresolved");
+    }
+    return issues;
   }
 
   /**
@@ -2575,6 +2665,7 @@ public class PlaywrightService {
    * @return 索引越界或没有对应元素时返回 null
    */
   private Locator resolveIndex(BrowserInstance inst, int index, String selector) {
+    if (inst.snapshotInvalidated) return null;
     DOMState state = inst.domState;
     if (state != null) {
       DOMElementNode node = state.getSelectorMap().get(index);
@@ -2755,6 +2846,7 @@ public class PlaywrightService {
   /** 给一份快照记上「什么时候建的」与「当时页面变过多少次」,供报错时解释索引为什么失效 */
   private static void recordSnapshot(BrowserInstance inst, DOMState state) {
     inst.domState = state;
+    inst.snapshotInvalidated = false;
     inst.domStateAt = System.currentTimeMillis();
     inst.domStateMutations = readMutationCount(inst);
   }
@@ -2929,7 +3021,7 @@ public class PlaywrightService {
       if (matched > 1) {
         kv.set("chosenIndex", chosenIndex).set("scanned", scanned).set("selectorNote",
             "选择器匹配到 " + matched + " 个元素,这次用的是第 " + chosenIndex
-                + " 个（按文档顺序遇到的第一个**可见**元素）;要精确指定就把选择器写得更具体");
+                + " 个（优先中心点可接收事件的可见元素，否则取首个可见元素）;要精确指定就把选择器写得更具体");
       }
       if (allHidden) {
         kv.set("visibleMatched", 0).set("hiddenMatchNote",
@@ -2956,7 +3048,7 @@ public class PlaywrightService {
   }
 
   /**
-   * 动作类命令的选择器定位:先 count 再挑可见的那个,两个坑都在里面挡掉
+   * 动作类命令的选择器定位:先 count，再优先挑中心点可接收事件的可见元素
    *
    * <p>
    * <b>只给「动作」用</b>,不要用在等待类命令上({@code wait_for_element} 等的就是「现在还没有」,
@@ -2983,8 +3075,19 @@ public class PlaywrightService {
     int chosen = -1;
     for (int i = 0; i < scanned; i++) {
       if (root.locator(selector).nth(i).isVisible()) {
-        chosen = i;
-        break;
+        if (chosen < 0) chosen = i;
+        // isVisible 不包含遮挡检查；多层弹窗中后面的按钮也可能可见。
+        boolean receivesEvents = Boolean.TRUE.equals(root.locator(selector).nth(i).evaluate("""
+            el => {
+              const r = el.getBoundingClientRect();
+              const hit = el.ownerDocument.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+              return !!hit && (hit === el || el.contains(hit));
+            }
+            """));
+        if (receivesEvents) {
+          chosen = i;
+          break;
+        }
       }
     }
     boolean allHidden = chosen < 0;
@@ -3167,7 +3270,8 @@ public class PlaywrightService {
    * 按方式执行一次点击类动作
    *
    * <p>
-   * {@code auto}(默认)的降级链是 **原生点击 → 真实鼠标 → JS 派发**,三档各有各的适用面:
+   * {@code auto}(默认)只在未发现遮挡的普通失败时使用 **原生点击 → 真实鼠标 → JS 派发**。
+   * 对象释放异常可能发生在操作之后，必须交给观察层处理，不能补点。
    *
    * <ol>
    * <li><b>原生</b>({@code locator.click})带可操作性检查:可见、稳定、不被遮挡、能接收事件,
@@ -3208,20 +3312,14 @@ public class PlaywrightService {
       nativeAction.run();
       outcome.mode = "native";
     } catch (PlaywrightException nativeFailure) {
-      if (!"auto".equals(resolved)) {
+      if (!"auto".equals(resolved) || ActionError.isSpuriousDispatch(nativeFailure.getMessage())) {
         throw nativeFailure;
       }
       outcome.fallbackReason = briefMessage(nativeFailure.getMessage());
-      if (covered) {
-        // 目标被盖住时**刻意不用真实鼠标**:鼠标点的是那个坐标,落在遮挡物上,会把遮挡物按下去
-        // (实测最坑的一种「点错了」)。JS 派发虽然可能被框架忽略,但事件至少是给目标的。
+      if (covered || recordBlocker(locator, outcome)) {
+        // 不穿透弹窗点击背景提交按钮；页面可能在原生操作等待期间新增遮挡层。
         outcome.extra.set("mouseSkipped", "target-covered");
-        if (jsFallbackEnabled()) {
-          jsClick(locator);
-          outcome.mode = "js";
-        } else {
-          throw nativeFailure;
-        }
+        throw new PlaywrightException("ELEMENT_OBSCURED 目标被遮挡，auto 模式不穿透点击；请重新读取当前弹窗并定位控件");
       } else if (mouseFallbackEnabled() && mouseClick(locator)) {
         outcome.mode = "mouse";
       } else if (jsFallbackEnabled()) {
@@ -3259,6 +3357,10 @@ public class PlaywrightService {
       target.page().mouse().click(box.x + box.width / 2, box.y + box.height / 2);
       return true;
     } catch (PlaywrightException e) {
+      // The click may already have been delivered. Do not fall through to a JS click.
+      if (ActionError.isSpuriousDispatch(e.getMessage())) {
+        throw e;
+      }
       return false;
     }
   }
@@ -3287,7 +3389,7 @@ public class PlaywrightService {
     }
     outcome.extra.set("coveredBy", probe.get("hit")).set("coveredHint",
         "目标中心点上实际命中的是别的元素(常见:用户服务协议层、弹窗遮罩、叠起来的确认框),"
-            + "这类点击很容易被吃掉:先关掉遮挡物再点(close_modal);确实要点被遮住的元素时用 mode:\"js\"");
+            + "auto 模式不会穿透遮挡层；请读取当前弹窗并定位其中的目标，或完成当前弹窗后再操作背景页面");
     return true;
   }
 
@@ -3321,7 +3423,7 @@ public class PlaywrightService {
     String description = hit instanceof Map ? String.valueOf(((Map<?, ?>) hit).get("text")) + " <"
         + String.valueOf(((Map<?, ?>) hit).get("tag")) + " class=" + String.valueOf(((Map<?, ?>) hit).get("className"))
         + ">" : String.valueOf(hit);
-    return "；目标中心点上实际命中的是别的元素:" + description + "(被遮挡,先关掉遮挡物或改用 mode:\"mouse\")";
+    return "；目标中心点上实际命中的是别的元素:" + description + "(被遮挡，请先读取并处理当前弹窗，再定位目标)";
   }
 
   private static void jsClick(Locator locator) {
@@ -3585,6 +3687,21 @@ public class PlaywrightService {
 
   /** 同上,{@code frame} 非空时探针取在该 frame 里(见 {@link #stateProbe(BrowserInstance, Frame)}) */
   private static Kv receipt(Kv before, BrowserInstance inst, Frame frame) {
+    return observeSafely(() -> receiptUnchecked(before, inst, frame));
+  }
+
+  /** Observation must never turn a completed action into a failed command. */
+  static Kv observeSafely(java.util.function.Supplier<Kv> observation) {
+    try {
+      return observation.get();
+    } catch (RuntimeException e) {
+      return Kv.by("changed", null).set("changeStatus", "unknown")
+          .set("observationComplete", false).set("probeTrustworthy", false)
+          .set("observationError", briefMessage(e.getMessage()));
+    }
+  }
+
+  private static Kv receiptUnchecked(Kv before, BrowserInstance inst, Frame frame) {
     Kv after = observeAfter(before, inst, frame);
     String urlBefore = String.valueOf(before.get("url"));
     String urlAfter = String.valueOf(after.get("url"));
@@ -3643,7 +3760,11 @@ public class PlaywrightService {
     // probeTrustworthy 由 receipt 统一给出:探针取到过「用不了的中间态」且没等到恢复时为 false
     boolean probeTrustworthy = !Boolean.FALSE.equals(report.getBoolean("probeTrustworthy"));
     // effective 是给智能体用的机器可读结论:动作发出去了,但观察窗口内页面没动 = 不保证生效
-    report.set("effective", changed);
+    report.set("actionStatus", "completed").set("retrySafe", false);
+    report.set("effective", probeTrustworthy ? changed : null);
+    if (!probeTrustworthy) {
+      report.set("changeStatus", "unknown");
+    }
     if (!probeTrustworthy) {
       // 取证不可信时**盖掉**通用提示与遮挡提示:这时候的 changed / coveredBy 都是假象
       // (实测 B 站点分区报了一个根本不存在的 div.header 遮挡,而那次点击其实生效了)。
@@ -3701,8 +3822,13 @@ public class PlaywrightService {
       return RespBodyVo.fail(fallbackFailure);
     }
     Kv report = receipt(before, inst, frame);
-    if (!Boolean.TRUE.equals(report.getBoolean("changed"))) {
-      return RespBodyVo.fail(fallbackFailure);
+    report.set("actionStatus", "unknown").set("retrySafe", false).set("actionError", detail);
+    if (!Boolean.TRUE.equals(report.getBoolean("changed"))
+        || Boolean.FALSE.equals(report.getBoolean("probeTrustworthy"))) {
+      report.set("effective", null).set("hint", "动作结果未知，可能已经执行。请先只读确认业务结果，不要自动重复提交。");
+      RespBodyVo failed = RespBodyVo.fail(fallbackFailure);
+      failed.setData(report);
+      return failed;
     }
     // 有下载发生是最硬的正向证据(下载不一定改变 DOM),把它单独标出来。
     // -1 表示目录读不到 = 未知,这时**不敢**当证据用
@@ -5608,12 +5734,7 @@ public class PlaywrightService {
 
   /** 带回执与命中信息的成功响应 */
   private static RespBodyVo okWithHit(Kv before, BrowserInstance inst, String action, Kv hit) {
-    Kv report = receipt(before, inst);
-    report.set(hit);
-    if (!Boolean.TRUE.equals(report.getBoolean("changed"))) {
-      report.set("hint", action + " 已执行，但观察窗口内尚未发现变化；不代表点击失败，请等待目标条件或读取新状态");
-    }
-    return RespBodyVo.ok(report);
+    return okWithReceipt(before, inst, action, hit);
   }
 
   public RespBodyVo clickElementByRole(Long browserId, String role, String name) {
@@ -7991,8 +8112,12 @@ public class PlaywrightService {
       if (entry instanceof Map) {
         item.set((Map<?, ?>) entry);
       }
+      item.set("resolved", entry instanceof Map);
       if (node != null) {
         item.set("xpath", node.getXpath());
+        if (!(entry instanceof Map)) {
+          item.set("tag", node.getTagName()).set("text", "[element could not be re-read]");
+        }
       }
       FrameSnapshot snapshot = state.frameOf(index);
       if (snapshot != null) {

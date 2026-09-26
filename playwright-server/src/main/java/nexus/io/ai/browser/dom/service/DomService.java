@@ -308,6 +308,11 @@ public class DomService {
         // viewportExpansion=-1 表示「不管在不在视口都给索引」,与单 frame 路径的取法一致
         state = getClickableElements(node.frame, expression, highlightElements, -1, viewportExpansion, cursor, false);
       } catch (RuntimeException e) {
+        // Main-frame failure is not a successful empty snapshot. Let the read-only
+        // dispatcher retry transient Playwright errors instead of hiding them.
+        if (main) {
+          throw e;
+        }
         failure = e.getMessage();
       }
       int first = -1;

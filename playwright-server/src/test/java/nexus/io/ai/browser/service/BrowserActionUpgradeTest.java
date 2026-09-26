@@ -29,8 +29,7 @@ import nexus.io.model.body.RespBodyVo;
  *
  * <p>覆盖四件事:
  * <ul>
- * <li><b>点击的降级链</b>:被遮挡的元素上原生点击会超时,{@code mode=auto} 应当自动改用 JS 派发并成功,
- * 回执里如实写明 {@code mode=js} 与降级原因;</li>
+ * <li><b>点击的降级链</b>:被遮挡的元素不得在 auto 模式下穿透点击，显式 js 模式仍可用;</li>
  * <li><b>输入的模式</b>:看得见就用真实输入(进框架模型),看不见才退回 JS 设值并标明
  * {@code committed=false};</li>
  * <li><b>隐藏 file input 的上传</b>:没有索引的元素用选择器就能传,不再需要先把它显示出来;</li>
@@ -173,19 +172,60 @@ public class BrowserActionUpgradeTest {
 
   // ==================== 点击的降级链 ====================
 
-  /** 被遮挡的元素:原生点击等满超时,auto 模式自动改用 JS 派发并成功 */
+  /** 被遮挡的元素不能通过自动降级触发背景提交。 */
   @Test
-  public void coveredElementFallsBackToJsDispatch() {
+  public void coveredElementDoesNotSubmitThroughOverlay() {
     open();
     RespBodyVo nativeOnly = service.clickElementBySelector(id, "#covered", "native", 700);
     assertFalse("原生点击被遮挡的元素应当超时失败,实际:" + nativeOnly.getMsg(), nativeOnly.isOk());
     assertEquals("页面不该有任何反应", "idle", flag());
 
     RespBodyVo auto = service.clickElementBySelector(id, "#covered", "auto", 700);
-    Kv result = data(auto);
-    assertEquals("降级后应当用的是 JS 派发", "js", result.getStr("mode"));
-    assertNotNull("回执要说明降级原因,不能让调用方以为是原生点击成功", result.getStr("fallbackReason"));
-    assertEquals("JS 派发要真的触发页面上的监听器", "clicked", flag());
+    assertFalse("auto 不应穿透遮挡层", auto.isOk());
+    assertEquals("ELEMENT_OBSCURED", ActionError.code(auto.getMsg()));
+    assertEquals("idle", flag());
+  }
+
+  @Test
+  public void duplicateSubmitTargetsForegroundDialog() {
+    open();
+    service.getInstance(id).page.evaluate("""
+        () => {
+          document.body.insertAdjacentHTML('beforeend',
+            '<button type="submit" class="duplicate" onclick="window.backgroundClicks++">提交</button>' +
+            '<div style="position:fixed;inset:0;background:white;z-index:9999">' +
+            '<button type="submit" class="duplicate" onclick="window.dialogClicks++">确认</button></div>');
+          window.backgroundClicks = 0;
+          window.dialogClicks = 0;
+        }
+        """);
+    Kv result = data(service.clickElementBySelector(id, ".duplicate", "auto", 700));
+    assertEquals(1, result.getInt("chosenIndex").intValue());
+    assertEquals(0, ((Number) service.getInstance(id).page.evaluate("() => window.backgroundClicks")).intValue());
+    assertEquals(1, ((Number) service.getInstance(id).page.evaluate("() => window.dialogClicks")).intValue());
+  }
+
+  @Test
+  public void releasedObjectFailureDoesNotDispatchAnotherClick() throws Exception {
+    open();
+    service.getInstance(id).page.evaluate("() => document.getElementById('overlay').remove()");
+    Class<?> outcomeType = Class.forName(PlaywrightService.class.getName() + "$ActionOutcome");
+    var constructor = outcomeType.getDeclaredConstructor();
+    constructor.setAccessible(true);
+    var click = PlaywrightService.class.getDeclaredMethod("clickWithMode",
+        com.microsoft.playwright.Locator.class, String.class, outcomeType, Runnable.class);
+    click.setAccessible(true);
+    Runnable uncertainClick = () -> {
+      throw new com.microsoft.playwright.PlaywrightException("Object doesn't exist: response@fixture");
+    };
+    try {
+      click.invoke(null, service.getInstance(id).page.locator("#covered"), "auto",
+          constructor.newInstance(), uncertainClick);
+      org.junit.Assert.fail("Uncertain action must propagate without a second click");
+    } catch (java.lang.reflect.InvocationTargetException expected) {
+      assertTrue(ActionError.isSpuriousDispatch(expected.getCause().getMessage()));
+    }
+    assertEquals("idle", flag());
   }
 
   /** mode=js 时不做可操作性检查,直接派发 */

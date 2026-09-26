@@ -470,7 +470,8 @@ def _summarize(data) -> str:
     parts = []
     for key in ("count", "countBlocking", "countStrict", "succeeded", "failed", "expectFailed", "seq", "status",
                 "mode", "matched", "stable", "closed", "elementCount", "jobId", "step", "title", "url",
-                "value", "visible", "enabled", "checked", "result"):
+                "value", "visible", "enabled", "checked", "result", "actionStatus", "retrySafe",
+                "observationComplete", "snapshotConsistent", "indicesUsable"):
         if key not in data or data[key] in (None, "", [], {}):
             continue
         value = data[key]
@@ -593,11 +594,12 @@ class Printer:
     """
 
     def __init__(self, mode: str = "full", mask: bool = True, patterns: tuple[str, ...] = (),
-                 out=sys.stdout):
+                 out=sys.stdout, select: str | None = None):
         self.mode = mode
         self.mask = mask
         self.patterns = patterns
         self.out = out
+        self.select = select
 
     def _clean(self, text: str) -> str:
         return redact(text, self.patterns) if self.mask else text
@@ -605,6 +607,9 @@ class Printer:
     def response(self, response: Response, *, label: str = "", index: int | None = None,
                  payload=None) -> None:
         """默认打印「一行摘要 + 完整信封」;`payload` 给定时改印它(比如只要批量里的某一步)"""
+        if self.select is not None:
+            self.json(response.envelope if payload is None else payload)
+            return
         if self.mode != "json":
             prefix = f"#{index:03d} " if index else ""
             verdict = "OK" if response.ok else "FAIL"
@@ -623,6 +628,22 @@ class Printer:
 
     def json(self, value) -> None:
         """`--compact` 时压成一行(这类子命令没有「摘要」可言,一行 JSON 就是它的一行)"""
+        if self.select is not None:
+            # Failed responses retain the full error envelope and business exit code.
+            if isinstance(value, dict) and value.get("ok") is False:
+                print(self._clean(json.dumps(value, ensure_ascii=False, indent=2)), file=self.out)
+                return
+            data = value.get("data", {}) if isinstance(value, dict) else {}
+            if isinstance(data, dict):
+                if data.get("snapshotConsistent") is False:
+                    self.warn("快照不可靠:" + str(data.get("snapshotIssues")))
+                if data.get("actionStatus") == "unknown" or data.get("observationComplete") is False:
+                    self.warn("动作结果或观测不完整，请先读取业务结果，勿自动重试")
+            # Redact before dropping object keys, so requestId/jobId keep their
+            # existing exemption even when the projection returns only a string.
+            value = select_field(redact_obj(value, self.patterns) if self.mask else value, self.select)
+            print(json.dumps(value, ensure_ascii=False, indent=2), file=self.out)
+            return
         if self.mode == "compact":
             print(self._clean(json.dumps(value, ensure_ascii=False, separators=(",", ":"))), file=self.out)
         else:
@@ -664,9 +685,23 @@ def build_client(args) -> Client:
 
 
 def printer_for(args) -> Printer:
-    mode = "json" if getattr(args, "json", False) else ("compact" if getattr(args, "compact", False) else "full")
+    mode = "json" if getattr(args, "json", False) or getattr(args, "select", None) is not None else (
+        "compact" if getattr(args, "compact", False) else "full")
     return Printer(mode=mode, mask=not getattr(args, "no_redact", False),
-                   patterns=tuple(getattr(args, "redact_pattern", None) or ()))
+                   patterns=tuple(getattr(args, "redact_pattern", None) or ()),
+                   select=getattr(args, "select", None))
+
+
+def select_field(value, path: str):
+    """Select a dot-separated object path, with numeric list indices; never eval input."""
+    for part in path.split("."):
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            raise UsageError(f"--select 路径不存在:{path} (在 {part})")
+    return value
 
 
 def pick_index(envelope: dict, index: int | None):
@@ -862,14 +897,23 @@ def cmd_uploads(client: Client, args, out: Printer) -> int:
 
 def cmd_state(client: Client, args, out: Printer) -> int:
     """页面状态摘要:标题、URL、元素数,以及可选的元素清单/正文"""
-    params: dict = {"includeElements": True}
+    params: dict = {"includeElements": not args.text_only}
+    if args.viewport_expansion is not None:
+        params["viewportExpansion"] = args.viewport_expansion
+    if args.include_frames:
+        params["includeFrames"] = True
     if args.max_elements is not None:
         params["maxElements"] = args.max_elements
     response = client.command("get_browser_state", params)
-    if args.json or not response.ok:
+    if args.json or out.select is not None or not response.ok:
         out.json(pick_index(response.envelope, args.index))
         return EXIT_OK if response.ok else EXIT_BUSINESS
     data = response.data if isinstance(response.data, dict) else {}
+    if data.get("snapshotConsistent") is False:
+        out.warn("快照不可靠:" + str(data.get("snapshotIssues") or data.get("snapshotHint")))
+    if args.text_only:
+        out.line(str(data.get("text") or ""))
+        return EXIT_OK
     out.line(f"标题:{data.get('title')}")
     out.line(f"URL:{data.get('url')}")
     out.line(f"元素:{data.get('elementCount')} 个(内联 {len(data.get('elements') or [])}"
@@ -895,7 +939,7 @@ def cmd_js(client: Client, args, out: Printer) -> int:
         params["vars"] = variables
     response = client.command("execute_js", params, label="execute_js")
     # JS 的「值」才是重点:默认只打摘要 + 返回值,信封里的截图/序号是噪音
-    if out.mode == "json":
+    if out.mode == "json" or out.select is not None:
         out.json(pick_index(response.envelope, args.index) if args.index is not None else response.envelope)
     else:
         out.response(response, label="execute_js",
@@ -1098,6 +1142,7 @@ def add_common_options(parser: argparse.ArgumentParser, *, suppress_defaults: bo
     add("--no-redact", action="store_true", help="关闭脱敏(默认对手机号/证件号/邮箱等打码)")
     add("--redact-pattern", action="append", help="额外要打码的词,可重复")
     add("--json", action="store_true", help="只输出 JSON(便于管道)")
+    add("--select", metavar="PATH", help="仅输出指定字段的 JSON，如 data.text / data.fields.0；仍脱敏和记录，失败保留完整错误")
     add("--compact", "--summary", dest="compact", action="store_true",
         help="只输出一行摘要(--summary 是同一个开关的正名;注意它只管本地输出,"
              "服务端的响应精简模式要用 --response-mode compact)")
@@ -1187,6 +1232,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = subs.add_parser("state", parents=[common], help="页面状态摘要")
     p.add_argument("--max-elements", type=int, help="内联元素条数上限")
     p.add_argument("--full", action="store_true", help="连元素清单与结构化文本一起打印")
+    p.add_argument("--text-only", action="store_true", help="仅输出脱敏后的结构化文本，不重复列出元素")
+    p.add_argument("--viewport-expansion", type=int, help="扩展快照视口像素；-1 纳入全部元素")
+    p.add_argument("--include-frames", action="store_true", help="纳入跨域 iframe")
 
     p = subs.add_parser("js", parents=[common], help="执行 JavaScript")
     p.add_argument("script", help="脚本内容,或 @脚本.js,或 - 读标准输入")
@@ -1261,6 +1309,8 @@ def main(argv: list[str] | None = None) -> int:
             print(hint, file=sys.stderr)
         print("提示:dsb --help 看用法,dsb methods 看服务端支持的命令", file=sys.stderr)
         return EXIT_USAGE
+    if args.select is not None:
+        args.json = True
     out = printer_for(args)
     try:
         client = build_client(args)
