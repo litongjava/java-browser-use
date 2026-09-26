@@ -704,8 +704,10 @@ deepseek-browser-use/
 │       ├── browser.properties             内嵌 Chromium 修订号 + 浏览器/profile/日志/上传配置
 │       └── dom/dom_tree/                  DOM 转结构化文本的 JS
 ├── scripts/package/build-release.mjs      发行版打包脚本
-├── scripts/run/start-server.ps1           后台启动服务(脱离当前进程树) + 等健康检查
-├── scripts/run/stop-server.ps1            先 shutdown 再结束进程树,不留孤儿浏览器
+├── scripts/run/start-server.sh            macOS/Linux 后台启动服务(脱离当前进程树) + 等健康检查
+├── scripts/run/stop-server.sh             先 shutdown 再结束进程树,不留孤儿浏览器(macOS/Linux)
+├── scripts/run/start-server.ps1           Windows 后台启动服务(脱离当前进程树) + 等健康检查
+├── scripts/run/stop-server.ps1            先 shutdown 再结束进程树,不留孤儿浏览器(Windows)
 ├── scripts/trace/browse.ps1               客户端侧调用留档脚本(与服务端同一套脱敏规则)
 ├── client/dsb.py                           Python 客户端(CLI + 可 import,只用标准库)
 ├── client/dsb.cmd                          Windows 薄包装(能直接敲 dsb,不必写 python 前缀)
@@ -742,7 +744,9 @@ deepseek-browser-use/
 浏览器是**独立进程**：强杀服务（或它的 mvn 进程）不会关掉它启动的浏览器，残留的浏览器会一直占着 profile 目录，下一次 `start` 可能卡到启动超时（默认 60 秒，`browser.launch.timeoutMs`）。
 
 - **规范做法**：先 `close` 掉任务再停服务 —— 关掉最后一个任务时浏览器会跟着退出。
-- **别手动拼这套流程**：仓库里有两个脚本，后台启动 / 干净停止各一个（Windows）：
+- **别手动拼这套流程**：后台启动 / 干净停止各有 Windows 与 macOS/Linux 两套脚本。
+
+  Windows：
 
   ```shell
   # 后台启动(脱离当前进程树,宿主回收自己的子进程时不会带走它),并等健康检查通过
@@ -751,6 +755,19 @@ deepseek-browser-use/
   # 先 shutdown(关任务与共享浏览器),再按端口结束整棵进程树
   scripts\run\stop-server.cmd -Port 10049
   ```
+
+  macOS / Linux（同一份 `.sh` 同时支持两者，只要有 bash 与 curl/wget；参数与 Windows 版一一对应）：
+
+  ```shell
+  # 后台启动:优先 setsid(Linux),没有 setsid 时用 python3 的 os.setsid()(macOS),都没有才退回 nohup;
+  # 启动后等 /playwright/health 通过,并打印实际生效的引擎与 profile 目录
+  scripts/run/start-server.sh --port 10049 --engine chromium
+
+  # 先 shutdown(关任务与共享浏览器),再按端口结束进程组/子进程
+  scripts/run/stop-server.sh --port 10049
+  ```
+
+  参数：`-p/--port`、`-e/--engine`、`--profile-dir`、`--jar`、`-t/--timeout`、`-f/--force`（`stop` 侧另有 `--keep-browser`、`-q`）。日志与 pid 仍然落在 `logs/server/server-<端口>.{pid,out.log,err.log}`，另生成一个 `logs/server/run-<端口>.sh` 启动器，`stop-server.sh` 会连同 pid 文件一起清理。
 
   `start-server` 优先用 WMI(`Win32_Process.Create`)创建进程：该进程由 `WmiPrvSE` 创建，不在当前进程的 Job 里，宿主的 `taskkill /T` 不会带走它；并给它一个 `Win32_ProcessStartup.ShowWindow = SW_HIDE`，所以**不会在桌面上留下黑窗口**（见下节）。拿不到 WMI 时退回 `Start-Process -WindowStyle Hidden`，再不行才退成可见窗口并给出警告。pid 落在 `logs/server/server-<端口>.pid`，日志在 `logs/server/server-<端口>.{out,err}.log`。
 
