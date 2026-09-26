@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  阿里云 Maven 镜像专用 settings.xml
+
+  用法（不改动全局 ~/.m2/settings.xml）：
+      mvn -s /Users/ping/code/network/aliyun-settings.xml package -DskipTests -U
+
+  想全局生效就把本文件的 <mirrors> 段合并进 ~/.m2/settings.xml。
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                              https://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <!-- 留空即使用默认的 ~/.m2/repository -->
+  <localRepository/>
+
+  <pluginGroups/>
+
+  <proxies/>
+
+  <!--
+    注意：下面 mirrorOf 里的 !github-imaginix 是“排除名单”。
+    mirrorOf=* 会把所有仓库（含你自己的私服/GitHub 仓库）都重定向到阿里云，
+    那样 litongjava 之类的私有依赖就会 404，所以这里显式排除。
+    若你的 pom 里私服仓库 id 不叫 github-imaginix，请改成实际的 <repository><id>。
+  -->
+  <mirrors>
+    <mirror>
+      <id>aliyunmaven</id>
+      <name>阿里云公共仓库 (central + jcenter 聚合)</name>
+      <url>https://maven.aliyun.com/repository/public</url>
+      <mirrorOf>*,!github-imaginix</mirrorOf>
+    </mirror>
+
+    <!-- 按需启用：只想代理 central、其余仓库保持原样时，改用下面这个并注释掉上面的
+    <mirror>
+      <id>aliyunmaven-central</id>
+      <name>阿里云 central 仓库</name>
+      <url>https://maven.aliyun.com/repository/central</url>
+      <mirrorOf>central</mirrorOf>
+    </mirror>
+    -->
+
+    <!-- 按需启用：Spring / Gradle 插件等专用代理
+    <mirror>
+      <id>aliyunmaven-spring</id>
+      <name>阿里云 Spring 仓库</name>
+      <url>https://maven.aliyun.com/repository/spring</url>
+      <mirrorOf>spring-milestones,spring-snapshots</mirrorOf>
+    </mirror>
+    <mirror>
+      <id>aliyunmaven-gradle-plugin</id>
+      <name>阿里云 Gradle 插件仓库</name>
+      <url>https://maven.aliyun.com/repository/gradle-plugin</url>
+      <mirrorOf>gradle-plugin</mirrorOf>
+    </mirror>
+    -->
+  </mirrors>
+
+  <servers>
+    <!--
+      本文件刻意不写入凭据（避免明文 token 被同步/误提交）。
+      若构建需要 GitHub 私服，请从 ~/.m2/settings.xml 复制对应 <server> 段到此处，
+      并且更推荐先去 GitHub 吊销那个已泄露的 ghp_ 开头的 token。
+
+    <server>
+      <id>github-imaginix</id>
+      <username>litongjava</username>
+      <password>${env.GITHUB_TOKEN}</password>
+    </server>
+    -->
+  </servers>
+
+  <profiles/>
+  <activeProfiles/>
+
+</settings>
