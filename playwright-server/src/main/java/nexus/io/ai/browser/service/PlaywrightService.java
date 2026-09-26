@@ -91,6 +91,18 @@ public class PlaywrightService {
   private static volatile SharedBrowser sharedBrowser;
 
   /**
+   * 「正在启动共享浏览器」的现场,启动结束(成功或失败)后清空
+   *
+   * <p>
+   * 为什么需要它:{@code start} 在浏览器起来之前不会返回,而<b>首次使用(或 Playwright 升级后)驱动
+   * 会先下载/升级它管理的浏览器</b> —— 这一步不受 {@code browser.launch.timeoutMs} 约束,实测能卡十几
+   * 分钟。调用方(人或者 agent)在 {@code start} 超时后只能看到 {@code list_tasks} 的 {@code count=0},
+   * 分不清「正在起浏览器」和「什么都没发生」,于是去查端口、查进程、重复 {@code start}。这个字段就是
+   * 让 {@code list_tasks} 能回答那个问题。
+   */
+  private static volatile Kv launchState;
+
+  /**
    * 全进程共享的 Playwright(driver)
    *
    * <p>
@@ -579,7 +591,16 @@ public class PlaywrightService {
     }
     synchronized (PlaywrightService.class) {
       if (sharedBrowser == null) {
-        sharedBrowser = launchSharedBrowser(headless, requested);
+        launchState = Kv.by("startedAt", System.currentTimeMillis()).set("headless", headless)
+            .set("browser", BrowserChoice.resolve(requested).id())
+            .set("note", "正在启动共享浏览器:首次使用(或 Playwright 升级后)驱动会先下载/升级它管理的浏览器,"
+                + "实测数百 MB、可能十几分钟,这一步不受 browser.launch.timeoutMs 约束,start 在它结束前不会返回;"
+                + "服务端日志里能看到 Downloading ... 进度");
+        try {
+          sharedBrowser = launchSharedBrowser(headless, requested);
+        } finally {
+          launchState = null;
+        }
       }
       return sharedBrowser;
     }
@@ -807,7 +828,13 @@ public class PlaywrightService {
     try {
       Files.createDirectories(profileDir);
     } catch (IOException e) {
-      log.warn("创建 profile 目录失败 {}:{}", profileDir, e.getMessage());
+      // 以前这里只打一条 WARN 就继续往下走,结果是「真正的原因只出现在服务端日志里,而调用方
+      // 只能看到一个与原因无关的失败」—— 实测在受限环境(目录不可写)下 profile 建不出来,
+      // start 会一直不返回,拿到回执的人完全看不出是权限问题。托管 profile 建不出来就没有
+      // 可用的浏览器,所以这里直接快速失败,把路径、原因和改法一起交出去。
+      throw new IllegalStateException("无法创建 profile 目录 " + profileDir + ":" + e.getMessage()
+          + "(托管 profile 建不出来就起不了浏览器;请确认这个目录存在且可写,"
+          + "或用 -Dbrowser.profileDir / start-server 的 --profile-dir 换一个可写目录)", e);
     }
     log.info("启动浏览器:browser={}, engine={}, executable={}, profileDir={}, 用户 profile={}, headless={}",
         resolved.id(), resolved.engine().id(), executable, profileDir, userProfile, headless);
@@ -999,6 +1026,18 @@ public class PlaywrightService {
           .set("mode", browser.browser != null ? "cdp" : "managed"));
     } else {
       data.set("browser", null);
+    }
+    Kv launching = launchState;
+    if (launching != null) {
+      Long started = launching.getLong("startedAt");
+      long startedAt = started == null ? System.currentTimeMillis() : started;
+      data.set("launching", Kv.by("startedAt", startedAt).set("elapsedMs", System.currentTimeMillis() - startedAt)
+          .set("browser", launching.get("browser")).set("headless", launching.get("headless"))
+          .set("note", launching.get("note")))
+          .set("note", "浏览器正在启动中,所以 count=0 是正常的(任务要等浏览器起来才注册):"
+              + "现在这一步可能是在下载/升级 Playwright 的浏览器,先别重复 start;详情见 launching 字段");
+    } else {
+      data.set("launching", null);
     }
     return RespBodyVo.ok(data);
   }
@@ -7537,7 +7576,7 @@ public class PlaywrightService {
       }
     }
     if (matched.isEmpty()) {
-      return RespBodyVo.fail("get_response_body 没有匹配的响应: " + filter + "(只保留最近 100 个响应)");
+      return RespBodyVo.fail(noResponseMatchMessage(inst, filter, requestId));
     }
     int position = index == null ? matched.size() - 1 : index;
     if (position < 0 || position >= matched.size()) {
@@ -7550,6 +7589,47 @@ public class PlaywrightService {
     synchronized (inst.recentResponses) {
       return new ArrayList<>(inst.recentResponses);
     }
+  }
+
+  /**
+   * 一条响应都没匹配上时,把「为什么没匹配上」说清楚
+   *
+   * <p>
+   * 实测踩过:调用方拿着 {@code get_requests} 回执里的 {@code requestId} 去 {@code get_response_body},
+   * 只拿到「没有匹配的响应: null」—— 那个 {@code null} 是 {@code filter}(它压根没传),而传进去的
+   * {@code requestId} 一个字都没出现在错误里。于是三种完全不同的情况(这个 id 不存在 / 它还没收到响应 /
+   * 它的响应已经被挤出最近 100 条)在调用方看来一模一样,只能靠反复试。
+   *
+   * <p>
+   * 现在按请求记录回查这个 {@code requestId},分别给出结论。
+   */
+  private static String noResponseMatchMessage(BrowserInstance inst, String filter, String requestId) {
+    StringBuilder text = new StringBuilder("get_response_body 没有匹配的响应: filter=")
+        .append(filter == null || filter.isEmpty() ? "(未传)" : filter);
+    if (requestId == null || requestId.isEmpty()) {
+      return text.append("(响应最多保留最近 100 条)").toString();
+    }
+    text.append(", requestId=").append(requestId);
+    Kv recorded = null;
+    synchronized (inst.requests) {
+      for (Kv kv : inst.requests) {
+        if (requestId.equals(kv.getStr("requestId"))) {
+          recorded = kv;
+          break;
+        }
+      }
+    }
+    if (recorded == null) {
+      text.append(":这个 requestId 不在请求记录里(记录挂在页签上、从认领那一刻开始,最多 200 条),"
+          + "确认它来自同一个任务、且还没有被挤出记录;也可以只用 filter/index 回看最近 100 条响应");
+    } else if (recorded.get("status") == null && recorded.get("failure") == null) {
+      text.append(":这条请求还没有收到响应(get_requests 里它的 status 是 null),稍后再读,"
+          + "或用 wait_for_response 等一个新响应");
+    } else {
+      text.append(":这条请求有响应,但响应体已经不在最近 100 条里了(被后面的流量挤出去了),"
+          + "回看时去掉 requestId、用 filter 或 index 取;要长期留证据请在动作发生的当下就读它");
+    }
+    return text.toString();
   }
 
   /**

@@ -586,6 +586,7 @@ current tab is: 1               		[12]<a name='tj_login'>登录/>
 | --- | --- |
 | 有哪些方法 | `list_methods` / `GET /playwright/methods` |
 | 现在有哪些任务、浏览器活着没 | `list_tasks` / `GET /playwright/tasks` |
+| **`start` 迟迟不返回时，浏览器到底在干什么** | 同一个 `list_tasks` 的 `launching` 字段：非 `null` 就是正在起共享浏览器（带 `elapsedMs` 与说明）——首次使用多半是在下载 Playwright 的浏览器，别重复 `start` |
 | 服务端生效配置（引擎、profile 目录、降级开关） | `get_config` / `GET /playwright/config` |
 | 页面上的 DOM 弹窗是谁、按钮在哪 | `get_modals`（标题、按钮文本、× 与各按钮的坐标） |
 | 关掉弹窗 | `close_modal`（真实鼠标点，并校验数量真的减少了） |
@@ -603,6 +604,17 @@ current tab is: 1               		[12]<a name='tj_login'>登录/>
 - Maven 3.8+
 - Node.js 18+（只用于打包发行版）
 
+> **JDK 要「能跑」且「够新」**，两条都实测踩过：
+>
+> - **架构要与本机一致**。macOS arm64 上如果 `JAVA_HOME` 指向 x86_64 的 JDK，`java -version` 自己就挂
+>   （`rosetta error: Attachment of code signature supplement failed`，退出码 134），连服务都起不来；
+> - **版本要 ≥ 21**。低于 21 时日志里是 `UnsupportedClassVersionError: … class file version 65.0,
+>   this version … up to 61.0` —— 进程其实已经退出，但看起来很像「启动慢」。
+>
+> `scripts/run/start-server.sh` / `start-server.ps1` 现在会**先探一次 java**（跑不起来或低于 21 直接报错退出），
+> 健康检查失败时再按日志归因（JDK 版本 / 架构 / 端口被占 / Maven 失败 / 正在下载浏览器），
+> 不再一律提示「端口可能没被覆盖」。
+
 ### 开发态运行
 
 ```shell
@@ -611,6 +623,15 @@ mvn spring-boot:run
 ```
 
 开发态下 jar 里没有内嵌浏览器（`browsers/index.txt` 不存在），`BundledBrowser` 会返回 null，Playwright 就用它自己管理的浏览器（缓存目录是 `~/.cache/ms-playwright`，Windows 上是 `%USERPROFILE%\AppData\Local\ms-playwright`），本地调试不需要重新打包。首次用到时会自动下载，需要能访问外网。
+
+> **首次 `start` 可能十几分钟不返回**：Playwright 的驱动第一次被调用（或 Playwright 版本升级后）会把它管理的
+> 浏览器**一起**下载/升级（实测 Chromium + Firefox + WebKit 约 700MB，十几分钟）—— **即使你用的是本机已装的
+> Google Chrome**，这一步也照做。它不受 `browser.launch.timeoutMs`（默认 60 秒）约束，所以表现是「请求挂住」
+> 而不是「启动超时失败」。
+>
+> 判断方法：`list_tasks` 的 `launching` 字段非 `null`（带 `elapsedMs`）就说明正在起共享浏览器，
+> 服务端日志里能看到 `Downloading …`。**别重复 `start`**。想先把这一步摆到明面上，跑一次
+> `./client/dsb selftest --browser chrome`。
 
 ### 跑测试
 

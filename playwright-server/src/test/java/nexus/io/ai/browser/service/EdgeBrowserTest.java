@@ -67,6 +67,19 @@ public class EdgeBrowserTest {
     }
   }
 
+  /**
+   * 探测到的可执行文件「看起来是 Edge」吗
+   *
+   * <p>
+   * 不能只认 `msedge`：Windows 上可执行文件叫 `msedge.exe`，而 **macOS 上它就叫
+   * `Microsoft Edge`**（在 `Microsoft Edge.app/Contents/MacOS/` 里）。实测在装了 Edge 的 macOS 上，
+   * 只认 `msedge` 会让下面两条断言必挂 —— 而它们真正要守的是「别把 Chrome 当 Edge」。
+   */
+  private static boolean looksLikeEdge(Path found) {
+    String text = found.toAbsolutePath().toString().toLowerCase().replace('\\', '/');
+    return !text.contains("chrome") && (text.contains("msedge") || text.contains("microsoft edge"));
+  }
+
   /** 配了一个不存在的路径时不能把它交给 Playwright:那只会得到一句英文的启动失败 */
   @Test
   public void missingConfiguredExecutableIsIgnored() {
@@ -76,18 +89,18 @@ public class EdgeBrowserTest {
     assertTrue("要么找不到(null),要么退回自动探测,但绝不能是那个不存在的路径",
         found == null || Files.isRegularFile(found));
     if (found != null) {
-      assertTrue("自动探测的结果应当是 msedge", found.getFileName().toString().toLowerCase().contains("msedge"));
+      assertTrue("自动探测的结果应当是 Edge(msedge / Microsoft Edge),实际:" + found, looksLikeEdge(found));
     }
   }
 
-  /** 自动探测的结果必须是 msedge(不能把 chrome.exe 当 Edge 用) */
+  /** 自动探测的结果必须是 Edge(不能把 chrome.exe 当 Edge 用) */
   @Test
   public void detectedExecutableIsEdgeNotChrome() {
     Path found = EdgeBrowser.executablePath();
     if (found == null) {
       return;
     }
-    assertTrue("探测到的应当是 msedge,实际:" + found, found.getFileName().toString().toLowerCase().contains("msedge"));
+    assertTrue("探测到的应当是 Edge(msedge / Microsoft Edge),实际:" + found, looksLikeEdge(found));
   }
 
   /** Edge 的托管 profile 与 Chrome 那份分开:默认在 profiles/edge 下 */

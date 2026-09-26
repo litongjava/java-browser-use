@@ -26,7 +26,7 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | `references/batch-and-js.md` | `commands` 批量、`expect` 断言、`execute_js` / `bodyFile` / `vars` |
 | `references/human-in-loop.md` | 验证码 / 扫码 / 短信码 / 人工登录、`ocr_image`、多步 `steps` |
 | `references/browsers.md` | 选浏览器与引擎、profile 与登录态、实例生命周期、残留进程 |
-| `references/pitfalls.md` | 57 条坑与限制（下面「症状表」与「最常踩的坑」里说的「第 N 条」都指它） |
+| `references/pitfalls.md` | 60 条坑与限制（下面「症状表」与「最常踩的坑」里说的「第 N 条」都指它） |
 
 > ## 省 token 铁律：非必要不要读图
 >
@@ -61,6 +61,8 @@ whenToUse: 需要在真实浏览器里打开网页、阅读页面、填表、点
 | 索引老是失效 | 「一次快照只做一个动作」，或全程用选择器；报错里已经带上快照的年龄与元素范围 |
 | 换了浏览器之后所有站点都退登录了 | 看 `start` 回执里的 `data.profileSeenBefore` / `data.profileNote`（换引擎等于换一套登录态） |
 | 操作一个 id 得到「没有找到对应的浏览器实例」 | 看报错里的服务启动时间：实例只在内存里，**服务重启即失效**，`list_tasks` 确认后重新 `start` 即可（登录态在 profile 里，不会丢） |
+| **`start` 迟迟不返回 / 客户端超时** | 先 `list_tasks` 看 ``launching`` 字段：它不是「什么都没发生」，而是正在起共享浏览器 —— **首次使用或 Playwright 升级后驱动要先下载/升级浏览器（实测约 700MB、十几分钟），这一步不受启动超时约束**。别重复 `start`，服务端日志里能看到 `Downloading …`（第 58 条） |
+| **服务起不来，脚本等满超时只说「端口可能没被覆盖」** | 现在的 `scripts/run/start-server.sh` / `.ps1` 会先探一次 java（跑不起来 / 版本低于 21 直接报），失败时再按日志归因。手工排查见第 59 条 |
 | **报错说 `Object doesn't exist: response@…`，可这条命令根本没碰过什么 response**；而且换一条毫不相干的命令还是报同样的对象 | 这是 Playwright 事件泵投递过来的**伪故障**（见 `references/pitfalls.md` 第 47 条），不是页面坏了：只读命令服务端**已自动重发**，回执里会多一个 `data.spuriousRetry`；`execute_js` 读页面时请传 `retryOnSpurious: true`；**点击/提交/支付类命令绝不要自动重发**，先读页面状态 |
 | **`get_element_screenshot` / `click_element_by_selector` 用 `[class*=xxx]` 报 `ACTION_TIMEOUT`（等元素可操作超时），可 `get_element_count` 明明说匹配到好几个** | 选择器命中了**隐藏**节点：Playwright 只对可见元素做可操作性检查，隐藏的那个会一直等到超时。先 `get_element_count` 看数量，再用更精确的选择器、或改用索引（快照里只有可见元素才有索引）。实测登录页的 `[class*=qrcode]` 命中 3 个，只有第一个是真二维码 |
 | **`get_modals` 回 `count=0`，但页面上确实有一层挡着点不动** | `count=0` 只说明「框架弹窗 / 类名线索 / 几何兜底」这三轮扫描都没命中，**不是「绝对没有遮挡」**：新版站点的「引导层 / 新手蒙层」常常既没有 `role=dialog`、类名也不含 dialog/modal。改用 `get_browser_state` 读文本找「暂不体验 / 我知道了 / 跳过」这类按钮，按索引点掉，元素数会立刻从个位数涨到几十上百 |
@@ -510,7 +512,7 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 | 判断点击到底生效没有 | 看点击回执里的 `data.changed`，或 `diff_dom_text` 确认快照有没有变。**不要为了这个去读 `data.screenshot`** |
 | 事后复看某一步的页面 | `GET http://localhost:10049/data/<id>/<seq>.png`（截图）与同序号的 `.txt`（页签 + 可交互结构化文本，两者序号相同表示同一时刻） |
 
-## 九、最常踩的 12 条坑（完整 57 条见 `references/pitfalls.md`）
+## 九、最常踩的 12 条坑（完整 60 条见 `references/pitfalls.md`）
 
 1. **页面变化后索引全部重算**：点击、跳转、异步渲染之后必须重新 `get_browser_state`；沿用旧索引会得到 `索引越界` 或超时（报错里带快照年龄与元素范围，照它判断就行）。
 2. **快照里没有 `id`/`class`/`href`**：按 id/class 定位用选择器类命令，取 href 用 `execute_js`，批量看属性用 `get_interactive_map`。
@@ -525,4 +527,4 @@ curl -s -X POST "$BASE" -H 'Content-Type: application/json' -d '{"id":1001,"meth
 11. **`send_keys` 回了 `ok:true` 但页面毫无反应**：看回执里的 `focused` —— 焦点可能根本不在输入框上（落在 `<body>` 上时会给 `focusNote`）。先 `click` 目标输入框再送键。
 12. **`go_to_url` 报失败、可地址栏其实已经跳过去了**：幂等导航会读一次地址栏核对（比较主机+路径，忽略 `?vd_source=…` 这类会话参数），到达了就按成功返回并带 `data.warning`。
 
-其余 45 条里最值得先翻的几类：跨域 iframe（第 37 条）、弹窗与遮挡（第 20 / 39 条）、网络响应体缓存（第 23 条）、`data/<id>/` 与日志不会自动清理（第 27 / 34 条）、强杀服务留下孤儿浏览器（第 32 条）、`get_dialog` 是「最近一次弹窗」（第 20 条）、`Object doesn't exist` 伪故障的机制（第 47 条）、整页截不出图的 ``capture_degraded``（第 48 条）、回读看不到 input 不等于上传失败（第 45 条）、**截图里的彩色高亮层会让二维码扫不出来**（第 54 条）、**按文本点击点中了"包含"它的长容器**（第 55 条）、**`get_form_state` 对自定义下拉撒的两个谎**（第 56 条）、**`wait_for_idle` 在轮询页面上永远等不到**（第 57 条）。
+其余 48 条里最值得先翻的几类：跨域 iframe（第 37 条）、弹窗与遮挡（第 20 / 39 条）、网络响应体缓存（第 23 条）、`data/<id>/` 与日志不会自动清理（第 27 / 34 条）、强杀服务留下孤儿浏览器（第 32 条）、`get_dialog` 是「最近一次弹窗」（第 20 条）、`Object doesn't exist` 伪故障的机制（第 47 条）、整页截不出图的 ``capture_degraded``（第 48 条）、回读看不到 input 不等于上传失败（第 45 条）、**截图里的彩色高亮层会让二维码扫不出来**（第 54 条）、**按文本点击点中了"包含"它的长容器**（第 55 条）、**`get_form_state` 对自定义下拉撒的两个谎**（第 56 条）、**`wait_for_idle` 在轮询页面上永远等不到**（第 57 条）、**首次 `start` 卡在下载浏览器**（第 58 条）、**JDK 架构/版本不匹配让服务起不来**（第 59 条）、**`get_response_body` 传 `requestId` 读不到时的三种归因**（第 60 条）。

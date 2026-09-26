@@ -63,6 +63,14 @@ Windows 下把上面例子里的 `python client/dsb.py` 换成 `.\client\dsb.cmd
   `submit_human_input` / `get_response_body(requestId=…)` 就没法用了，比泄露它更糟。
 - **多行脚本不要写在命令行里**：经 cmd/PowerShell 传参会只剩第一行。用 `js @脚本.js`、`--params @文件.json`
   或 `batch cmds.json`。
+- **`js` / `batch` / `state` 这些是子命令，不是 `run` 的方法名**。写成 `dsb run js @脚本.js` 只会得到一句
+  `用法错:unrecognized arguments: @脚本.js`（真正的错在「`js` 不该跟在 `run` 后面」）。
+  客户端现在会补一句对症提示，但正确写法是：
+
+  ```shell
+  dsb --port 10049 --id 1001 js @脚本.js        # 对：子命令直接写
+  dsb --port 10049 --id 1001 run get_title      # 对：run 只用于服务端方法
+  ```
 
 不确定服务端现在是什么状态（引擎、profile 目录、命令数、配方数）时，先跑一次自检：
 

@@ -90,6 +90,72 @@ json_string_field() { # json key -> 第一个匹配的字符串值
   return 0
 }
 
+# ---- 前置检查与失败归因 --------------------------------------------------
+
+# 要用的那个 java 到底能不能跑;回显 "ok <版本行>" 或 "fail <原因>"
+#
+# 为什么需要:JAVA_HOME 指向一个与本机 CPU 架构不匹配的 JDK 时(macOS arm64 上装了 x86_64 的 JDK),
+# java 自己就起不来 —— 实测报 `rosetta error: Attachment of code signature supplement failed`,
+# 退出码 134。以前脚本照常往下走、等满超时,最后给一句「端口可能没被 -Dserver.port 覆盖」,
+# 把人引到完全无关的方向(实测按那句话查了半天端口)。
+java_probe() {
+  local bin=$1 out code
+  if [ ! -x "$bin" ]; then
+    printf 'fail 找不到可执行的 java:%s' "$bin"
+    return 0
+  fi
+  out="$("$bin" -version 2>&1)"
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    printf 'fail %s' "$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | cut -c1-200)"
+    return 0
+  fi
+  printf 'ok %s' "$(printf '%s' "$out" | head -n 1)"
+}
+
+java_major() { # 参一:`java -version` 的第一行;回显主版本号(1.8 -> 8)
+  local v major
+  v="$(printf '%s' "$1" | sed -n 's/.*version "\([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+  major="${v%%.*}"
+  if [ "$major" = "1" ]; then
+    v="${v#1.}"
+    major="${v%%.*}"
+  fi
+  printf '%s' "$major"
+}
+
+# 健康检查失败时,从日志里读出「真正的原因」,而不是笼统地让人「再等一会儿」
+#
+# 实测两种最误导人的失败都出在这里:
+#   ① 运行的 JDK 比编译用的版本低 -> 日志里是 UnsupportedClassVersionError(class file version 65.0),
+#      即「按 Java 21 编译,现在这个 JRE 只认到 61.0」;进程其实已经退出,日志看起来却像启动慢;
+#   ② java 进程本身起不来(架构不匹配)-> err 日志里是 rosetta error / Abort trap。
+diagnose_health_failure() {
+  local out_log=$1 err_log=$2 text
+  text="$(cat "$out_log" "$err_log" 2>/dev/null || true)"
+  case "$text" in
+    *UnsupportedClassVersionError*)
+      echo "  [真正的原因] 运行这个服务的 JDK 版本太低:它是按 Java 21 编译的(class file version 65.0)。" >&2
+      echo "               把 JAVA_HOME 指向 JDK 21+ 再启动。" >&2
+      return 0 ;;
+    *"rosetta error"*|*"Abort trap"*)
+      echo "  [真正的原因] 这个 java 在本机根本跑不起来 —— 常见于 JDK 与本机 CPU 架构不匹配" >&2
+      echo "               (macOS arm64 上装了 x86_64 的 JDK)。换一个与本机架构一致的 JDK 21+。" >&2
+      return 0 ;;
+    *"Address already in use"*)
+      echo "  [真正的原因] 端口被占用:换一个 --port,或先停掉占用它的进程。" >&2
+      return 0 ;;
+    *"BUILD FAILURE"*)
+      echo "  [真正的原因] Maven 构建/启动失败,真正的错就在上面日志里的 [ERROR] 行。" >&2
+      return 0 ;;
+    *Downloading*)
+      echo "  [正在下载浏览器] 日志里有 Downloading … —— 这是 Playwright 在下载它管理的浏览器" >&2
+      echo "               (首次使用或 Playwright 升级后,数百 MB、可能十几分钟),不是失败:下完再跑一次。" >&2
+      return 0 ;;
+  esac
+  echo "  提示:端口可能没被 -Dserver.port 覆盖(看日志里的 'Server port:'),也可能这次启动确实慢 —— 再等一会儿看看。" >&2
+}
+
 start_detached() { # 参一:启动器路径;设置 LAUNCHED_PID 与 DETACH_MODE
   local launcher=$1
   if command -v setsid >/dev/null 2>&1; then
@@ -169,6 +235,51 @@ if is_healthy && [ "$FORCE" -ne 1 ]; then
   exit 0
 fi
 
+# ---- 前置检查:要用的那个 java 到底能不能跑 ------------------------------
+# 放在「已经在跑就早退」之后:只有真要启动时才值得花这点时间。开发态(mvn)直接失败,
+# 用发行版 jar 时只告警(有人手上可能是按更低的 Java 版本编出来的老包)。
+# 探的必须是「真正会跑起来的那个 java」:发行版那条路的启动器写的是 `java`(由 PATH 决定),
+# 开发态的 mvn 优先用 JAVA_HOME。
+JAVA_BIN=""
+if [ -n "$JAR" ]; then
+  JAVA_BIN="$(command -v java || true)"
+elif [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  JAVA_BIN="$JAVA_HOME/bin/java"
+else
+  JAVA_BIN="$(command -v java || true)"
+fi
+JAVA_PROBE="$(java_probe "${JAVA_BIN:-java}")"
+case "$JAVA_PROBE" in
+  ok*)
+    JAVA_VERSION_LINE="${JAVA_PROBE#ok }"
+    JAVA_VERSION_MAJOR="$(java_major "$JAVA_VERSION_LINE")"
+    case "$JAVA_VERSION_MAJOR" in
+      ''|*[!0-9]*) : ;;
+      *)
+        if [ "$JAVA_VERSION_MAJOR" -lt 21 ]; then
+          if [ -n "$JAR" ]; then
+            echo "警告:当前 java 是 $JAVA_VERSION_LINE,低于本仓库要求的 Java 21+;" >&2
+            echo "      如果这个 jar 是老版本编出来的可能仍能跑,跑不起来请看下面的日志归因。" >&2
+          else
+            echo "✗ java 版本太低:$JAVA_VERSION_LINE($JAVA_BIN)" >&2
+            echo "  开发态要编译本仓库(pom.xml 里 java.version=21,产物是 class file version 65.0)," >&2
+            echo "  低于 21 的 JDK 会在启动时报 UnsupportedClassVersionError。" >&2
+            echo "  改法:export JAVA_HOME=<JDK 21+ 目录>(macOS 用 /usr/libexec/java_home -v 21 找)。" >&2
+            exit 1
+          fi
+        fi ;;
+    esac ;;
+  fail*)
+    echo "✗ 这个 java 跑不起来:${JAVA_BIN:-java}" >&2
+    echo "  报错:${JAVA_PROBE#fail }" >&2
+    if [ -n "${JAVA_HOME:-}" ]; then
+      echo "  当前 JAVA_HOME=$JAVA_HOME —— 先确认它指向的 JDK 与本机 CPU 架构一致" >&2
+      echo "  (macOS arm64 上装了 x86_64 的 JDK 就是这个报错)。" >&2
+    fi
+    echo "  改法:换一个 JDK 21+(macOS 看 /usr/libexec/java_home -V;/opt/homebrew/opt/openjdk@21 也常见)。" >&2
+    exit 1 ;;
+esac
+
 # ---- 拼启动命令 ----------------------------------------------------------
 JVM_ARG_LINE="-Dserver.port=$PORT"
 if [ -n "$ENGINE" ]; then JVM_ARG_LINE="$JVM_ARG_LINE -Dbrowser.engine=$ENGINE"; fi
@@ -227,7 +338,7 @@ if [ "$HEALTHY" -ne 1 ]; then
   echo "等了 $TIMEOUT 秒,http://127.0.0.1:$PORT 还没起来。最后 20 行日志:" >&2
   if [ -f "$OUT_LOG" ]; then echo "--- $OUT_LOG ---" >&2; tail -n 20 "$OUT_LOG" >&2 || true; fi
   if [ -f "$ERR_LOG" ]; then echo "--- $ERR_LOG ---" >&2; tail -n 20 "$ERR_LOG" >&2 || true; fi
-  echo "提示:端口可能没被 -Dserver.port 覆盖(看日志里的 'Server port:'),也可能这次浏览器起得慢 —— 再等一会儿看看。" >&2
+  diagnose_health_failure "$OUT_LOG" "$ERR_LOG"
   exit 1
 fi
 

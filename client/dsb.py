@@ -1198,6 +1198,37 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: 子命令名;其中 start / close 既是子命令**也是**服务端方法名,不能一律当成误用
+SUBCOMMAND_NAMES = ("health", "methods", "config", "tasks", "last", "recipes", "start", "close", "shutdown",
+                    "run", "batch", "job", "upload", "uploads", "state", "js", "selftest")
+
+#: 这两个名字在服务端也是合法方法,`dsb run start` / `dsb run close` 是正常用法
+SUBCOMMAND_ALSO_METHOD = ("start", "close")
+
+
+def subcommand_misuse_hint(argv: list[str] | None) -> str | None:
+    """「把子命令当成 run 的方法名」这种用法错,给一句对症的提示
+
+    实测踩过:照着文档敲 `dsb run js @脚本.js`(前面还带着 --port/--id),只拿到一句
+    `用法错:unrecognized arguments: @脚本.js` —— 真正的原因是 js / batch / state 这些是**子命令**,
+    不是 run 的方法名,而 argparse 的通用提示完全指不到这一点,只能去翻 --help。
+    """
+    if not argv:
+        return None
+    bare = [item for item in argv if not item.startswith("-")]
+    if "run" not in bare:
+        return None
+    rest = bare[bare.index("run") + 1:]
+    if not rest:
+        return None
+    name = rest[0]
+    if name not in SUBCOMMAND_NAMES or name in SUBCOMMAND_ALSO_METHOD:
+        return None
+    return (f"提示:{name} 是子命令,不是 run 的方法名 —— 直接写成 `dsb {name} ...`"
+            f"(例如 `dsb js @脚本.js`、`dsb batch cmds.json`、`dsb state --full`);"
+            f"run 只用来调服务端方法,例如 `dsb run go_to_url -p url=https://example.com`")
+
+
 HANDLERS = {
     "health": cmd_health,
     "methods": cmd_methods,
@@ -1225,6 +1256,9 @@ def main(argv: list[str] | None = None) -> int:
         args = build_parser().parse_args(argv)
     except UsageError as error:  # argparse 的参数错也统一成退出码 3
         print(f"用法错:{error}", file=sys.stderr)
+        hint = subcommand_misuse_hint(argv if argv is not None else sys.argv[1:])
+        if hint:
+            print(hint, file=sys.stderr)
         print("提示:dsb --help 看用法,dsb methods 看服务端支持的命令", file=sys.stderr)
         return EXIT_USAGE
     out = printer_for(args)

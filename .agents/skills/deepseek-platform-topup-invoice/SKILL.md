@@ -37,6 +37,35 @@ description: 用 deepseek-browser-use 在 DeepSeek 开放平台（platform.deeps
 | 登录方式 | 手机号 + 短信验证码 / 账号密码 / 微信扫码 三种 |
 | 关键接口 | `GET /api/v0/fapiao/available_amount?income_type=TOPUP`、`GET /api/v0/fapiao/company_hint?keyword=...`、`POST /api/v0/fapiao/apply`、`GET /api/v0/fapiao/history` |
 
+### 只查余额：页面上读，或者用 ``get_user_summary`` 接口读
+
+用户问「我的 DeepSeek 余额还有多少」时不用做任何写操作，两条路都行：
+
+1. **读页面**（最省事）：`/usage` 页顶部就是 `Topped-up balance`（充值余额，实测那次是 ¥105.01 CNY）与
+   `Total cost`。页面上**只列充值余额**，赠送/代金部分要另看（见下）。
+2. **读接口**（要精确的数字、或要把「充值 / 赠送 / 累计消费」分开时）：
+
+   ```
+   dsb --port 10049 --id <ID> js @余额.js      # 是子命令 js,不是 run js
+   ```
+
+   ```javascript
+   async () => {
+     let t = localStorage.getItem('userToken') || '';
+     try { const o = JSON.parse(t); t = o.value || o.token || t; } catch (e) {}
+     const r = await fetch('/api/v0/users/get_user_summary',
+       {credentials: 'same-origin', headers: {Authorization: 'Bearer ' + t}});
+     return await r.json();
+   }
+   ```
+
+   回执里 ``normal_wallets`` 是充值余额、``bonus_wallets`` 是赠送余额、``total_costs`` 是累计消费。
+
+**这个站点不是 cookie 鉴权，别指望 `credentials:'same-origin'` 帮你带凭据**：实测裸 `fetch` 会拿到
+`{"code":40002,"msg":"Missing Token"}`，token 存在 localStorage 的 `userToken` 里（JSON，取 `.value`），
+必须自己放进 `Authorization: Bearer`。另外连续快速调用同一接口可能回 `202` + 空 body（风控/限流）——
+隔几秒重试，或直接以页面上的数字为准。
+
 ## 2. 开工前
 
 ### 2.1 服务端：发行版 jar 可能落后于源码（实测踩过）

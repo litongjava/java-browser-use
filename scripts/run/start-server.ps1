@@ -78,10 +78,97 @@ function Test-Health {
   }
 }
 
+# 健康检查失败时从日志里读出「真正的原因」,而不是笼统地让人「再等一会儿」
+# (与 macOS/Linux 的 start-server.sh 对齐:运行的 JDK 比编译用的版本低 -> UnsupportedClassVersionError;
+#  java 本身起不来 -> 架构不匹配等)
+function Write-HealthFailureDiagnosis {
+  param([string]$OutLog, [string]$ErrLog)
+  $text = ''
+  if (Test-Path $OutLog) { $text = $text + (Get-Content -Path $OutLog -Raw -ErrorAction SilentlyContinue) }
+  if (Test-Path $ErrLog) { $text = $text + (Get-Content -Path $ErrLog -Raw -ErrorAction SilentlyContinue) }
+  if ($text -match 'UnsupportedClassVersionError') {
+    Write-Host '  [真正的原因] 运行这个服务的 JDK 版本太低:它是按 Java 21 编译的(class file version 65.0)。'
+    Write-Host '               把 JAVA_HOME 指向 JDK 21+ 再启动。'
+    return
+  }
+  if (($text -match 'rosetta error') -or ($text -match 'Abort trap')) {
+    Write-Host '  [真正的原因] 这个 java 在本机根本跑不起来 —— 常见于 JDK 与本机架构不匹配'
+    Write-Host '               (x64 / arm64、32 位 / 64 位不一致)。换一个与本机架构一致的 JDK 21+。'
+    return
+  }
+  if ($text -match 'Address already in use') {
+    Write-Host '  [真正的原因] 端口被占用:换一个 -Port,或先停掉占用它的进程。'
+    return
+  }
+  if ($text -match 'BUILD FAILURE') {
+    Write-Host '  [真正的原因] Maven 构建/启动失败,真正的错就在上面日志里的 [ERROR] 行。'
+    return
+  }
+  if ($text -match 'Downloading') {
+    Write-Host '  [正在下载浏览器] 日志里有 Downloading … —— 这是 Playwright 在下载它管理的浏览器'
+    Write-Host '               (首次使用或 Playwright 升级后,数百 MB、可能十几分钟),不是失败:下完再跑一次。'
+    return
+  }
+  Write-Host "提示:端口可能没被 -Dserver.port 覆盖(看日志里的 'Server port:'),也可能这次启动确实慢 —— 再等一会儿看看。"
+}
+
 if ((Test-Health) -and -not $Force) {
   Write-Host "服务已经在 $Port 上跑着(健康检查通过),不重复启动。"
   Write-Host "要重启:先 pwsh -File scripts/run/stop-server.ps1 -Port $Port"
   exit 0
+}
+
+# ---- 前置检查:要用的那个 java 到底能不能跑 ----------------------------------
+# 与 macOS/Linux 的 start-server.sh 对齐:JAVA_HOME 指向与本机架构不匹配的 JDK 时 java 自己起不来,
+# 以前脚本会照常启动、等满超时,最后给一句「端口可能没被覆盖」,把人引到完全无关的方向。
+# 探的必须是「真正会跑起来的那个 java」:发行版那条路的启动器写的是 `java`(由 PATH 决定),
+# 开发态的 mvn.cmd 优先用 JAVA_HOME。
+$javaExe = $null
+if ($Jar) {
+  $javaCmd = Get-Command java.exe -ErrorAction SilentlyContinue
+  if ($javaCmd) { $javaExe = $javaCmd.Source }
+}
+if (-not $javaExe -and $env:JAVA_HOME) {
+  $candidate = Join-Path $env:JAVA_HOME 'bin\java.exe'
+  if (Test-Path $candidate) { $javaExe = $candidate }
+}
+if (-not $javaExe) {
+  $javaCmd = Get-Command java.exe -ErrorAction SilentlyContinue
+  if ($javaCmd) { $javaExe = $javaCmd.Source }
+}
+if (-not $javaExe) {
+  Write-Host '✗ 找不到 java:请把 JDK 21+ 加进 PATH,或设置 JAVA_HOME。'
+  exit 1
+}
+# 注意:`java -version` 写的是 stderr,而本脚本开头把 $ErrorActionPreference 设成了 Stop ——
+# 在 PS 5.1 下原生命令往 stderr 写会被当成终止性错误,所以这里临时放宽一下。
+$savedEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$javaVersionLine = (& $javaExe -version 2>&1 | Select-Object -First 1)
+$javaExitCode = $LASTEXITCODE
+$ErrorActionPreference = $savedEap
+if ($javaExitCode -ne 0 -or -not $javaVersionLine) {
+  Write-Host "✗ 这个 java 跑不起来:$javaExe"
+  Write-Host '  先确认 JAVA_HOME 指向的 JDK 与本机架构一致(x64 / arm64、32 位 / 64 位不一致就是这种表现)。'
+  Write-Host '  改法:换一个 JDK 21+。'
+  exit 1
+}
+$javaMajor = 0
+if ("$javaVersionLine" -match 'version "1\.(\d+)') {
+  $javaMajor = [int]$Matches[1]
+} elseif ("$javaVersionLine" -match 'version "(\d+)') {
+  $javaMajor = [int]$Matches[1]
+}
+if ($javaMajor -gt 0 -and $javaMajor -lt 21) {
+  if ($Jar) {
+    Write-Warning "当前 java 是 $javaVersionLine,低于本仓库要求的 Java 21+;老 jar 可能仍能跑,跑不起来请看下面的日志归因。"
+  } else {
+    Write-Host "✗ java 版本太低:$javaVersionLine($javaExe)"
+    Write-Host '  开发态要编译本仓库(pom.xml 里 java.version=21,产物是 class file version 65.0),'
+    Write-Host '  低于 21 的 JDK 会在启动时报 UnsupportedClassVersionError。'
+    Write-Host '  改法:换一个 JDK 21+ 再启动。'
+    exit 1
+  }
 }
 
 # ---- 拼启动命令 ----------------------------------------------------------
@@ -168,7 +255,7 @@ if (-not $healthy) {
   Write-Warning "等了 $TimeoutSeconds 秒,http://127.0.0.1:$Port 还没起来。最后 20 行日志:"
   if (Test-Path $outLog) { Get-Content $outLog -Tail 20 }
   if (Test-Path $errLog) { Get-Content $errLog -Tail 20 }
-  Write-Host "提示:端口可能没被 -Dserver.port 覆盖(看日志里的 'Server port:'),也可能这次浏览器起得慢 —— 再等一会儿看看。"
+  Write-HealthFailureDiagnosis -OutLog $outLog -ErrLog $errLog
   exit 1
 }
 

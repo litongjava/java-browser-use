@@ -1,4 +1,4 @@
-# 坑与限制（57 条）
+# 坑与限制（60 条）
 
 > 本文是 [SKILL.md](../SKILL.md) 的分册，按需阅读。SKILL.md 开头的「症状 → 命令」表里提到的「第 N 条」就是本文的编号。
 
@@ -340,3 +340,46 @@
     另一半是批量的默认行为：`commands` 的 `stopOnError` 默认 `true`，一条等待超时会让**后面的命令一条都不跑**
     （实测那次的 `get_browser_state` 就没执行，等于白跑一轮、还看不到页面）。
     批量里显式加客户端的 `--keep-going`（= 服务端 `stopOnError:false`），让每一步的结果都回来。
+
+58. **首次 `start` 会卡在「Playwright 下载浏览器」上，而不是卡在起 Chrome 上 —— 判据是 `list_tasks` 的 ``launching``。**
+    实测在一台全新的机器上，`start --browser chrome`（用的明明是**本机已装的 Google Chrome**）整整
+    十几分钟没有返回：服务端日志里是 `Downloading Chromium 138.0.7204.23 …`、`Downloading Firefox …`、
+    `Downloading Webkit …`（约 700MB）—— Playwright 的驱动在被第一次调用时会把**它自己管理的那些浏览器**
+    一起下载/升级，与这次到底用哪个可执行文件无关。这一步**不受 `browser.launch.timeoutMs`（默认 60 秒）约束**，
+    所以表现是「请求挂住」而不是「启动超时失败」。
+
+    三条判据，按顺序看：
+
+    - `list_tasks` 的 ``launching`` 字段非 `null`（带 `startedAt` / `elapsedMs` / 说明）：就是正在起共享浏览器，
+      **别重复 `start`**、也别去查端口；这次实测抓到的现场是 `count:0` + ``launching.elapsedMs`` 一路在涨；
+    - 服务端日志（`logs/server/server-<端口>.out.log`）里有 `Downloading …` / `Removing unused browser …`；
+    - 什么都没下、`launching` 也是 `null`，才去看端口与进程。
+
+    只想「预热一次」的话，先跑一遍 `./client/dsb selftest --browser chrome` 把这一步摆在明面上。
+
+59. **服务起不来时，先分清是「JDK 跑不起来」还是「版本太低」—— 两者的日志长得完全不一样，而脚本从前的提示都不沾边。**
+    实测两次都是环境问题、却都被引到「端口没被覆盖」上：
+
+    - `JAVA_HOME` 指向与本机 CPU 架构不匹配的 JDK（macOS arm64 上装了 x86_64 的 JDK）：
+      `java -version` 自己就挂（`rosetta error: Attachment of code signature supplement failed`，退出码 134），
+      连 `java` 都跑不起来；
+    - JDK 版本低于编译用的版本（本仓库 `pom.xml` 是 `java.version=21`，产物 class file version 65.0）：
+      日志里是 `UnsupportedClassVersionError: … class file version 65.0, this version … up to 61.0`，
+      进程其实**已经退出**，看起来却像「启动慢」。
+
+    现在 `scripts/run/start-server.sh` / `start-server.ps1` 会先探一次 java（跑不起来或低于 21 就直接报并退出），
+    健康检查失败时再按日志归因（`UnsupportedClassVersionError` / `rosetta error` / `Address already in use` /
+    `BUILD FAILURE` / `Downloading`）。**换 JDK 请连 `JAVA_HOME` 一起换**，别只改 PATH。
+
+60. **`get_response_body` 传 `requestId` 读不到时，三种原因要分开看（回执现在会直接告诉你哪一种）。**
+    实测拿 `get_requests` 回执里的 `requestId` 去读响应体，只得到一句
+    `没有匹配的响应: null` —— 那个 `null` 是 `filter`（压根没传），传进去的 `requestId` 一个字都没出现，
+    于是「id 不存在 / 还没收到响应 / 响应被挤出去了」在调用方看来一模一样。现在的回执按请求记录回查后给出结论：
+
+    - 「这个 requestId 不在请求记录里」→ 它不是这个任务页签记到的（记录从认领页签那一刻才开始，最多 200 条）；
+    - 「这条请求还没有收到响应（`status` 是 null）」→ 实测最常见的一种：页面刚发出的请求还没回来，
+      改 `wait_for_response` 等一个新响应，或稍后再读；
+    - 「响应体已经不在最近 100 条里了」→ 只保留最近 100 条，要留证据就在动作发生的当下读。
+
+    另外 `get_requests` 回执里的 `requestId` 是数字：命令行直接写 `-p requestId=<数字>` 即可
+    （实测能正确绑上并匹配到请求记录），不要自己去猜它的类型。
